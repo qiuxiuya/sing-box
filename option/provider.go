@@ -2,7 +2,9 @@ package option
 
 import (
 	"context"
+	"reflect"
 
+	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -11,6 +13,7 @@ import (
 )
 
 type ProviderOptionsRegistry interface {
+	OptionTypes() []string
 	CreateOptions(providerType string) (any, bool)
 }
 type _Provider struct {
@@ -46,17 +49,29 @@ func (h *Provider) UnmarshalJSONContext(ctx context.Context, content []byte) err
 	return nil
 }
 
+func (h Provider) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("Provider", func() (*schema.Node, error) {
+		registry := service.FromContext[ProviderOptionsRegistry](builder.Context())
+		if registry == nil {
+			return nil, E.New("missing provider options registry in context")
+		}
+		return registryUnion(builder, registry, nil, true)
+	})
+}
+
 type ProviderLocalOptions struct {
 	Path        string                     `json:"path"`
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
+	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
 	URL            string             `json:"url"`
 	Path           string             `json:"path,omitempty"`
+	InitialPath    string             `json:"initial_path,omitempty"`
 	UserAgent      string             `json:"user_agent,omitempty"`
 	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
@@ -67,9 +82,58 @@ type ProviderRemoteOptions struct {
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
+	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
 
 	// Deprecated: use http_client instead
-	DownloadDetour string `json:"download_detour,omitempty"`
+	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
+}
+
+type providerRemoteOptionsSchema ProviderRemoteOptions
+
+func (o *ProviderRemoteOptions) UnmarshalJSON(content []byte) error {
+	err := json.Unmarshal(content, (*providerRemoteOptionsSchema)(o))
+	if err != nil {
+		return err
+	}
+	if o.Path != "" && o.InitialPath != "" {
+		return E.New("provider path and initial_path are mutually exclusive")
+	}
+	return nil
+}
+
+func (o ProviderRemoteOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	buildVariant := func(pathField string) (*schema.Node, error) {
+		variant := schema.StrictObject()
+		err := builder.FlattenStruct(variant, reflect.TypeFor[providerRemoteOptionsSchema]())
+		if err != nil {
+			return nil, err
+		}
+		switch pathField {
+		case "path":
+			variant.Properties.Remove("initial_path")
+			variant.Required = append(variant.Required, "path")
+		case "initial_path":
+			variant.Properties.Remove("path")
+			variant.Required = append(variant.Required, "initial_path")
+		default:
+			variant.Properties.Remove("path")
+			variant.Properties.Remove("initial_path")
+		}
+		return variant, nil
+	}
+	noPathVariant, err := buildVariant("")
+	if err != nil {
+		return nil, err
+	}
+	pathVariant, err := buildVariant("path")
+	if err != nil {
+		return nil, err
+	}
+	initialPathVariant, err := buildVariant("initial_path")
+	if err != nil {
+		return nil, err
+	}
+	return schema.OneOf(noPathVariant, pathVariant, initialPathVariant), nil
 }
 
 type ProviderInlineOptions struct {
@@ -86,7 +150,7 @@ type ProviderHealthCheckOptions struct {
 }
 
 type OverrideDialerOptions struct {
-	Detour               *string                            `json:"detour,omitempty"`
+	Detour               *string                            `json:"detour,omitempty" reference:"outbound"`
 	BindInterface        *string                            `json:"bind_interface,omitempty"`
 	Inet4BindAddress     *badoption.Addr                    `json:"inet4_bind_address,omitempty"`
 	Inet6BindAddress     *badoption.Addr                    `json:"inet6_bind_address,omitempty"`
@@ -109,7 +173,12 @@ type OverrideDialerOptions struct {
 	DisableTCPKeepAlive *bool `json:"disable_tcp_keep_alive,omitempty"`
 
 	// Deprecated: migrated to domain resolver
-	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty"`
+	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
+}
+
+type OverrideAnyTLSOptions struct {
+	ClientMetadata *string `json:"client_metadata,omitempty"`
+	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
 }
 
 type OverrideTLSOptions struct {

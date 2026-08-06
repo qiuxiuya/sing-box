@@ -93,6 +93,7 @@ func (w *systemDevice) Start() error {
 		MTU:            w.options.MTU,
 		GSO:            w.options.GSO,
 		InterfaceScope: true,
+		DNSMode:        tun.DNSModeDisabled,
 		Inet4RouteAddress: common.Filter(w.options.AllowedAddress, func(it netip.Prefix) bool {
 			return it.Addr().Is4()
 		}),

@@ -52,13 +52,15 @@ func TestSnellSelf(t *testing.T) {
 		{name: "v6-userkey-default", version: 6, authentication: "userkey"},
 		{name: "v6-psk-default", version: 6, authentication: "psk"},
 		{name: "v6-psk-unshaped", version: 6, mode: "unshaped", authentication: "psk"},
+		{name: "v6-userkey-quic-proxy", version: 6, authentication: "userkey", quicProxy: true},
+		{name: "v6-psk-quic-proxy", version: 6, authentication: "psk", quicProxy: true},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			ports := snellFreePorts(t, 7)
 			serverPort := ports[0]
 			clientPort := ports[1]
-			testSnellSelf(t, serverPort, clientPort, testCase.version, testCase.mode, testCase.authentication, testCase.obfsMode, false)
+			testSnellSelf(t, serverPort, clientPort, testCase.version, testCase.mode, testCase.authentication, testCase.obfsMode, false, testCase.quicProxy)
 			testSnellTraffic(t, clientPort, ports[2:6])
 			if testCase.quicProxy {
 				testSnellQUICProxy(t, clientPort, ports[6])
@@ -71,7 +73,7 @@ func TestSnellUDPDomainMapping(t *testing.T) {
 	for _, disableDomainUnmapping := range []bool{false, true} {
 		t.Run(F.ToString("disable-domain-unmapping-", disableDomainUnmapping), func(t *testing.T) {
 			ports := snellFreePorts(t, 3)
-			testSnellSelf(t, ports[0], ports[1], 5, "", "psk", "", disableDomainUnmapping)
+			testSnellSelf(t, ports[0], ports[1], 5, "", "psk", "", disableDomainUnmapping, false)
 			if disableDomainUnmapping {
 				testSnellUDPDomainWithExternalClient(t, ports[0], ports[2])
 			} else {
@@ -81,33 +83,40 @@ func TestSnellUDPDomainMapping(t *testing.T) {
 	}
 }
 
-func testSnellSelf(t *testing.T, serverPort uint16, clientPort uint16, version int, mode string, authentication string, obfsMode string, udpDisableDomainUnmapping bool) {
+func testSnellSelf(t *testing.T, serverPort uint16, clientPort uint16, version int, mode string, authentication string, obfsMode string, udpDisableDomainUnmapping bool, quicProxyMode bool) {
 	user := option.SnellUser{Name: snellUserName}
 	inbound := &option.SnellInboundOptions{
-		ListenOptions: option.ListenOptions{
-			Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
-			ListenPort: serverPort,
+		AbstractSnellInboundOptions: option.AbstractSnellInboundOptions{
+			ListenOptions: option.ListenOptions{
+				Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+				ListenPort: serverPort,
+			},
+			Users:                   []option.SnellUser{user},
+			MultiUserAuthentication: authentication,
 		},
-		Version:                 version,
-		Users:                   []option.SnellUser{user},
-		MultiUserAuthentication: authentication,
+		Version: version,
 		ObfsOptions: option.SnellObfsServerOptions{
 			ObfsMode: obfsMode,
 		},
 		V6Options: option.SnellV6Options{Mode: mode},
 	}
 	outbound := &option.SnellOutboundOptions{
-		ServerOptions: option.ServerOptions{
-			Server:     "127.0.0.1",
-			ServerPort: serverPort,
+		AbstractSnellOutboundOptions: option.AbstractSnellOutboundOptions{
+			ServerOptions: option.ServerOptions{
+				Server:     "127.0.0.1",
+				ServerPort: serverPort,
+			},
+			Reuse: true,
 		},
 		Version: version,
-		Reuse:   true,
 		ObfsOptions: option.SnellObfsClientOptions{
 			ObfsMode: obfsMode,
 			ObfsHost: "example.com",
 		},
-		V6Options: option.SnellV6Options{Mode: mode},
+		V6Options: option.SnellV6OutboundOptions{
+			Mode:          mode,
+			QUICProxyMode: version == 6 && quicProxyMode,
+		},
 	}
 	if authentication == "psk" {
 		inbound.Users[0].PSK = snellUserPSK

@@ -32,6 +32,7 @@ type RemoteRuleSet struct {
 	cancel         context.CancelFunc
 	outbound       adapter.OutboundManager
 	url            string
+	initialPath    string
 	options        option.RemoteRuleSet
 	updateInterval time.Duration
 	httpClient     *http.Client
@@ -44,6 +45,10 @@ type RemoteRuleSet struct {
 
 func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	if options.Path != "" && options.RemoteOptions.InitialPath != "" {
+		cancel()
+		return nil, E.New("rule-set path and initial_path are mutually exclusive")
+	}
 	var path string
 	if options.Path != "" {
 		path = filemanager.BasePath(ctx, strings.ReplaceAll(options.Path, C.RuleSetTagPlaceholder, tag))
@@ -54,6 +59,11 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		updateInterval = time.Duration(options.RemoteOptions.UpdateInterval)
 	} else {
 		updateInterval = 24 * time.Hour
+	}
+	var initialPath string
+	if options.RemoteOptions.InitialPath != "" {
+		initialPath = filemanager.BasePath(ctx, strings.ReplaceAll(options.RemoteOptions.InitialPath, C.RuleSetTagPlaceholder, tag))
+		initialPath, _ = filepath.Abs(initialPath)
 	}
 	return &RemoteRuleSet{
 		abstractRuleSet: abstractRuleSet{
@@ -66,6 +76,7 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		},
 		outbound:       service.FromContext[adapter.OutboundManager](ctx),
 		url:            strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag),
+		initialPath:    initialPath,
 		cancel:         cancel,
 		options:        options.RemoteOptions,
 		updateInterval: updateInterval,
@@ -85,10 +96,27 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if err = s.loadCacheFile(); err != nil {
+	if s.initialPath != "" && s.cacheFile == nil {
+		return E.New("rule-set initial_path requires cache_file")
+	}
+	loadedFromCache, err := s.loadCacheFile()
+	if err != nil {
 		s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
 	}
-	if s.UpdatedTime().IsZero() {
+	var loadedFromInitialPath bool
+	if !loadedFromCache && s.initialPath != "" {
+		var content []byte
+		content, err = filemanager.ReadFile(s.ctx, s.initialPath)
+		if err == nil {
+			err = s.loadBytes(content, s)
+		}
+		if err != nil {
+			s.logger.Warn(E.Cause(err, "load initial rule-set from ", s.initialPath))
+		} else {
+			loadedFromInitialPath = true
+		}
+	}
+	if !loadedFromCache && !loadedFromInitialPath {
 		err = s.fetch(ctx, true)
 		if err != nil {
 			return E.Cause(err, "initial rule-set: ", s.tag)
@@ -217,7 +245,7 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 	return defaultTransport, nil
 }
 
-func (s *RemoteRuleSet) loadCacheFile() error {
+func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 	var content []byte
 	var lastUpdated time.Time
 	var lastEtag string
@@ -230,31 +258,31 @@ func (s *RemoteRuleSet) loadCacheFile() error {
 	if s.path != "" {
 		exists, err := pathExists(s.ctx, s.path)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !exists {
-			return nil
+			return false, nil
 		}
 		file, err := filemanager.Open(s.ctx, s.path)
 		if err != nil {
-			return err
+			return false, err
 		}
 		content, err = io.ReadAll(file)
 		if err != nil {
 			file.Close()
-			return err
+			return false, err
 		}
 		info, err := file.Stat()
 		closeErr := file.Close()
 		if err != nil {
-			return err
+			return false, err
 		}
 		if closeErr != nil {
-			return closeErr
+			return false, closeErr
 		}
 		if savedSet != nil {
 			if !s.hash.Equal(hash.MakeHash(content)) {
-				return E.New("load rule-set cache file failed: validation failed")
+				return false, E.New("load rule-set cache file failed: validation failed")
 			}
 			lastUpdated = savedSet.LastUpdated
 			lastEtag = savedSet.LastEtag
@@ -266,14 +294,14 @@ func (s *RemoteRuleSet) loadCacheFile() error {
 		lastUpdated = savedSet.LastUpdated
 		lastEtag = savedSet.LastEtag
 	} else {
-		return nil
+		return false, nil
 	}
 	if err := s.loadBytes(content, s); err != nil {
-		return err
+		return false, err
 	}
 	s.setUpdatedTime(lastUpdated)
 	s.lastEtag = lastEtag
-	return nil
+	return true, nil
 }
 
 func pathExists(ctx context.Context, path string) (bool, error) {

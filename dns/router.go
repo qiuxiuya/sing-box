@@ -616,33 +616,42 @@ func (r *Router) walkDNSRules(ctx context.Context, rules []adapter.DNSRule, mess
 				}
 				if len(pendingFutures) > 0 {
 					r.logger.DebugContext(ctx, "armed[", state.ruleIndex, "] ", currentRule, " => ", currentRule.Action())
-					state.armedRules = append(state.armedRules, &dnsArmedRule{
-						ruleIndex:       state.ruleIndex,
-						rule:            currentRule,
-						futures:         pendingFutures,
-						anonymousFuture: anonymousFuture,
-						bindsAnonymous:  bindsAnonymous,
-						options:         state.effectiveOptions,
-					})
-					continue
 				}
-			} else {
-				var awaitFuture *dnsEvaluatedFuture
-				for _, responseTag := range currentRule.MatchResponseTags() {
-					future := state.namedFutures[responseTag]
-					if future != nil && !future.resolved() {
-						awaitFuture = future
-						break
+				state.armedRules = append(state.armedRules, &dnsArmedRule{
+					ruleIndex:       state.ruleIndex,
+					rule:            currentRule,
+					futures:         pendingFutures,
+					anonymousFuture: anonymousFuture,
+					bindsAnonymous:  bindsAnonymous,
+					options:         state.effectiveOptions,
+				})
+				if len(pendingFutures) == 0 {
+					sweepResult, sweepPending, committed := r.sweepArmedDNSRules(ctx, message, state, allowFakeIP)
+					if committed {
+						if sweepPending != nil {
+							state.armedRules = nil
+							return exchangeWithRulesResult{}, &dnsWalkSuspension{pending: sweepPending}
+						}
+						return sweepResult, nil
 					}
 				}
-				if awaitFuture == nil && currentRule.MatchResponseAnonymous() {
-					if future := state.anonymousFuture; future != nil && !future.resolved() {
-						awaitFuture = future
-					}
+				continue
+			}
+			var awaitFuture *dnsEvaluatedFuture
+			for _, responseTag := range currentRule.MatchResponseTags() {
+				future := state.namedFutures[responseTag]
+				if future != nil && !future.resolved() {
+					awaitFuture = future
+					break
 				}
-				if awaitFuture != nil {
-					return exchangeWithRulesResult{}, &dnsWalkSuspension{await: awaitFuture}
+			}
+			if awaitFuture == nil && currentRule.MatchResponseAnonymous() {
+				if future := state.anonymousFuture; future != nil && !future.resolved() {
+					awaitFuture = future
 				}
+			}
+			if awaitFuture != nil {
+				return exchangeWithRulesResult{}, &dnsWalkSuspension{await: awaitFuture}
 			}
 		}
 		metadata.ResetRuleCache()
@@ -1787,8 +1796,10 @@ func dnsRuleActionDisablesLegacyDNSMode(action option.DNSRuleAction) bool {
 		return true
 	}
 	switch action.Action {
-	case "", C.RuleActionTypeRoute, C.RuleActionTypeEvaluate:
+	case "", C.RuleActionTypeRoute:
 		return action.RouteOptions.DisableOptimisticCache || action.RouteOptions.Speculative
+	case C.RuleActionTypeEvaluate:
+		return action.EvaluateOptions.DisableOptimisticCache || action.EvaluateOptions.Speculative
 	case C.RuleActionTypeRouteOptions:
 		return action.RouteOptionsOptions.DisableOptimisticCache
 	default:
@@ -1798,8 +1809,10 @@ func dnsRuleActionDisablesLegacyDNSMode(action option.DNSRuleAction) bool {
 
 func dnsRuleActionHasStrategy(action option.DNSRuleAction) bool {
 	switch action.Action {
-	case "", C.RuleActionTypeRoute, C.RuleActionTypeEvaluate:
+	case "", C.RuleActionTypeRoute:
 		return C.DomainStrategy(action.RouteOptions.Strategy) != C.DomainStrategyAsIS
+	case C.RuleActionTypeEvaluate:
+		return C.DomainStrategy(action.EvaluateOptions.Strategy) != C.DomainStrategyAsIS
 	case C.RuleActionTypeRouteOptions:
 		return C.DomainStrategy(action.RouteOptionsOptions.Strategy) != C.DomainStrategyAsIS
 	default:
@@ -1827,8 +1840,14 @@ func dnsRuleActionType(rule option.DNSRule) string {
 func dnsRuleActionServer(rule option.DNSRule) string {
 	switch rule.Type {
 	case "", C.RuleTypeDefault:
+		if dnsRuleActionType(rule) == C.RuleActionTypeEvaluate {
+			return rule.DefaultOptions.EvaluateOptions.Server
+		}
 		return rule.DefaultOptions.RouteOptions.Server
 	case C.RuleTypeLogical:
+		if dnsRuleActionType(rule) == C.RuleActionTypeEvaluate {
+			return rule.LogicalOptions.EvaluateOptions.Server
+		}
 		return rule.LogicalOptions.RouteOptions.Server
 	default:
 		return ""
@@ -1838,9 +1857,9 @@ func dnsRuleActionServer(rule option.DNSRule) string {
 func dnsRuleActionEvaluateTag(rule option.DNSRule) string {
 	switch rule.Type {
 	case "", C.RuleTypeDefault:
-		return rule.DefaultOptions.RouteOptions.Tag
+		return rule.DefaultOptions.EvaluateOptions.Tag
 	case C.RuleTypeLogical:
-		return rule.LogicalOptions.RouteOptions.Tag
+		return rule.LogicalOptions.EvaluateOptions.Tag
 	default:
 		return ""
 	}
@@ -1849,8 +1868,14 @@ func dnsRuleActionEvaluateTag(rule option.DNSRule) string {
 func dnsRuleActionSpeculative(rule option.DNSRule) bool {
 	switch rule.Type {
 	case "", C.RuleTypeDefault:
+		if dnsRuleActionType(rule) == C.RuleActionTypeEvaluate {
+			return rule.DefaultOptions.EvaluateOptions.Speculative
+		}
 		return rule.DefaultOptions.RouteOptions.Speculative
 	case C.RuleTypeLogical:
+		if dnsRuleActionType(rule) == C.RuleActionTypeEvaluate {
+			return rule.LogicalOptions.EvaluateOptions.Speculative
+		}
 		return rule.LogicalOptions.RouteOptions.Speculative
 	default:
 		return false

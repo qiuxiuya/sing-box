@@ -62,6 +62,7 @@ type ProviderRemote struct {
 	downloadDetour    string
 	url               string
 	path              string
+	initialPath       string
 	userAgent         string
 	updateInterval    time.Duration
 	exclude           *regexp.Regexp
@@ -69,16 +70,27 @@ type ProviderRemote struct {
 
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
+	overrideAnyTLS *option.OverrideAnyTLSOptions
 }
 
 func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderRemoteOptions) (adapter.Provider, error) {
 	if options.URL == "" {
 		return nil, E.New("provider URL is required")
 	}
-	var path string
+	if options.Path != "" && options.InitialPath != "" {
+		return nil, E.New("provider path and initial_path are mutually exclusive")
+	}
+	var (
+		path        string
+		initialPath string
+	)
 	if options.Path != "" {
 		path = filemanager.BasePath(ctx, options.Path)
 		path, _ = filepath.Abs(path)
+	}
+	if options.InitialPath != "" {
+		initialPath = filemanager.BasePath(ctx, options.InitialPath)
+		initialPath, _ = filepath.Abs(initialPath)
 	}
 	if path != "" {
 		info, err := filemanager.Stat(ctx, path)
@@ -87,6 +99,15 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, E.Cause(err, "check provider path")
+		}
+	}
+	if initialPath != "" {
+		info, err := filemanager.Stat(ctx, initialPath)
+		if err == nil && info.IsDir() {
+			return nil, E.New("provider initial_path is a directory: ", initialPath)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, E.Cause(err, "check provider initial_path")
 		}
 	}
 	updateInterval := time.Duration(options.UpdateInterval)
@@ -120,6 +141,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		httpClientOptions: options.HTTPClient,
 		url:               options.URL,
 		path:              path,
+		initialPath:       initialPath,
 		userAgent:         userAgent,
 		updateInterval:    updateInterval,
 		exclude:           (*regexp.Regexp)(options.Exclude),
@@ -127,6 +149,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 		overrideDialer: options.OverrideDialer,
 		overrideTLS:    options.OverrideTLS,
+		overrideAnyTLS: options.OverrideAnyTLS,
 
 		//nolint:staticcheck
 		downloadDetour: options.DownloadDetour,
@@ -135,8 +158,21 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
 	s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
-	if err := s.loadCacheFile(); err != nil {
+	if s.initialPath != "" && s.cacheFile == nil {
+		return E.New("provider initial_path requires cache_file")
+	}
+	loadedFromCache, err := s.loadCacheFile()
+	if err != nil {
 		s.logger.Warn(E.Cause(err, "restore cached outbound provider, will refetch"))
+	}
+	var loadedFromInitialPath bool
+	if !loadedFromCache && s.initialPath != "" {
+		err = s.loadInitialPath()
+		if err != nil {
+			s.logger.Warn(E.Cause(err, "load initial outbound provider from ", s.initialPath))
+		} else {
+			loadedFromInitialPath = true
+		}
 	}
 	transport, err := s.resolveTransport()
 	if err != nil {
@@ -144,9 +180,9 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if s.lastUpdated.IsZero() {
+	if !loadedFromCache && !loadedFromInitialPath {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
-		err := s.fetch(ctx, true)
+		err = s.fetch(ctx, true)
 		if err != nil {
 			return E.Cause(err, "initial outbound provider: ", s.Tag())
 		}
@@ -334,7 +370,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	return nil
 }
 
-func (s *ProviderRemote) loadCacheFile() error {
+func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	var content []byte
 	var lastUpdated time.Time
 	var lastEtag string
@@ -347,31 +383,31 @@ func (s *ProviderRemote) loadCacheFile() error {
 	if s.path != "" {
 		exists, err := pathExists(s.ctx, s.path)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !exists {
-			return nil
+			return false, nil
 		}
 		file, err := filemanager.Open(s.ctx, s.path)
 		if err != nil {
-			return err
+			return false, err
 		}
 		content, err = io.ReadAll(file)
 		if err != nil {
 			file.Close()
-			return err
+			return false, err
 		}
 		fileInfo, err := file.Stat()
 		closeErr := file.Close()
 		if err != nil {
-			return err
+			return false, err
 		}
 		if closeErr != nil {
-			return closeErr
+			return false, closeErr
 		}
 		if saveSub != nil {
 			if !s.hash.Equal(hash.MakeHash(content)) {
-				return E.New("load outbound provider cache file failed: validation failed")
+				return false, E.New("load outbound provider cache file failed: validation failed")
 			}
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
@@ -383,23 +419,32 @@ func (s *ProviderRemote) loadCacheFile() error {
 		lastUpdated = saveSub.LastUpdated
 		lastEtag = saveSub.LastEtag
 	} else {
-		return nil
+		return false, nil
 	}
 	if err := s.loadFromContent(content); err != nil {
-		return err
+		return false, err
 	}
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	return true, nil
+}
+
+func (s *ProviderRemote) loadInitialPath() error {
+	contentRaw, err := filemanager.ReadFile(s.ctx, s.initialPath)
+	if err != nil {
+		return err
+	}
+	content := s.decodeContent(contentRaw)
+	err = s.updateProviderFromContent(content)
+	if err != nil {
+		return err
+	}
+	s.UpdateGroups()
 	return nil
 }
 
 func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
-	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
-	firstLine, others := getFirstLine(content)
-	if info, ok := parseInfo(firstLine); ok {
-		s.subscriptionInfo = info
-		content, _ = parser.DecodeBase64URLSafe(others)
-	}
+	content := s.decodeContent(contentRaw)
 	outboundOpts, endpointOpts, err := parser.ParseBoxSubscription(s.ctx, content)
 	if err != nil {
 		return err
@@ -409,6 +454,18 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
+}
+
+func (s *ProviderRemote) decodeContent(contentRaw []byte) string {
+	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
+	firstLine, others := getFirstLine(content)
+	if info, ok := parseInfo(firstLine); ok {
+		s.infoMu.Lock()
+		s.subscriptionInfo = info
+		s.infoMu.Unlock()
+		content, _ = parser.DecodeBase64URLSafe(others)
+	}
+	return content
 }
 
 func pathExists(ctx context.Context, path string) (bool, error) {
@@ -478,7 +535,7 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
 	if err != nil {
 		return err
 	}

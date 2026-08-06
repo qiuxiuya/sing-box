@@ -2,6 +2,73 @@
 icon: material/alert-decagram
 ---
 
+#### 1.14.0-beta.7
+
+* Add Hysteria2 Chrome QUIC fingerprint parroting **1**
+* Update quic-go to v0.61.0
+* Update tailscale to v1.102.1
+* Update gvisor to 20260727.0
+* Fixes and improvements
+
+**1**:
+
+Hysteria2 client connections now parrot Chrome's QUIC handshake by default,
+making the traffic harder to identify by handshake fingerprinting. Since
+Chrome does not declare support for Ed25519, servers using Ed25519
+certificates will fail the handshake; see
+[disable_chrome_parrot](/configuration/outbound/hysteria2/#disable_chrome_parrot).
+
+#### 1.14.0-beta.5
+
+* Remove client metadata from AnyTLS requests by default **1**
+* Update naiveproxy to v150.0.7871.63-1
+* Fixes and improvements
+
+**1**:
+
+We found that the AnyTLS client implementation uploads metadata that is
+**not used by the open-source server**, and there are reports of vendors using
+it to profile and discriminate against users. We now leave it empty by default
+and allow you to customize it, see
+[AnyTLS client metadata](/manual/misc/anytls-client-metadata/).
+
+#### 1.13.16
+
+* Remove client metadata from AnyTLS requests by default **1**
+* Fixes and improvements
+
+**1**:
+
+We found that the AnyTLS client implementation uploads metadata that is
+**not used by the open-source server**, and there are reports of vendors using
+it to profile and discriminate against users. We now leave it empty by default
+and allow you to customize it, see
+[AnyTLS client metadata](/manual/misc/anytls-client-metadata/).
+
+#### 1.14.0-beta.4
+
+* Fixes and improvements
+
+#### 1.13.15
+
+* Fixes and improvements
+
+#### 1.14.0-beta.2
+
+* Add [JSON Schema](/configuration/schema/) support **1**
+* Fixes and improvements
+
+**1**:
+
+sing-box now provides a JSON Schema for its configuration, enabling completion
+and validation in compatible editors. The schema published with the
+documentation can be selected with the new top-level `$schema` field, while
+the new `sing-box schema` command generates a schema matching the current
+binary and its build tags.
+
+We have also improved the JSON editor experience in the graphical clients on
+macOS, Android, Windows, and Linux, and added schema-based completion support.
+
 #### 1.14.0-beta.1
 
 * Correct undefined rule-set matching semantics **1**
