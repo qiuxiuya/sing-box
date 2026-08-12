@@ -23,11 +23,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const sharedNetworkUDPClientHelperEnv = "SING_BOX_EBPF_SHARED_UDP_CLIENT_HELPER"
+const (
+	sharedNetworkUDPClientHelperEnv     = "SING_BOX_EBPF_SHARED_UDP_CLIENT_HELPER"
+	sharedNetworkUDPFragmentHelperMode  = "fragment"
+	sharedNetworkUDPFragmentPayloadSize = 4096
+)
 
 func TestSharedNetworkUDPClientHelper(t *testing.T) {
-	if os.Getenv(sharedNetworkUDPClientHelperEnv) != "1" {
+	helperMode := os.Getenv(sharedNetworkUDPClientHelperEnv)
+	if helperMode == "" {
 		t.Skip("shared-network integration test helper")
+	}
+	if helperMode == sharedNetworkUDPFragmentHelperMode {
+		testSharedNetworkUDPFragments(t)
+		return
+	}
+	if helperMode != "1" {
+		t.Fatalf("unknown shared-network UDP helper mode: %s", helperMode)
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -61,6 +73,45 @@ func TestSharedNetworkUDPClientHelper(t *testing.T) {
 		expectedResponse := append([]byte("udp6-ok:"), payload...)
 		if !bytes.Equal(response[:n], expectedResponse) {
 			t.Fatalf("unexpected response for flow %d: %q", index, response[:n])
+		}
+	}
+}
+
+func testSharedNetworkUDPFragments(t *testing.T) {
+	payload := bytes.Repeat([]byte("fragment-path-"), sharedNetworkUDPFragmentPayloadSize/len("fragment-path-")+1)
+	payload = payload[:sharedNetworkUDPFragmentPayloadSize]
+	testCases := []struct {
+		network     string
+		listen      *net.UDPAddr
+		destination netip.AddrPort
+	}{
+		{"udp4", &net.UDPAddr{IP: net.IPv4zero}, netip.MustParseAddrPort("8.8.4.4:5354")},
+		{"udp6", &net.UDPAddr{IP: net.IPv6unspecified}, netip.MustParseAddrPort("[2606:4700:4700::1111]:5354")},
+	}
+	for _, testCase := range testCases {
+		conn, err := net.ListenUDP(testCase.network, testCase.listen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.WriteToUDPAddrPort(payload, testCase.destination); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		if err = conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		response := make([]byte, len(payload))
+		n, source, readErr := conn.ReadFromUDPAddrPort(response)
+		_ = conn.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if source != testCase.destination {
+			t.Fatalf("unexpected restored fragment source: %s", source)
+		}
+		if !bytes.Equal(response[:n], payload) {
+			t.Fatalf("unexpected fragmented response length: %d", n)
 		}
 	}
 }
@@ -146,6 +197,19 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rawUDP6, err := udp6Listener.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var socketControlErr error
+	if err = rawUDP6.Control(func(fd uintptr) {
+		socketControlErr = unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if socketControlErr != nil {
+		t.Fatal(socketControlErr)
+	}
 	t.Cleanup(func() { _ = udp6Listener.Close() })
 	if err = ipv6.NewPacketConn(udp6Listener).SetControlMessage(ipv6.FlagDst, true); err != nil {
 		t.Fatal(err)
@@ -160,14 +224,19 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = routeOwner.removeLocalRoutes() })
 	backend, err := ECommon.PrepareSharedNetwork(nil, ECommon.SharedNetworkConfig{
-		ListenerPort: listenerPort,
-		EnableTCP:    true,
-		EnableUDP:    true,
-		HijackDNS:    true,
-		RedirectIPv4: redirectPrefix,
-		RedirectIPv6: redirectPrefix6,
-		MapCapacity:  5,
-		UDPTimeout:   5 * time.Minute,
+		ListenerPort:         listenerPort,
+		EnableTCP:            true,
+		EnableUDP:            true,
+		HijackDNS:            true,
+		BypassPrivateAddress: false,
+		RedirectIPv4:         redirectPrefix,
+		RedirectIPv6:         redirectPrefix6,
+		MapCapacity: ECommon.SharedNetworkMapCapacities{
+			Proxy:    7,
+			Bypass:   7,
+			Fragment: 7,
+		},
+		UDPTimeout: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +280,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 			tcpResult <- lookupErr
 			return
 		}
-		if original.Destination != netip.MustParseAddrPort("8.8.8.8:18080") {
+		if original.Destination != netip.MustParseAddrPort("10.0.0.1:18080") {
 			tcpResult <- &unexpectedDestinationError{original.Destination}
 			return
 		}
@@ -229,7 +298,7 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	tcpCommand := exec.CommandContext(ctx, "ip", "netns", "exec", namespace, "nc", "-w", "3", "8.8.8.8", "18080")
+	tcpCommand := exec.CommandContext(ctx, "ip", "netns", "exec", namespace, "nc", "-w", "3", "10.0.0.1", "18080")
 	tcpCommand.Stdin = bytes.NewReader(tcpPayload)
 	tcpOutput, err := tcpCommand.Output()
 	if err != nil {
@@ -378,10 +447,76 @@ func TestSharedNetworkDataPathIntegration(t *testing.T) {
 	udp6Command.Env = append(os.Environ(), sharedNetworkUDPClientHelperEnv+"=1")
 	udp6Output, err := udp6Command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("IPv6 UDP client: %v: %s", err, udp6Output)
+		serverErr := <-udp6Result
+		t.Fatalf("IPv6 UDP client: %v: %s; server: %v", err, udp6Output, serverErr)
 	}
 	if err = <-udp6Result; err != nil {
 		t.Fatal(err)
+	}
+
+	fragmentResult := make(chan error, 2)
+	serveFragment := func(listener *net.UDPConn, expectedDestination netip.AddrPort) {
+		_ = listener.SetReadDeadline(time.Now().Add(8 * time.Second))
+		payload := make([]byte, sharedNetworkUDPFragmentPayloadSize)
+		oob := make([]byte, 256)
+		n, oobN, _, client, readErr := listener.ReadMsgUDPAddrPort(payload, oob)
+		if readErr != nil {
+			fragmentResult <- readErr
+			return
+		}
+		tokenAddress, parseErr := redirectAddressFromOOB(oob[:oobN])
+		if parseErr != nil {
+			fragmentResult <- parseErr
+			return
+		}
+		tokenDestination := netip.AddrPortFrom(tokenAddress, listenerPort)
+		original, lookupErr := backend.LookupOriginal(ECommon.ProtocolUDP, client, tokenDestination)
+		if lookupErr != nil {
+			fragmentResult <- lookupErr
+			return
+		}
+		if original.Destination != expectedDestination {
+			fragmentResult <- &unexpectedDestinationError{original.Destination}
+			return
+		}
+		var controlMessage []byte
+		if tokenAddress.Is4() {
+			controlMessage = (&ipv4.ControlMessage{Src: net.IP(tokenAddress.AsSlice())}).Marshal()
+		} else {
+			controlMessage = (&ipv6.ControlMessage{Src: net.IP(tokenAddress.AsSlice())}).Marshal()
+		}
+		_, _, writeErr := listener.WriteMsgUDPAddrPort(payload[:n], controlMessage, client)
+		fragmentResult <- writeErr
+	}
+	go serveFragment(udpListener, netip.MustParseAddrPort("8.8.4.4:5354"))
+	go serveFragment(udp6Listener, netip.MustParseAddrPort("[2606:4700:4700::1111]:5354"))
+	fragmentContext, fragmentCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer fragmentCancel()
+	fragmentCommand := exec.CommandContext(
+		fragmentContext,
+		"ip", "netns", "exec", namespace, os.Args[0],
+		"-test.run=^TestSharedNetworkUDPClientHelper$",
+	)
+	fragmentCommand.Env = append(
+		os.Environ(),
+		sharedNetworkUDPClientHelperEnv+"="+sharedNetworkUDPFragmentHelperMode,
+	)
+	fragmentOutput, err := fragmentCommand.CombinedOutput()
+	if err != nil {
+		firstServerErr := <-fragmentResult
+		secondServerErr := <-fragmentResult
+		t.Fatalf(
+			"fragmented UDP client: %v: %s; servers: [%v, %v]",
+			err,
+			fragmentOutput,
+			firstServerErr,
+			secondServerErr,
+		)
+	}
+	for range 2 {
+		if err = <-fragmentResult; err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	dhcpListener, err := net.ListenUDP("udp4", &net.UDPAddr{

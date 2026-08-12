@@ -1,7 +1,7 @@
 // Copyright 2026, Asterisk4Magisk contributors
 // SPDX-License-Identifier: GPL-3.0
 
-#include "ebpf.h"
+#include "runtime.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -18,20 +19,18 @@
 #define SB_EBPF_LPM_TRIE_MAP_TYPE 11U
 #define SB_EBPF_HASH_MAP_TYPE 1U
 #define SB_EBPF_ARRAY_MAP_TYPE 2U
-#define SB_EBPF_ATTACHED_CONNECT4 (1U << 0U)
-#define SB_EBPF_ATTACHED_CONNECT6 (1U << 1U)
-#define SB_EBPF_ATTACHED_CONNECT6_V4MAPPED (1U << 2U)
-#define SB_EBPF_ATTACHED_UDP4_SENDMSG (1U << 3U)
-#define SB_EBPF_ATTACHED_UDP6_SENDMSG (1U << 4U)
-#define SB_EBPF_ATTACHED_UDP6_V4MAPPED_SENDMSG (1U << 5U)
-#define SB_EBPF_ATTACHED_UDP4_RECVMSG (1U << 6U)
-#define SB_EBPF_ATTACHED_UDP6_RECVMSG (1U << 7U)
-#define SB_EBPF_ATTACHED_UDP6_V4MAPPED_RECVMSG (1U << 8U)
-#define SB_EBPF_ATTACHED_SOCKET_RELEASE (1U << 9U)
-
 #define BPF_ALU64_IMM_OP(OP, DST, IMM) ((struct bpf_insn){.code = BPF_ALU64 | BPF_OP(OP) | BPF_K, .dst_reg = DST, .imm = (int32_t)(IMM)})
 #define BPF_MOV64_IMM(DST, IMM) BPF_ALU64_IMM_OP(BPF_MOV, DST, IMM)
 #define BPF_EXIT_INSN() ((struct bpf_insn){.code = BPF_JMP | BPF_EXIT})
+#define BPF_MOV64_REG(DST, SRC) ((struct bpf_insn){.code = BPF_ALU64 | BPF_MOV | BPF_X, .dst_reg = DST, .src_reg = SRC})
+#define BPF_RSH64_IMM(DST, IMM) ((struct bpf_insn){.code = BPF_ALU64 | BPF_RSH | BPF_K, .dst_reg = DST, .imm = IMM})
+#define BPF_ADD64_IMM(DST, IMM) ((struct bpf_insn){.code = BPF_ALU64 | BPF_ADD | BPF_K, .dst_reg = DST, .imm = IMM})
+#define BPF_ST_MEM_W(DST, OFF, IMM) ((struct bpf_insn){.code = BPF_ST | BPF_MEM | BPF_W, .dst_reg = DST, .off = OFF, .imm = IMM})
+#define BPF_STX_MEM_W(DST, SRC, OFF) ((struct bpf_insn){.code = BPF_STX | BPF_MEM | BPF_W, .dst_reg = DST, .src_reg = SRC, .off = OFF})
+#define BPF_CALL_HELPER(ID) ((struct bpf_insn){.code = BPF_JMP | BPF_CALL, .imm = ID})
+#define BPF_LD_MAP_FD(DST, FD) \
+    ((struct bpf_insn){.code = BPF_LD | BPF_DW | BPF_IMM, .dst_reg = DST, .src_reg = BPF_PSEUDO_MAP_FD, .imm = FD}), \
+    ((struct bpf_insn){0})
 
 static uint32_t ipv4_redirect_host_mask(uint32_t prefix_bits) {
     if (prefix_bits > 32U) return 0U;
@@ -54,8 +53,9 @@ static void init_runtime(struct sb_ebpf_cgroup_runtime *runtime) {
     runtime->self_bypass_tgid = false;
     runtime->enable_tcp = false;
     runtime->enable_udp = false;
-    runtime->include_uid_policy = false;
-    runtime->exclude_uid_policy = false;
+    runtime->uid_policy = false;
+    runtime->uid_default_bypass = false;
+    runtime->exclude_android_dns_tether = false;
     runtime->bypass_ipv4_policy = false;
     runtime->bypass_ipv6_policy = false;
     runtime->auto_ipv6 = false;
@@ -65,5 +65,5 @@ static void init_runtime(struct sb_ebpf_cgroup_runtime *runtime) {
 
 static int create_bypass_socket_cookie_map(uint32_t max_entries);
 
-#include "cgroup_program.c"
+#include "cgroup_loader.c"
 #include "cgroup_runtime.c"

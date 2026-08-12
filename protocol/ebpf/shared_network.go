@@ -21,7 +21,7 @@ type sharedNetwork struct {
 	udpNat          *udpnat.Service
 	udpClientTable  udpClientTable
 	udpWarnings     udpWarningLimiters
-	mapCapacity     uint32
+	mapCapacity     ECommon.SharedNetworkMapCapacities
 	tcPriority      uint16
 	lifecycleAccess sync.RWMutex
 	backendAccess   sync.RWMutex
@@ -47,16 +47,19 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.closeListeners())
 	}
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
-		ListenerPort:      s.listeners.selectedPort(),
-		EnableTCP:         s.inbound.enableTCP,
-		EnableUDP:         s.inbound.enableUDP,
-		HijackDNS:         s.inbound.dnsMode == dnsModeHijack,
-		RedirectIPv4:      s.inbound.redirectIPv4Prefix,
-		RedirectIPv6:      s.inbound.redirectIPv6Prefix,
-		IncludeSourceCIDR: s.inbound.sharedNetworkOptions.IncludeSourceCIDR,
-		ExcludeSourceCIDR: s.inbound.sharedNetworkOptions.ExcludeSourceCIDR,
-		MapCapacity:       s.mapCapacity,
-		UDPTimeout:        s.inbound.udpTimeout,
+		ListenerPort:         s.listeners.selectedPort(),
+		EnableTCP:            s.inbound.enableTCP,
+		EnableUDP:            s.inbound.enableUDP,
+		HijackDNS:            s.inbound.dnsMode == dnsModeHijack,
+		BypassPrivateAddress: s.inbound.bypassPrivateAddress,
+		RedirectIPv4:         s.inbound.redirectIPv4Prefix,
+		RedirectIPv6:         s.inbound.redirectIPv6Prefix,
+		IncludeSourceCIDR:    s.inbound.sharedNetworkOptions.IncludeSourceCIDR,
+		ExcludeSourceCIDR:    s.inbound.sharedNetworkOptions.ExcludeSourceCIDR,
+		IncludeSourceMAC:     s.inbound.sharedNetworkIncludeMAC,
+		ExcludeSourceMAC:     s.inbound.sharedNetworkExcludeMAC,
+		MapCapacity:          s.mapCapacity,
+		UDPTimeout:           s.inbound.udpTimeout,
 	})
 	if err != nil {
 		return E.Errors(err, s.closeListeners())
@@ -90,10 +93,15 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		"], redirect_listener_port=", s.listeners.selectedPort(),
 		", dns_mode=", s.inbound.dnsMode,
 		", bypass_maps=", bypassMapSource,
+		", bypass_private_address=", s.inbound.bypassPrivateAddress,
 		", source_cidr={include:", len(s.inbound.sharedNetworkOptions.IncludeSourceCIDR),
 		", exclude:", len(s.inbound.sharedNetworkOptions.ExcludeSourceCIDR), "}",
+		", source_mac={include:", len(s.inbound.sharedNetworkIncludeMAC),
+		", exclude:", len(s.inbound.sharedNetworkExcludeMAC), "}",
 		", tc_priority=", s.tcPriority,
-		", map_capacity=", s.mapCapacity,
+		", map_capacity={proxy:", s.mapCapacity.Proxy,
+		", bypass:", s.mapCapacity.Bypass,
+		", fragment:", s.mapCapacity.Fragment, "}",
 		", programs=[tc/ingress, tc/egress]",
 	)
 	return nil

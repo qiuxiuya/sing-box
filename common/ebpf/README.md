@@ -9,13 +9,16 @@ The Go implementation is grouped by data path and responsibility:
 
 - `cgroup_abi.go`, `cgroup_policy.go`, and `cgroup_mount.go` contain portable
   ABI, policy compilation, and cgroup discovery logic.
-- `cgroup_cgo.go`, `cgroup_socket_cgo.go`, and `cgroup_policy_cgo.go` manage
-  the native cgroup runtime, socket redirect maps, and live policy maps.
+- `cgroup_backend_cgo.go`, `cgroup_socket_cgo.go`, and
+  `cgroup_policy_cgo.go` manage the native cgroup runtime, socket redirect
+  maps, and live policy maps.
 - `shared_network_abi.go` and `shared_network_policy.go` contain the portable
   TC map ABI and host-address policy compilation.
 - `shared_network_cgo.go`, `shared_network_flow_cgo.go`, and
   `shared_network_policy_cgo.go` manage the native TC runtime, flow maps, and
   live host-address maps.
+- `backend_cgo.go` contains memlock, capability-probe, and load-error helpers
+  shared by the cgroup and TC backends.
 - `map.go` contains the small BPF map syscall boundary shared by both data
   paths. Files ending in `_stub.go` preserve the same API when cgo is disabled.
 
@@ -29,19 +32,22 @@ include implementation files from `native/`:
   program and runtime implementation in one cgo translation unit.
 - `native/cgroup.bpf.c` and `native/shared_network.bpf.c` are compiled to the
   embedded cgroup and TC ingress/egress objects.
-- `native/cgroup_program.c` selects cgroup object sections, loads them, and
+- `native/cgroup_loader.c` selects cgroup object sections, loads them, and
   retains the TGID to socket-cookie compatibility fallback.
 - `native/cgroup_runtime.c` creates the cgroup maps and manages prepare,
   attach, and close operations.
-- `native/object_loader.c` relocates and loads both objects without libbpf.
+- `native/object_loader.c` validates, relocates, and loads both objects without
+  libbpf. Backend-specific map and program tables live in
+  `native/cgroup_loader.c` and `native/shared_network_loader.c`.
 - `native/shared_network_runtime.c` creates and manages the shared-network
   maps and programs.
 - `native/bpf.c` contains the BPF syscall, loader, attach, and cleanup
   helpers.
-- `native/ebpf.h` is the private runtime API shared with the Go backend.
+- `native/abi.h` contains only the cgroup map ABI shared by userspace and BPF
+  C. `native/runtime.h` is the private userspace runtime API shared with Go.
 
 Helpers used only by one native component remain static in that component
-instead of being exposed through `native/ebpf.h`.
+instead of being exposed through `native/runtime.h`.
 
 ## Embedded eBPF objects
 
@@ -64,6 +70,12 @@ The generated objects remain ignored by Git. `make ebpf_check` is available
 for local reproducibility checks after generation. Both use the baseline BPF
 v1 instruction set so changing the host or NDK Clang does not silently raise
 the kernel instruction-set requirement.
+
+When native IPv6 interception is disabled, the cgroup loader selects smaller
+IPv4-mapped `connect6`, `sendmsg6`, and `recvmsg6` sections. These preserve
+IPv4 traffic from dual-stack applications without loading the unused native
+IPv6 policy and redirect path. Dual-stack configurations continue to select
+the complete IPv6 sections.
 
 ## Testing
 
@@ -108,9 +120,10 @@ go test -count=1 \
 
 The shared-network integration test additionally creates a temporary network
 namespace and veth pair. It verifies IPv4 and IPv6 public TCP interception,
-a large TCP payload through the TC/GSO path, dual-stack DNS capture to the
-gateway in the default hijack mode, DHCP bypass, fail-closed behavior at map
-capacity, reply source restoration, TC cleanup, local redirect routes, and
+a large TCP payload through the TC/GSO path, dual-stack fragmented UDP round
+trips, dual-stack DNS capture to the gateway in the default hijack mode, DHCP
+bypass, fail-closed behavior at map capacity, reply source restoration, TC
+cleanup, local redirect routes, and
 `route_localnet` restoration. It requires `ip` and `nc`:
 
 ```sh

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/hash"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
 )
@@ -133,6 +134,9 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if contentLength > uint64(reader.Len()) {
+		return E.New("invalid content length: ", contentLength)
+	}
 	s.Content = make([]byte, contentLength)
 	_, err = io.ReadFull(reader, s.Content)
 	if err != nil {
@@ -147,6 +151,9 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	etagLength, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return err
+	}
+	if etagLength > uint64(reader.Len()) {
+		return E.New("invalid etag length: ", etagLength)
 	}
 	etagBytes := make([]byte, etagLength)
 	_, err = io.ReadFull(reader, etagBytes)

@@ -207,6 +207,57 @@ func TestValidateDataPaths(t *testing.T) {
 	}
 }
 
+func TestDisabledSharedNetworkIgnoresSubOptions(t *testing.T) {
+	zeroCapacity := option.EBPFMapCapacity(0)
+	normalized, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
+		IncludeInterface:  []string{""},
+		IncludeSourceCIDR: []netip.Prefix{{}},
+		ExcludeSourceCIDR: []netip.Prefix{{}},
+		IncludeMACAddress: []string{"invalid"},
+		ExcludeMACAddress: []string{"invalid"},
+		TCPriority:        option.EBPFTCPriority(42),
+		MapCapacity: option.EBPFSharedNetworkMapCapacityOptions{
+			Proxy: &zeroCapacity,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Enabled || len(normalized.IncludeInterface) != 0 ||
+		len(normalized.IncludeSourceCIDR) != 0 || len(normalized.ExcludeSourceCIDR) != 0 ||
+		len(normalized.IncludeMACAddress) != 0 || len(normalized.ExcludeMACAddress) != 0 ||
+		normalized.TCPriority != 0 || normalized.MapCapacity != (option.EBPFSharedNetworkMapCapacityOptions{}) {
+		t.Fatalf("disabled shared-network options were not ignored: %+v", normalized)
+	}
+	capacity, err := normalizeSharedNetworkMapCapacity(normalized.MapCapacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity != ECommon.DefaultSharedNetworkMapCapacities() {
+		t.Fatalf("unexpected disabled shared-network map capacity: %+v", capacity)
+	}
+}
+
+func TestParseSharedNetworkMACAddresses(t *testing.T) {
+	addresses, err := parseSharedNetworkMACAddresses("include_mac_address", []string{
+		"02:00:00:00:00:01",
+		"02-00-00-00-00-01",
+		"02:00:00:00:00:02",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 2 || addresses[0] != (ECommon.MACAddress{0x02, 0, 0, 0, 0, 1}) ||
+		addresses[1] != (ECommon.MACAddress{0x02, 0, 0, 0, 0, 2}) {
+		t.Fatalf("unexpected parsed MAC addresses: %v", addresses)
+	}
+	for _, address := range []string{"invalid", "02:00:00:00:00:00:00:01"} {
+		if _, err = parseSharedNetworkMACAddresses("include_mac_address", []string{address}); err == nil {
+			t.Fatalf("expected MAC address to be rejected: %s", address)
+		}
+	}
+}
+
 func TestNormalizeDNSMode(t *testing.T) {
 	for _, test := range []struct {
 		input  string
@@ -255,6 +306,31 @@ func TestNormalizeMapCapacity(t *testing.T) {
 	}
 }
 
+func TestNormalizeSharedNetworkMapCapacity(t *testing.T) {
+	capacity, err := normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity != ECommon.DefaultSharedNetworkMapCapacities() {
+		t.Fatalf("unexpected default shared-network map capacity: %+v", capacity)
+	}
+	proxy := option.EBPFMapCapacity(32768)
+	bypass := option.EBPFMapCapacity(8192)
+	fragment := option.EBPFMapCapacity(131072)
+	capacity, err = normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{
+		Proxy:    &proxy,
+		Bypass:   &bypass,
+		Fragment: &fragment,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity.Proxy != uint32(proxy) || capacity.Bypass != uint32(bypass) ||
+		capacity.Fragment != uint32(fragment) {
+		t.Fatalf("unexpected shared-network map capacity: %+v", capacity)
+	}
+}
+
 func TestNormalizeMapCapacityRejectsExplicitInvalidValues(t *testing.T) {
 	zero := option.EBPFMapCapacity(0)
 	tooLarge := option.EBPFMapCapacity(ECommon.MaxConfigurableMapCapacity + 1)
@@ -264,11 +340,9 @@ func TestNormalizeMapCapacityRejectsExplicitInvalidValues(t *testing.T) {
 		}); err == nil {
 			t.Fatalf("expected map capacity %d to be rejected", *configured)
 		}
-		if _, err := normalizeMapCapacityValue(
-			"shared_network.map_capacity",
-			configured,
-			ECommon.SharedNetworkMapCapacity,
-		); err == nil {
+		if _, err := normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{
+			Proxy: configured,
+		}); err == nil {
 			t.Fatalf("expected shared-network map capacity %d to be rejected", *configured)
 		}
 	}

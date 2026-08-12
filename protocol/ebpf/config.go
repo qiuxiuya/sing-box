@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"net"
 	"net/netip"
 	"path/filepath"
 	"strconv"
@@ -122,6 +123,24 @@ func normalizeCgroupMapCapacity(options option.EBPFMapCapacityOptions) (ECommon.
 	)
 	if err != nil {
 		return ECommon.CgroupMapCapacity{}, err
+	}
+	return capacity, nil
+}
+
+func normalizeSharedNetworkMapCapacity(options option.EBPFSharedNetworkMapCapacityOptions) (ECommon.SharedNetworkMapCapacities, error) {
+	capacity := ECommon.DefaultSharedNetworkMapCapacities()
+	var err error
+	capacity.Proxy, err = normalizeMapCapacityValue("shared_network.map_capacity.proxy", options.Proxy, capacity.Proxy)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
+	}
+	capacity.Bypass, err = normalizeMapCapacityValue("shared_network.map_capacity.bypass", options.Bypass, capacity.Bypass)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
+	}
+	capacity.Fragment, err = normalizeMapCapacityValue("shared_network.map_capacity.fragment", options.Fragment, capacity.Fragment)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
 	}
 	return capacity, nil
 }
@@ -279,6 +298,28 @@ func normalizeSourceCIDR(name string, prefixes []netip.Prefix) (badoption.Listab
 		normalized = append(normalized, prefix)
 	}
 	return normalized, nil
+}
+
+func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.MACAddress, error) {
+	parsed := make([]ECommon.MACAddress, 0, len(addresses))
+	seen := make(map[ECommon.MACAddress]struct{}, len(addresses))
+	for index, address := range addresses {
+		hardwareAddress, err := net.ParseMAC(address)
+		if err != nil {
+			return nil, E.Cause(err, "parse shared_network.", name, "[", index, "]")
+		}
+		if len(hardwareAddress) != len(ECommon.MACAddress{}) {
+			return nil, E.New("shared_network.", name, "[", index, "] must be a 48-bit MAC address")
+		}
+		var mac ECommon.MACAddress
+		copy(mac[:], hardwareAddress)
+		if _, loaded := seen[mac]; loaded {
+			continue
+		}
+		seen[mac] = struct{}{}
+		parsed = append(parsed, mac)
+	}
+	return parsed, nil
 }
 
 func validateSharedNetworkProtocols(options option.EBPFSharedNetworkOptions, enableUDP bool, dnsMode string) error {

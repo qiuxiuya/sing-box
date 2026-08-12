@@ -64,7 +64,10 @@ type Inbound struct {
 	androidUIDOptions        *androidUIDOptions
 	localRoutes              []*localRoute
 	sharedNetworkOptions     option.EBPFSharedNetworkOptions
-	sharedNetworkMapCapacity uint32
+	sharedNetworkMapCapacity ECommon.SharedNetworkMapCapacities
+	bypassPrivateAddress     bool
+	sharedNetworkIncludeMAC  []ECommon.MACAddress
+	sharedNetworkExcludeMAC  []ECommon.MACAddress
 	sharedNetwork            *sharedNetwork
 	cgroupBackendAccess      sync.RWMutex
 	lifecycleAccess          sync.Mutex
@@ -131,11 +134,21 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err = validateDataPaths(cgroupEnabled, sharedNetworkOptions.Enabled); err != nil {
 		return nil, err
 	}
-	sharedNetworkMapCapacity, err := normalizeMapCapacityValue(
-		"shared_network.map_capacity",
-		options.SharedNetwork.MapCapacity,
-		ECommon.SharedNetworkMapCapacity,
+	sharedNetworkIncludeMAC, err := parseSharedNetworkMACAddresses(
+		"include_mac_address",
+		sharedNetworkOptions.IncludeMACAddress,
 	)
+	if err != nil {
+		return nil, err
+	}
+	sharedNetworkExcludeMAC, err := parseSharedNetworkMACAddresses(
+		"exclude_mac_address",
+		sharedNetworkOptions.ExcludeMACAddress,
+	)
+	if err != nil {
+		return nil, err
+	}
+	sharedNetworkMapCapacity, err := normalizeSharedNetworkMapCapacity(sharedNetworkOptions.MapCapacity)
 	if err != nil {
 		return nil, err
 	}
@@ -167,10 +180,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		cgroupMapCapacity:        cgroupMapCapacity,
 		sharedNetworkOptions:     sharedNetworkOptions,
 		sharedNetworkMapCapacity: sharedNetworkMapCapacity,
+		bypassPrivateAddress:     options.BypassPrivateAddress == nil || *options.BypassPrivateAddress,
+		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
+		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
 		cgroupPolicy: ECommon.CgroupPolicy{
-			HijackDNS:  dnsMode == dnsModeHijack,
-			IncludeUID: includeUIDRanges,
-			ExcludeUID: excludeUIDRanges,
+			HijackDNS: dnsMode == dnsModeHijack,
+			IncludeUIDConfigured: len(options.IncludeUID) > 0 ||
+				len(options.IncludeUIDRange) > 0 || len(options.IncludePackage) > 0,
+			IncludeUID:              includeUIDRanges,
+			ExcludeUID:              excludeUIDRanges,
+			ExcludeAndroidDNSTether: runtime.GOOS == "android",
 		},
 		androidUIDOptions: newAndroidUIDOptions(options),
 	}

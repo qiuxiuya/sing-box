@@ -4,7 +4,7 @@
 // Experimental cgroup backend implemented as BPF C. The production
 // testing-ref1nd branch retains the hand-written instruction emitter.
 
-#include "ebpf.h"
+#include "abi.h"
 
 #include <linux/bpf.h>
 #include <linux/in.h>
@@ -24,6 +24,12 @@ enum flow_cache_result {
     FLOW_CACHE_MISS,
     FLOW_CACHE_BYPASS,
     FLOW_CACHE_PROXY,
+};
+
+enum cgroup_protocol_mode {
+    CGROUP_PROTOCOL_AUTO,
+    CGROUP_PROTOCOL_TCP_ONLY,
+    CGROUP_PROTOCOL_UDP_ONLY,
 };
 
 struct bpf_map_def {
@@ -47,8 +53,7 @@ MAP(cgroup_udp_token, __u64, struct sb_ebpf_listener_key, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value, BPF_MAP_TYPE_HASH);
 MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
 MAP(cgroup_socket_bypass, __u64, __u8, BPF_MAP_TYPE_LRU_HASH);
-MAP(cgroup_include_uid, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
-MAP(cgroup_exclude_uid, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_ipv6_available, __u32, __u32, BPF_MAP_TYPE_ARRAY);
@@ -82,20 +87,20 @@ INLINE bool is_cookie_bypassed(void *ctx) {
 }
 
 INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
-    if ((config->flags & (SB_EBPF_CGROUP_FLAG_INCLUDE_UID | SB_EBPF_CGROUP_FLAG_EXCLUDE_UID)) == 0U) {
-        return false;
-    }
+    if ((config->flags & (SB_EBPF_CGROUP_FLAG_UID_POLICY |
+        SB_EBPF_CGROUP_FLAG_EXCLUDE_ANDROID_DNS_TETHER)) == 0U) return false;
+    __u32 uid = swap32((__u32)get_current_uid_gid());
+    if ((config->flags & SB_EBPF_CGROUP_FLAG_EXCLUDE_ANDROID_DNS_TETHER) != 0U &&
+        uid == SB_EBPF_ANDROID_DNS_TETHER_UID) return true;
+    if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
     struct sb_ebpf_uid_lpm_key key = {
         .prefixlen = 32U,
     };
-    __u32 uid = swap32((__u32)get_current_uid_gid());
     __builtin_memcpy(key.uid, &uid, sizeof(uid));
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_EXCLUDE_UID) != 0U &&
-        map_lookup(&cgroup_exclude_uid, &key) != 0) {
-        return true;
-    }
-    return (config->flags & SB_EBPF_CGROUP_FLAG_INCLUDE_UID) != 0U &&
-        map_lookup(&cgroup_include_uid, &key) == 0;
+    bool matched = map_lookup(&cgroup_uid_policy, &key) != 0;
+    return (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
+        ? !matched
+        : matched;
 }
 
 INLINE bool protocol_selected(const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
@@ -217,6 +222,7 @@ INLINE bool token_v4(
     key->family = AF_INET_VALUE;
     key->protocol = protocol;
     key->listener_port = config->listener_port;
+#pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < REDIRECT_TOKEN_ATTEMPTS; ++attempt) {
         __u32 candidate = config->redirect_ipv4_prefix |
             (seed & config->redirect_ipv4_host_mask);
@@ -248,6 +254,7 @@ INLINE bool token_v6(
     key->family = AF_INET6_VALUE;
     key->protocol = protocol;
     key->listener_port = config->listener_port;
+#pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < REDIRECT_TOKEN_ATTEMPTS; ++attempt) {
         __builtin_memcpy(key->token_addr, config->redirect_ipv6_prefix, 8U);
         __builtin_memcpy(key->token_addr + 8U, &seed0, 4U);
@@ -276,11 +283,11 @@ INLINE bool rewrite_v4(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_
 INLINE bool rewrite_v6(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_key *key) {
     __u32 address[4];
     __builtin_memcpy(address, key->token_addr, sizeof(address));
-    // Older Android verifiers reject spilled pointers derived from ctx->user_ip6.
-    ctx->user_ip6[0] = address[0];
-    ctx->user_ip6[1] = address[1];
-    ctx->user_ip6[2] = address[2];
-    ctx->user_ip6[3] = address[3];
+    // Linux 4.19 verifiers require fixed-offset 32-bit accesses to user_ip6.
+    *(volatile __u32 *)&ctx->user_ip6[0] = address[0];
+    *(volatile __u32 *)&ctx->user_ip6[1] = address[1];
+    *(volatile __u32 *)&ctx->user_ip6[2] = address[2];
+    *(volatile __u32 *)&ctx->user_ip6[3] = address[3];
     ctx->user_port = swap16(key->listener_port);
     return true;
 }
@@ -288,10 +295,10 @@ INLINE bool rewrite_v6(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_
 INLINE bool rewrite_v4_mapped(struct bpf_sock_addr *ctx, const struct sb_ebpf_listener_key *key) {
     __u32 address;
     __builtin_memcpy(&address, key->token_addr, sizeof(address));
-    ctx->user_ip6[0] = 0U;
-    ctx->user_ip6[1] = 0U;
-    ctx->user_ip6[2] = 0xffff0000U;
-    ctx->user_ip6[3] = address;
+    *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
+    *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
+    *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+    *(volatile __u32 *)&ctx->user_ip6[3] = address;
     ctx->user_port = swap16(key->listener_port);
     return true;
 }
@@ -446,10 +453,23 @@ INLINE bool restore_udp_peer_for_empty_v6(
     return true;
 }
 
-INLINE int handle_v4(struct bpf_sock_addr *ctx, bool tgid_mode, bool connect_hook) {
+INLINE int handle_v4(
+    struct bpf_sock_addr *ctx,
+    bool tgid_mode,
+    bool connect_hook,
+    enum cgroup_protocol_mode protocol_mode) {
     const struct sb_ebpf_cgroup_control *config = control();
     if (config == 0) return 1;
-    __u8 protocol = connect_hook ? ctx->protocol : UDP_VALUE;
+    __u8 protocol;
+    if (protocol_mode == CGROUP_PROTOCOL_TCP_ONLY) {
+        if (!connect_hook || ctx->protocol != TCP_VALUE) return 1;
+        protocol = TCP_VALUE;
+    } else if (protocol_mode == CGROUP_PROTOCOL_UDP_ONLY) {
+        if (!connect_hook || ctx->protocol != UDP_VALUE) return 1;
+        protocol = UDP_VALUE;
+    } else {
+        protocol = connect_hook ? ctx->protocol : UDP_VALUE;
+    }
     __u16 port = swap16((__u16)ctx->user_port);
     if (base_bypass(ctx, config, protocol, port, tgid_mode)) return 1;
     __u64 cookie = get_socket_cookie(ctx);
@@ -502,12 +522,26 @@ INLINE int handle_v4(struct bpf_sock_addr *ctx, bool tgid_mode, bool connect_hoo
     return rewrite_v4(ctx, &listener) ? 1 : 0;
 }
 
-INLINE int handle_v6(struct bpf_sock_addr *ctx, bool tgid_mode, bool connect_hook) {
+INLINE int handle_v6(
+    struct bpf_sock_addr *ctx,
+    bool tgid_mode,
+    bool connect_hook,
+    bool enable_native_ipv6,
+    enum cgroup_protocol_mode protocol_mode) {
     const struct sb_ebpf_cgroup_control *config = control();
     if (config == 0) return 1;
     __u32 address[4];
     __builtin_memcpy(address, ctx->user_ip6, sizeof(address));
-    __u8 protocol = connect_hook ? ctx->protocol : UDP_VALUE;
+    __u8 protocol;
+    if (protocol_mode == CGROUP_PROTOCOL_TCP_ONLY) {
+        if (!connect_hook || ctx->protocol != TCP_VALUE) return 1;
+        protocol = TCP_VALUE;
+    } else if (protocol_mode == CGROUP_PROTOCOL_UDP_ONLY) {
+        if (!connect_hook || ctx->protocol != UDP_VALUE) return 1;
+        protocol = UDP_VALUE;
+    } else {
+        protocol = connect_hook ? ctx->protocol : UDP_VALUE;
+    }
     __u16 port = swap16((__u16)ctx->user_port);
     if (base_bypass(ctx, config, protocol, port, tgid_mode)) return 1;
     __u64 cookie = get_socket_cookie(ctx);
@@ -560,6 +594,7 @@ INLINE int handle_v6(struct bpf_sock_addr *ctx, bool tgid_mode, bool connect_hoo
         }
         return rewrite_v4_mapped(ctx, &listener) ? 1 : 0;
     }
+    if (!enable_native_ipv6) return 1;
     if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV6) == 0U || !ipv6_available(config)) return 1;
     if (connected_udp) {
         reset_connected_udp(cookie);
@@ -601,14 +636,30 @@ INLINE int handle_v6(struct bpf_sock_addr *ctx, bool tgid_mode, bool connect_hoo
     return rewrite_v6(ctx, &listener) ? 1 : 0;
 }
 
-SEC("cgroup/connect4_tgid") int sb_ebpf_conn4_tgid(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, true); }
-SEC("cgroup/connect4_cookie") int sb_ebpf_conn4_cookie(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, true); }
-SEC("cgroup/sendmsg4_tgid") int sb_ebpf_udp4_tgid(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, false); }
-SEC("cgroup/sendmsg4_cookie") int sb_ebpf_udp4_cookie(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, false); }
-SEC("cgroup/connect6_tgid") int sb_ebpf_conn6_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true); }
-SEC("cgroup/connect6_cookie") int sb_ebpf_conn6_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true); }
-SEC("cgroup/sendmsg6_tgid") int sb_ebpf_udp6_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, false); }
-SEC("cgroup/sendmsg6_cookie") int sb_ebpf_udp6_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, false); }
+SEC("cgroup/connect4_tgid") int sb_ebpf_conn4_tgid(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect4_cookie") int sb_ebpf_conn4_cookie(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect4_tgid_tcp") int sb_ebpf_conn4_tgid_tcp(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, true, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect4_cookie_tcp") int sb_ebpf_conn4_cookie_tcp(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, true, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect4_tgid_udp") int sb_ebpf_conn4_tgid_udp(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, true, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/connect4_cookie_udp") int sb_ebpf_conn4_cookie_udp(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, true, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/sendmsg4_tgid") int sb_ebpf_udp4_tgid(struct bpf_sock_addr *ctx) { return handle_v4(ctx, true, false, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/sendmsg4_cookie") int sb_ebpf_udp4_cookie(struct bpf_sock_addr *ctx) { return handle_v4(ctx, false, false, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect6_tgid") int sb_ebpf_conn6_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect6_cookie") int sb_ebpf_conn6_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect6_tgid_tcp") int sb_ebpf_conn6_tgid_tcp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, true, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect6_cookie_tcp") int sb_ebpf_conn6_cookie_tcp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, true, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect6_tgid_udp") int sb_ebpf_conn6_tgid_udp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, true, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/connect6_cookie_udp") int sb_ebpf_conn6_cookie_udp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, true, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/connect6_mapped_tgid") int sb_ebpf_conn6_mapped_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, false, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect6_mapped_cookie") int sb_ebpf_conn6_mapped_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, false, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/connect6_mapped_tgid_tcp") int sb_ebpf_conn6_mapped_tgid_tcp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, false, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect6_mapped_cookie_tcp") int sb_ebpf_conn6_mapped_cookie_tcp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, false, CGROUP_PROTOCOL_TCP_ONLY); }
+SEC("cgroup/connect6_mapped_tgid_udp") int sb_ebpf_conn6_mapped_tgid_udp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, true, false, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/connect6_mapped_cookie_udp") int sb_ebpf_conn6_mapped_cookie_udp(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, true, false, CGROUP_PROTOCOL_UDP_ONLY); }
+SEC("cgroup/sendmsg6_tgid") int sb_ebpf_udp6_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, false, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/sendmsg6_cookie") int sb_ebpf_udp6_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, false, true, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/sendmsg6_mapped_tgid") int sb_ebpf_udp6_mapped_tgid(struct bpf_sock_addr *ctx) { return handle_v6(ctx, true, false, false, CGROUP_PROTOCOL_AUTO); }
+SEC("cgroup/sendmsg6_mapped_cookie") int sb_ebpf_udp6_mapped_cookie(struct bpf_sock_addr *ctx) { return handle_v6(ctx, false, false, false, CGROUP_PROTOCOL_AUTO); }
 
 INLINE int recv_v4(struct bpf_sock_addr *ctx) {
     const struct sb_ebpf_cgroup_control *config = control();
@@ -628,7 +679,7 @@ INLINE int recv_v4(struct bpf_sock_addr *ctx) {
     return 1;
 }
 
-INLINE int recv_v6(struct bpf_sock_addr *ctx) {
+INLINE int recv_v6(struct bpf_sock_addr *ctx, bool enable_native_ipv6) {
     const struct sb_ebpf_cgroup_control *config = control();
     if (config == 0) return 1;
     __u32 address[4];
@@ -645,13 +696,14 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx) {
         if (original == 0 || original->family != AF_INET_VALUE) return 1;
         __u32 original_address;
         __builtin_memcpy(&original_address, original->addr, sizeof(original_address));
-        ctx->user_ip6[0] = 0U;
-        ctx->user_ip6[1] = 0U;
-        ctx->user_ip6[2] = 0xffff0000U;
-        ctx->user_ip6[3] = original_address;
+        *(volatile __u32 *)&ctx->user_ip6[0] = 0U;
+        *(volatile __u32 *)&ctx->user_ip6[1] = 0U;
+        *(volatile __u32 *)&ctx->user_ip6[2] = 0xffff0000U;
+        *(volatile __u32 *)&ctx->user_ip6[3] = original_address;
         ctx->user_port = swap16(original->port);
         return 1;
     }
+    if (!enable_native_ipv6) return 1;
     if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV6) == 0U) return 1;
     __u32 redirect_prefix[2];
     __builtin_memcpy(redirect_prefix, config->redirect_ipv6_prefix, sizeof(redirect_prefix));
@@ -663,17 +715,17 @@ INLINE int recv_v6(struct bpf_sock_addr *ctx) {
     if (original == 0 || original->family != AF_INET6_VALUE) return 1;
     __u32 original_address[4];
     __builtin_memcpy(original_address, original->addr, sizeof(original_address));
-    // Keep each ctx write at a verifier-visible constant offset.
-    ctx->user_ip6[0] = original_address[0];
-    ctx->user_ip6[1] = original_address[1];
-    ctx->user_ip6[2] = original_address[2];
-    ctx->user_ip6[3] = original_address[3];
+    *(volatile __u32 *)&ctx->user_ip6[0] = original_address[0];
+    *(volatile __u32 *)&ctx->user_ip6[1] = original_address[1];
+    *(volatile __u32 *)&ctx->user_ip6[2] = original_address[2];
+    *(volatile __u32 *)&ctx->user_ip6[3] = original_address[3];
     ctx->user_port = swap16(original->port);
     return 1;
 }
 
 SEC("cgroup/recvmsg4") int sb_ebpf_urcv4_c(struct bpf_sock_addr *ctx) { return recv_v4(ctx); }
-SEC("cgroup/recvmsg6") int sb_ebpf_urcv6_c(struct bpf_sock_addr *ctx) { return recv_v6(ctx); }
+SEC("cgroup/recvmsg6") int sb_ebpf_urcv6_c(struct bpf_sock_addr *ctx) { return recv_v6(ctx, true); }
+SEC("cgroup/recvmsg6_mapped") int sb_ebpf_urcv6_mapped_c(struct bpf_sock_addr *ctx) { return recv_v6(ctx, false); }
 
 INLINE int release_socket(struct bpf_sock *ctx, bool delete_bypass) {
     __u64 cookie = get_socket_cookie(ctx);
