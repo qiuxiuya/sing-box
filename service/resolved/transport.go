@@ -6,7 +6,6 @@ import (
 	"context"
 	"net/netip"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,7 +197,7 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 			if domain.Domain == "." && domain.RoutingOnly && !t.acceptDefaultResolvers {
 				continue
 			}
-			if strings.HasSuffix(question.Name, domain.Domain) {
+			if mDNS.IsSubDomain(domain.Domain, question.Name) {
 				selectedLink = link
 			}
 		}

@@ -283,12 +283,29 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if metadata.FakeIP || metadata.DestOverride {
 		conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 	}
+	onClose = r.wrapQUICSniffIdleCache(metadata, onClose)
 	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandlerEx); isHandler {
 		outboundHandler.NewPacketConnectionEx(ctx, conn, metadata, onClose)
 	} else {
 		r.connection.NewPacketConnection(ctx, selectedOutbound, conn, metadata, onClose)
 	}
 	return nil
+}
+
+func (r *Router) wrapQUICSniffIdleCache(metadata adapter.InboundContext, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
+	if onClose == nil || metadata.Protocol != C.ProtocolQUIC || metadata.SniffHost == "" {
+		return onClose
+	}
+	source := metadata.Source
+	destination := metadata.Destination
+	if metadata.DestOverride && metadata.OriginDestination.IsValid() {
+		destination = metadata.OriginDestination
+	}
+	sniffHost := metadata.SniffHost
+	return func(err error) {
+		r.refreshQUICSniff(source, destination, sniffHost)
+		onClose(err)
+	}
 }
 
 func (r *Router) PreMatch(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration, supportBypass bool) (tun.DirectRouteDestination, error) {

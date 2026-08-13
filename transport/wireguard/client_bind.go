@@ -20,6 +20,11 @@ import (
 
 var _ conn.Bind = (*ClientBind)(nil)
 
+const (
+	clientBindPausePollInterval = 100 * time.Millisecond
+	clientBindRetryInterval     = time.Second
+)
+
 type ClientBind struct {
 	ctx                 context.Context
 	logger              logger.Logger
@@ -123,7 +128,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		c.logger.Error(E.Cause(err, "connect to server"))
 		err = nil
-		if !c.waitActive() || !c.waitRetry() {
+		if !c.waitAfterFailure() {
 			return
 		}
 		return
@@ -173,7 +178,7 @@ func (c *ClientBind) SetMark(mark uint32) error {
 func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 	udpConn, err := c.connect()
 	if err != nil {
-		if !c.waitActive() || !c.waitRetry() {
+		if !c.waitAfterFailure() {
 			return err
 		}
 		return err
@@ -217,15 +222,22 @@ func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved
 
 func (c *ClientBind) waitActive() bool {
 	for c.pauseManager != nil && c.pauseManager.IsPaused() {
-		if !c.waitRetry() {
+		if !c.waitDelay(clientBindPausePollInterval) {
 			return false
 		}
 	}
 	return !isDone(c.done)
 }
 
-func (c *ClientBind) waitRetry() bool {
-	timer := time.NewTimer(time.Second)
+func (c *ClientBind) waitAfterFailure() bool {
+	if c.pauseManager != nil && c.pauseManager.IsPaused() {
+		return c.waitActive()
+	}
+	return c.waitDelay(clientBindRetryInterval)
+}
+
+func (c *ClientBind) waitDelay(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-c.done:

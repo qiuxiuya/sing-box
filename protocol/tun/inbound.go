@@ -198,6 +198,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			IncludePackage:                        options.IncludePackage,
 			ExcludePackage:                        options.ExcludePackage,
 			InterfaceMonitor:                      networkManager.InterfaceMonitor(),
+			Logger:                                logger,
 			EXP_MultiPendingPackets:               multiPendingPackets,
 		},
 		udpTimeout:        udpTimeout,
@@ -303,7 +304,6 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			t.tunOptions.Name = tun.CalculateInterfaceName("")
 		}
 		if t.platformInterface == nil {
-			t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
 			for _, routeRuleSet := range t.routeRuleSet {
 				ipSets := routeRuleSet.ExtractIPSet()
 				if len(ipSets) == 0 {
@@ -315,7 +315,6 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 					t.routeRuleSetCallback = append(t.routeRuleSetCallback, routeRuleSet.RegisterCallback(t.updateRouteAddressSet))
 				}
 			}
-			t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
 			for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
 				ipSets := routeExcludeRuleSet.ExtractIPSet()
 				if len(ipSets) == 0 {

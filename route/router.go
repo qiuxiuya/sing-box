@@ -4,10 +4,10 @@ import (
 	"context"
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/expiringmap"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
@@ -47,7 +47,7 @@ type Router struct {
 	platformInterface adapter.PlatformInterface
 	started           bool
 
-	quicSniffCache sync.Map
+	quicSniffCache *expiringmap.Map[quicSniffCacheKey, string]
 
 	defaultDomainMatchStrategy C.DomainMatchStrategy
 	reloadChan                 chan<- struct{}
@@ -69,6 +69,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
 		pauseManager:      service.FromContext[pause.Manager](ctx),
 		platformInterface: service.FromContext[adapter.PlatformInterface](ctx),
+		quicSniffCache:    expiringmap.New[quicSniffCacheKey, string](quicSniffCacheTTL),
 
 		defaultDomainMatchStrategy: C.DomainMatchStrategy(options.DefaultDomainMatchStrategy),
 		reloadChan:                 reloadChan,
@@ -197,6 +198,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 }
 
 func (r *Router) Close() error {
+	r.quicSniffCache.Close()
 	monitor := taskmonitor.New(r.logger, C.StopTimeout)
 	var err error
 	for i, rule := range r.rules {
@@ -256,30 +258,18 @@ type quicSniffCacheKey struct {
 	destination M.Socksaddr
 }
 
-type quicSniffCacheEntry struct {
-	sniffHost string
-	expiry    time.Time
-}
-
 func (r *Router) cacheQUICSniff(source, destination M.Socksaddr, sniffHost string) {
-	r.quicSniffCache.Store(quicSniffCacheKey{source, destination}, quicSniffCacheEntry{
-		sniffHost: sniffHost,
-		expiry:    time.Now().Add(quicSniffCacheTTL),
-	})
+	r.quicSniffCache.Store(quicSniffCacheKey{source, destination}, sniffHost)
 }
 
 func (r *Router) lookupQUICSniff(source, destination M.Socksaddr) (string, bool) {
-	key := quicSniffCacheKey{source, destination}
-	v, ok := r.quicSniffCache.Load(key)
-	if !ok {
-		return "", false
-	}
-	entry := v.(quicSniffCacheEntry)
-	if time.Now().After(entry.expiry) {
-		r.quicSniffCache.Delete(key)
-		return "", false
-	}
-	return entry.sniffHost, true
+	return r.quicSniffCache.LoadAndRefresh(quicSniffCacheKey{source, destination})
+}
+
+func (r *Router) refreshQUICSniff(source, destination M.Socksaddr, sniffHost string) {
+	r.quicSniffCache.StoreIf(quicSniffCacheKey{source, destination}, sniffHost, func(current string, loaded bool) bool {
+		return !loaded || current == sniffHost
+	})
 }
 
 func (r *Router) DefaultDomainMatchStrategy() C.DomainMatchStrategy {

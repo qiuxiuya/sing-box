@@ -81,12 +81,12 @@ func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.H
 }
 
 func (s *LocalRuleSet) reloadFile(path string) error {
-	file, err := os.Open(path)
+	file, err := filemanager.OpenFile(s.ctx, path, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	content, err := io.ReadAll(file)
-	file.Close()
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	fs, err := os.Stat(path)
+	fs, err := file.Stat()
 	if err != nil {
 		return err
 	}

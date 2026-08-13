@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -72,6 +74,7 @@ type ProviderRemote struct {
 
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
+	overrideAnyTLS *option.OverrideAnyTLSOptions
 }
 
 func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderRemoteOptions) (adapter.Provider, error) {
@@ -121,6 +124,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 		overrideDialer: options.OverrideDialer,
 		overrideTLS:    options.OverrideTLS,
+		overrideAnyTLS: options.OverrideAnyTLS,
 	}, nil
 }
 
@@ -252,7 +256,9 @@ func (s *ProviderRemote) fetch(ctx context.Context, startContext *adapter.HTTPSt
 				Outbounds: s.lastOutOpts,
 				Endpoints: s.lastEPOpts,
 			})
-			s.saveCacheFile(hasInfo, info, content)
+			if err := s.saveCacheFile(hasInfo, info, content); err != nil {
+				return E.Cause(err, "save outbound provider cache file")
+			}
 		}
 		s.logger.Info("update outbound provider ", s.Tag(), ": not modified")
 		return nil
@@ -292,7 +298,9 @@ func (s *ProviderRemote) fetch(ctx context.Context, startContext *adapter.HTTPSt
 			Endpoints: s.lastEPOpts,
 		})
 		if s.path != "" {
-			s.saveCacheFile(hasInfo, info, content)
+			if err = s.saveCacheFile(hasInfo, info, content); err != nil {
+				return E.Cause(err, "save outbound provider cache file")
+			}
 		} else if hasInfo {
 			content = append([]byte(infoStr+"\n"), content...)
 		}
@@ -326,21 +334,25 @@ func (s *ProviderRemote) loadCacheFile() error {
 		}
 	}
 	if s.path != "" {
-		exists, err := pathExists(s.path)
-		if err != nil {
-			return err
-		}
-		if !exists {
+		file, err := filemanager.OpenFile(s.ctx, s.path, os.O_RDONLY, 0)
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		file, err := os.Open(s.path)
 		if err != nil {
 			return err
 		}
 		content, err = io.ReadAll(file)
-		file.Close()
+		if err != nil {
+			file.Close()
+			return err
+		}
+		fileInfo, err := file.Stat()
+		closeErr := file.Close()
 		if err != nil {
 			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		if saveSub != nil {
 			if !s.hash.Equal(hash.MakeHash(content)) {
@@ -349,11 +361,7 @@ func (s *ProviderRemote) loadCacheFile() error {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {
-			fs, err := os.Stat(s.path)
-			if err != nil {
-				return err
-			}
-			lastUpdated = fs.ModTime()
+			lastUpdated = fileInfo.ModTime()
 		}
 	} else if saveSub != nil && len(saveSub.Content) > 0 {
 		content = saveSub.Content
@@ -388,17 +396,6 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	return nil
 }
 
-func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
-}
-
 func (s *ProviderRemote) loopUpdate() {
 	s.ticker.Stop()
 	select {
@@ -427,7 +424,7 @@ func (s *ProviderRemote) loopUpdate() {
 	}
 }
 
-func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionInfo, contentRaw []byte) {
+func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionInfo, contentRaw []byte) error {
 	content := contentRaw
 	if hasInfo {
 		infoStr := fmt.Sprint(
@@ -438,16 +435,19 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 			";")
 		content = append([]byte(infoStr+"\n"), content...)
 	}
-	s.hash = hash.MakeHash(content)
 	dir := filepath.Dir(s.path)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		filemanager.MkdirAll(s.ctx, dir, 0o755)
+	if err := filemanager.MkdirAll(s.ctx, dir, 0o755); err != nil {
+		return err
 	}
-	filemanager.WriteFile(s.ctx, s.path, []byte(content), 0o666)
+	if err := filemanager.WriteFile(s.ctx, s.path, content, 0o666); err != nil {
+		return err
+	}
+	s.hash = hash.MakeHash(content)
+	return nil
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
 	if err != nil {
 		return err
 	}

@@ -486,19 +486,19 @@ type SnellOption struct {
 }
 
 func (s *SnellOption) Build() any {
-	version := s.Version
-	if version == 5 {
-		version = 4
-	}
 	return &option.SnellOutboundOptions{
-		DialerOptions: s.DialerOptions.Build(),
-		ServerOptions: s.ServerOptions.Build(),
-		PSK:           s.PSK,
-		Version:       version,
-		Reuse:         s.Reuse,
-		Network:       clashSnellNetworks(s.UDP),
-		ObfsMode:      clashStringOption(s.ObfsOpts, "mode"),
-		ObfsHost:      clashStringOption(s.ObfsOpts, "host"),
+		Version: s.Version,
+		AbstractSnellOutboundOptions: option.AbstractSnellOutboundOptions{
+			DialerOptions: s.DialerOptions.Build(),
+			ServerOptions: s.ServerOptions.Build(),
+			PSK:           s.PSK,
+			Reuse:         s.Reuse,
+			Network:       clashSnellNetworks(s.UDP),
+		},
+		ObfsOptions: option.SnellObfsClientOptions{
+			ObfsMode: clashStringOption(s.ObfsOpts, "mode"),
+			ObfsHost: clashStringOption(s.ObfsOpts, "host"),
+		},
 	}
 }
 
@@ -511,6 +511,7 @@ type AnyTLSOption struct {
 	IdleSessionCheckInterval int    `yaml:"idle-session-check-interval,omitempty"`
 	IdleSessionTimeout       int    `yaml:"idle-session-timeout,omitempty"`
 	MinIdleSession           int    `yaml:"min-idle-session,omitempty"`
+	DisableReuse             bool   `yaml:"disable-reuse,omitempty"`
 }
 
 func (a *AnyTLSOption) Build() any {
@@ -523,6 +524,7 @@ func (a *AnyTLSOption) Build() any {
 		IdleSessionCheckInterval:    badoption.Duration(a.IdleSessionCheckInterval),
 		IdleSessionTimeout:          badoption.Duration(a.IdleSessionTimeout),
 		MinIdleSession:              a.MinIdleSession,
+		DisableReuse:                a.DisableReuse,
 	}
 }
 

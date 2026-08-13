@@ -23,7 +23,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
-	"github.com/sagernet/sing/common/rw"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 	"github.com/sagernet/sing/service/pause"
@@ -180,7 +179,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, startContext *adapter.HTTPSta
 	case http.StatusNotModified:
 		s.lastUpdated = time.Now()
 		if s.path != "" {
-			os.Chtimes(s.path, s.lastUpdated, s.lastUpdated)
+			if err = os.Chtimes(s.path, s.lastUpdated, s.lastUpdated); err != nil {
+				s.logger.WarnContext(ctx, "update rule-set file modification time: ", err)
+			}
 		}
 		if s.cacheFile != nil {
 			if savedRuleSet := s.cacheFile.LoadRuleSet(s.tag); savedRuleSet != nil {
@@ -212,7 +213,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, startContext *adapter.HTTPSta
 	}
 	s.lastUpdated = time.Now()
 	if s.path != "" {
-		s.saveCacheFile(content)
+		if err = s.saveCacheFile(content); err != nil {
+			return E.Cause(err, "save rule-set cache file")
+		}
 	}
 	if s.cacheFile != nil {
 		savedRuleSet := &adapter.SavedBinary{
@@ -250,12 +253,12 @@ func (s *RemoteRuleSet) loadCacheFile() error {
 		if !exists {
 			return nil
 		}
-		file, err := os.Open(s.path)
+		file, err := filemanager.OpenFile(s.ctx, s.path, os.O_RDONLY, 0)
 		if err != nil {
 			return err
 		}
+		defer file.Close()
 		content, err = io.ReadAll(file)
-		file.Close()
 		if err != nil {
 			return err
 		}
@@ -266,7 +269,7 @@ func (s *RemoteRuleSet) loadCacheFile() error {
 			lastUpdated = savedSet.LastUpdated
 			lastEtag = savedSet.LastEtag
 		} else {
-			fs, err := os.Stat(s.path)
+			fs, err := file.Stat()
 			if err != nil {
 				return err
 			}
@@ -287,26 +290,29 @@ func (s *RemoteRuleSet) loadCacheFile() error {
 }
 
 func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path)
+	info, err := os.Stat(path)
 	if err == nil {
+		if info.IsDir() {
+			return false, E.New("rule_set path is a directory: ", path)
+		}
 		return true, nil
 	}
 	if os.IsNotExist(err) {
 		return false, nil
 	}
-	if rw.IsDir(path) {
-		return false, E.New("rule_set path is a directory: ", path)
-	}
 	return false, err
 }
 
-func (s *RemoteRuleSet) saveCacheFile(contentRaw []byte) {
-	s.hash = hash.MakeHash(contentRaw)
+func (s *RemoteRuleSet) saveCacheFile(content []byte) error {
 	dir := filepath.Dir(s.path)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		filemanager.MkdirAll(s.ctx, dir, 0o755)
+	if err := filemanager.MkdirAll(s.ctx, dir, 0o755); err != nil {
+		return err
 	}
-	filemanager.WriteFile(s.ctx, s.path, []byte(contentRaw), 0o666)
+	if err := filemanager.WriteFile(s.ctx, s.path, content, 0o666); err != nil {
+		return err
+	}
+	s.hash = hash.MakeHash(content)
+	return nil
 }
 
 func (s *RemoteRuleSet) Close() error {

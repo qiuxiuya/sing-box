@@ -52,6 +52,7 @@ type ProviderLocalOptions struct {
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
+	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
@@ -67,6 +68,7 @@ type ProviderRemoteOptions struct {
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
+	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
 }
 
 type ProviderInlineOptions struct {
@@ -109,10 +111,16 @@ type OverrideDialerOptions struct {
 	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty"`
 }
 
+type OverrideAnyTLSOptions struct {
+	ClientMetadata *string `json:"client_metadata,omitempty"`
+	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
+}
+
 type OverrideTLSOptions struct {
 	Enabled                    *bool                                `json:"enabled,omitempty"`
 	DisableSNI                 *bool                                `json:"disable_sni,omitempty"`
 	ServerName                 *string                              `json:"server_name,omitempty"`
+	CertificateServerName      *string                              `json:"certificate_server_name,omitempty"`
 	Insecure                   *bool                                `json:"insecure,omitempty"`
 	ALPN                       *badoption.Listable[string]          `json:"alpn,omitempty"`
 	MinVersion                 *string                              `json:"min_version,omitempty"`
