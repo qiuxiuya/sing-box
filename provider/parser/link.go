@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"net/netip"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 func ParseSubscriptionLink(link string) (option.Outbound, error) {
@@ -128,6 +130,20 @@ func v2rayTransportWs(host string, path string) option.V2RayWebsocketOptions {
 		v2rayTransportWsPath(&WebsocketOptions, path)
 	}
 	return WebsocketOptions
+}
+
+func v2rayHostTLSServerName(server string, host string) string {
+	// Some legacy links use the HTTP host as the certificate name when dialing an IP.
+	if _, err := netip.ParseAddr(server); err != nil {
+		return ""
+	}
+	if host == "" || strings.ContainsAny(host, ",:") || !M.IsDomainName(host) {
+		return ""
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return ""
+	}
+	return host
 }
 
 func parseShadowsocksLink(link string) (option.Outbound, error) {
@@ -369,6 +385,20 @@ func parseVMessLink(link string) (option.Outbound, error) {
 			}
 		}
 	}
+	if TLSOptions.Enabled && proxy["sni"] == "" {
+		transportType := proxy["net"]
+		if transportType == "h2" || transportType == "tcp" && proxy["type"] == "http" {
+			transportType = "http"
+		}
+		if transportType == "ws" || transportType == "http" {
+			if serverName := v2rayHostTLSServerName(proxy["add"], proxy["host"]); serverName != "" {
+				TLSOptions.ServerName = serverName
+			}
+		}
+	}
+	if serverName := proxy["sni"]; serverName != "" {
+		TLSOptions.ServerName = serverName
+	}
 	if TLSOptions.Enabled {
 		options.TLS = &TLSOptions
 	}
@@ -467,6 +497,17 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 				options.TCPFastOpen = true
 			}
 		}
+	}
+	if proxy["security"] == "tls" && proxy["sni"] == "" && proxy["peer"] == "" && proxy["serviceName"] == "" {
+		transportType := proxy["type"]
+		if transportType == "ws" || transportType == "http" {
+			if serverName := v2rayHostTLSServerName(options.Server, proxy["host"]); serverName != "" {
+				TLSOptions.ServerName = serverName
+			}
+		}
+	}
+	if serverName := proxy["sni"]; serverName != "" {
+		TLSOptions.ServerName = serverName
 	}
 	outbound := option.Outbound{
 		Type: C.TypeVLESS,

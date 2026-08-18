@@ -44,24 +44,26 @@ var _ adapter.CacheFile = (*CacheFile)(nil)
 var _ adapter.RDRCStoreWithKey = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx               context.Context
-	path              string
-	cacheID           []byte
-	storeFakeIP       bool
-	storeRDRC         bool
-	rdrcTimeout       time.Duration
-	DB                *bbolt.DB
-	resetAccess       sync.Mutex
-	saveMetadataTimer *time.Timer
-	saveFakeIPAccess  sync.RWMutex
-	saveDomain        map[netip.Addr]string
-	saveAddress4      map[string]netip.Addr
-	saveAddress6      map[string]netip.Addr
-	saveRDRCAccess    sync.RWMutex
-	saveRDRC          map[adapter.DNSCacheKey]bool
-	saveRDRCQueue     chan saveRDRCRequest
-	rdrcCleanupAccess sync.Mutex
-	rdrcNextCleanup   time.Time
+	ctx                context.Context
+	path               string
+	cacheID            []byte
+	storeFakeIP        bool
+	storeRDRC          bool
+	rdrcTimeout        time.Duration
+	DB                 *bbolt.DB
+	resetAccess        sync.Mutex
+	saveMetadataAccess sync.Mutex
+	saveMetadata       *adapter.FakeIPMetadata
+	saveMetadataTimer  *time.Timer
+	saveFakeIPAccess   sync.RWMutex
+	saveDomain         map[netip.Addr]string
+	saveAddress4       map[string]netip.Addr
+	saveAddress6       map[string]netip.Addr
+	saveRDRCAccess     sync.RWMutex
+	saveRDRC           map[adapter.DNSCacheKey]bool
+	saveRDRCQueue      chan saveRDRCRequest
+	rdrcCleanupAccess  sync.Mutex
+	rdrcNextCleanup    time.Time
 }
 
 func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
