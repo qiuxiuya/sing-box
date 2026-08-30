@@ -98,7 +98,7 @@ type InboundContext struct {
 	SourcePortMatch              bool
 	DestinationAddressMatch      bool
 	DestinationPortMatch         bool
-	DidMatch                     bool
+	DefinitiveMatchStates        uint16
 	IgnoreDestinationIPCIDRMatch bool
 
 	// extended metadata
@@ -139,7 +139,7 @@ func (c *InboundContext) ResetRuleMatchCache() {
 	c.SourcePortMatch = false
 	c.DestinationAddressMatch = false
 	c.DestinationPortMatch = false
-	c.DidMatch = false
+	c.DefinitiveMatchStates = 0
 }
 
 type inboundContextKey struct{}
