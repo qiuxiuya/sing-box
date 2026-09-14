@@ -81,6 +81,7 @@ jobs:
         id: outputs
         run: |-
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build binary
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
@@ -350,9 +351,24 @@ jobs:
             DIR_NAME="${DIR_NAME}-musl"
           fi
           echo "DIR_NAME=${DIR_NAME}" >> "${GITHUB_ENV}"
-          PKG_VERSION="${{ needs.calculate_version.outputs.version }}"
-          PKG_VERSION="${PKG_VERSION//-/\~}"
+
+          RAW_VERSION="${{ needs.calculate_version.outputs.version }}"
+
+          # Debian / RPM / Pacman / IPK: 连字符 -> 波浪号
+          PKG_VERSION="${RAW_VERSION//-/\~}"
           echo "PKG_VERSION=${PKG_VERSION}" >> "${GITHUB_ENV}"
+
+          # OpenWrt APK / Alpine APK: 连字符 -> 下划线, 并去掉后缀里的点号
+          # 例: 1.15.0-alpha.3 -> 1.15.0_alpha3
+          if [[ "$RAW_VERSION" == *-* ]]; then
+            APK_BASE="${RAW_VERSION%%-*}"
+            APK_SUFFIX="${RAW_VERSION#*-}"
+            APK_SUFFIX="${APK_SUFFIX//./}"
+            APK_VERSION="${APK_BASE}_${APK_SUFFIX}"
+          else
+            APK_VERSION="$RAW_VERSION"
+          fi
+          echo "APK_VERSION=${APK_VERSION}" >> "${GITHUB_ENV}"
       - name: Package DEB
         if: matrix.debian != ''
         run: |
@@ -429,9 +445,9 @@ jobs:
           for architecture in ${{ matrix.openwrt }}; do
             .github/build_openwrt_apk.sh \
               "$architecture" \
-              "${{ needs.calculate_version.outputs.version }}" \
+              "$APK_VERSION" \
               "dist/sing-box" \
-              "dist/sing-box_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.apk"
+              "dist/sing-box_${APK_VERSION}_openwrt_${architecture}.apk"
           done
       - name: Package Alpine APK
         if: matrix.alpine != ''
@@ -439,9 +455,9 @@ jobs:
           set -xeuo pipefail
           .github/build_alpine_apk.sh \
             "${{ matrix.alpine }}" \
-            "${{ needs.calculate_version.outputs.version }}" \
+            "$APK_VERSION" \
             "dist/sing-box" \
-            "dist/sing-box_${{ needs.calculate_version.outputs.version }}_linux_${{ matrix.alpine }}.apk"
+            "dist/sing-box_${APK_VERSION}_linux_${{ matrix.alpine }}.apk"
       - name: Archive
         run: |
           set -xeuo pipefail
@@ -466,6 +482,7 @@ jobs:
         with:
           name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}${{ matrix.go386 && format('_{0}', matrix.go386) }}${{ matrix.gomips && format('_{0}', matrix.gomips) }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}${{ matrix.variant && format('-{0}', matrix.variant) }}
           path: "dist"
+
   build_darwin:
     name: Build Darwin binaries
     if: ${{ !failure() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary') }}
@@ -567,6 +584,7 @@ jobs:
         with:
           name: binary-darwin_${{ matrix.arch }}${{ matrix.legacy_name && format('-legacy-{0}', matrix.legacy_name) }}
           path: "dist"
+
   build_windows:
     name: Build Windows binaries
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
@@ -668,6 +686,7 @@ jobs:
         with:
           name: binary-windows_${{ matrix.arch }}
           path: "dist"
+
   build_android_library:
     name: Build Android library (${{ matrix.go_arch }})
     if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android' || inputs.build == 'publish-android') && github.ref != 'refs/heads/oldstable'
@@ -727,6 +746,7 @@ jobs:
           name: libbox-android-${{ matrix.go_arch }}
           path: dist
           compression-level: 0
+
   build_android:
     name: Build Android (${{ matrix.variant }})
     if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android') && github.ref != 'refs/heads/oldstable'
@@ -845,6 +865,7 @@ jobs:
         with:
           name: binary-android-apks-${{ matrix.variant }}
           path: 'dist'
+
   publish_android:
     name: Publish Android
     if: github.event_name == 'workflow_dispatch' && inputs.build == 'publish-android' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/testing')
@@ -944,6 +965,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
+
   build_windows_client:
     name: Build Windows client (${{ matrix.desktop_arch }})
     if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Windows') && github.ref != 'refs/heads/oldstable'
@@ -1057,6 +1079,7 @@ jobs:
         with:
           name: binary-windows-client-${{ matrix.desktop_arch }}
           path: 'dist'
+
   build_linux_client:
     name: Build Linux client (${{ matrix.desktop_arch }})
     if: (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Linux') && github.ref != 'refs/heads/oldstable'
@@ -1212,6 +1235,7 @@ jobs:
         with:
           name: binary-linux-client-${{ matrix.desktop_arch }}
           path: 'dist'
+
   build_apple_library:
     name: Build Apple library (${{ matrix.artifact }})
     runs-on: ${{ matrix.build && 'macos-26' || 'ubuntu-latest' }}
@@ -1283,6 +1307,7 @@ jobs:
           name: libbox-apple-${{ matrix.artifact }}
           path: dist
           compression-level: 1
+
   build_apple:
     name: Build Apple release clients
     runs-on: ${{ matrix.if && 'macos-26' || 'ubuntu-latest' }}
@@ -1614,6 +1639,7 @@ jobs:
         with:
           name: binary-apple-${{ matrix.type }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
           path: 'dist'
+
   build_apple_app_store:
     name: Build Apple App Store clients
     runs-on: ${{ matrix.if && 'macos-26' || 'ubuntu-latest' }}
@@ -1662,6 +1688,7 @@ jobs:
             variant: ''
             library_arch: ''
     steps: *build_apple_steps
+
   upload:
     name: Upload builds
     if: "!failure() && github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Binary' || inputs.build == 'Android' || inputs.build == 'Windows' || inputs.build == 'Linux' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak')"
@@ -1730,6 +1757,7 @@ jobs:
           ghr --replace -p 5 "v${VERSION}" dist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   cache_gc:
     name: Cache GC
     if: always()
