@@ -32,8 +32,7 @@ type Listener struct {
 	oobPacketHandler         adapter.OOBPacketHandler
 	threadUnsafePacketWriter bool
 	disablePacketOutput      bool
-	disableConnectionLog     bool
-	disableListenerLog       bool
+	disableLog               bool
 	setSystemProxy           bool
 	systemProxySOCKS         bool
 	tproxy                   bool
@@ -58,8 +57,7 @@ type Options struct {
 	OOBPacketHandler         adapter.OOBPacketHandler
 	ThreadUnsafePacketWriter bool
 	DisablePacketOutput      bool
-	DisableConnectionLog     bool
-	DisableListenerLog       bool
+	DisableLog               bool
 	SetSystemProxy           bool
 	SystemProxySOCKS         bool
 	TProxy                   bool
@@ -79,8 +77,7 @@ func New(
 		oobPacketHandler:         options.OOBPacketHandler,
 		threadUnsafePacketWriter: options.ThreadUnsafePacketWriter,
 		disablePacketOutput:      options.DisablePacketOutput,
-		disableConnectionLog:     options.DisableConnectionLog,
-		disableListenerLog:       options.DisableListenerLog,
+		disableLog:               options.DisableLog,
 		setSystemProxy:           options.SetSystemProxy,
 		systemProxySOCKS:         options.SystemProxySOCKS,
 		tproxy:                   options.TProxy,
@@ -123,7 +120,7 @@ func (l *Listener) Start() error {
 		}
 		err = systemProxy.Enable()
 		if err != nil {
-			return E.Cause(err, "set system proxy")
+			return E.Errors(E.Cause(err, "set system proxy"), systemProxy.Close())
 		}
 		l.systemProxy = systemProxy
 	}
@@ -133,8 +130,11 @@ func (l *Listener) Start() error {
 func (l *Listener) Close() error {
 	l.shutdown.Store(true)
 	var err error
-	if l.systemProxy != nil && l.systemProxy.IsEnabled() {
-		err = l.systemProxy.Disable()
+	if l.systemProxy != nil {
+		if l.systemProxy.IsEnabled() {
+			err = l.systemProxy.Disable()
+		}
+		err = E.Errors(err, l.systemProxy.Close())
 	}
 	return E.Errors(err, common.Close(
 		l.tcpListener,

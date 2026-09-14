@@ -2,7 +2,6 @@ package include
 
 import (
 	"context"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -30,7 +29,7 @@ func TestEBPFInboundRuntimeOptions(t *testing.T) {
 	if err := json.UnmarshalContext(ctx, []byte(`{
 		"type": "ebpf",
 		"udp_timeout": "45s",
-		"dns_mode": "off",
+		"local": { "dns_mode": "off" },
 		"network": "tcp"
 	}`), &inboundOptions); err != nil {
 		t.Fatal(err)
@@ -42,8 +41,8 @@ func TestEBPFInboundRuntimeOptions(t *testing.T) {
 	if time.Duration(ebpfOptions.UDPTimeout) != 45*time.Second {
 		t.Fatalf("unexpected UDP timeout: %v", time.Duration(ebpfOptions.UDPTimeout))
 	}
-	if ebpfOptions.DNSMode != "off" {
-		t.Fatalf("unexpected DNS mode: %s", ebpfOptions.DNSMode)
+	if ebpfOptions.Local.DNSMode != "off" {
+		t.Fatalf("unexpected local DNS mode: %s", ebpfOptions.Local.DNSMode)
 	}
 	network := ebpfOptions.Network.Build()
 	if len(network) != 1 || network[0] != "tcp" {
@@ -51,34 +50,15 @@ func TestEBPFInboundRuntimeOptions(t *testing.T) {
 	}
 }
 
-func TestEBPFInboundRejectsListenFields(t *testing.T) {
-	ctx := Context(context.Background())
-	for name, content := range map[string]string{
-		"listen":      `{"type":"ebpf","listen":"0.0.0.0"}`,
-		"listen_port": `{"type":"ebpf","listen_port":5588}`,
-		"detour":      `{"type":"ebpf","detour":"other-in"}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			var inboundOptions option.Inbound
-			if err := json.UnmarshalContext(ctx, []byte(content), &inboundOptions); err == nil {
-				t.Fatal("expected removed eBPF listen field to be rejected")
-			}
-		})
-	}
-}
-
-func TestEBPFInboundRedirectAddresses(t *testing.T) {
+func TestEBPFInboundPolicyOptions(t *testing.T) {
 	ctx := Context(context.Background())
 	var inboundOptions option.Inbound
 	if err := json.UnmarshalContext(ctx, []byte(`{
 		"type": "ebpf",
-		"redirect_address": [
-			"127.128.0.0/9",
-			"fd53:696e:672d:626f::/64"
-		],
 		"bypass_rule_set": [
 			"geoip-cn"
-		]
+		],
+		"local": { "dns_mode": "respect_policy" }
 	}`), &inboundOptions); err != nil {
 		t.Fatal(err)
 	}
@@ -86,27 +66,26 @@ func TestEBPFInboundRedirectAddresses(t *testing.T) {
 	if !loaded {
 		t.Fatalf("unexpected eBPF options type: %T", inboundOptions.Options)
 	}
-	if len(ebpfOptions.RedirectAddress) != 2 {
-		t.Fatalf("unexpected redirect addresses: %v", ebpfOptions.RedirectAddress)
-	}
-	if ebpfOptions.RedirectAddress[0] != netip.MustParsePrefix("127.128.0.0/9") ||
-		ebpfOptions.RedirectAddress[1] != netip.MustParsePrefix("fd53:696e:672d:626f::/64") {
-		t.Fatalf("unexpected redirect addresses: %v", ebpfOptions.RedirectAddress)
+	if ebpfOptions.Local.DNSMode != "respect_policy" {
+		t.Fatalf("unexpected policy options: %+v", ebpfOptions)
 	}
 	if len(ebpfOptions.BypassRuleSet) != 1 || ebpfOptions.BypassRuleSet[0] != "geoip-cn" {
 		t.Fatalf("unexpected bypass rule-set: %v", ebpfOptions.BypassRuleSet)
 	}
 }
 
-func TestEBPFInboundSharedNetworkOptions(t *testing.T) {
+func TestEBPFInboundSharedOptions(t *testing.T) {
 	ctx := Context(context.Background())
 	var inboundOptions option.Inbound
 	if err := json.UnmarshalContext(ctx, []byte(`{
 		"type": "ebpf",
-		"cgroup_path": "/sys/fs/cgroup/test.slice",
-		"shared_network": {
+		"tc_priority": 7,
+		"local": {"enabled": true},
+		"shared": {
 			"enabled": true,
-			"include_interface": ["wlan2"]
+			"dns_mode": "off",
+			"interface": ["wlan2", "rndis0"],
+			"ipv6": false
 		}
 	}`), &inboundOptions); err != nil {
 		t.Fatal(err)
@@ -115,10 +94,11 @@ func TestEBPFInboundSharedNetworkOptions(t *testing.T) {
 	if !loaded {
 		t.Fatalf("unexpected eBPF options type: %T", inboundOptions.Options)
 	}
-	if ebpfOptions.CgroupPath != "/sys/fs/cgroup/test.slice" ||
-		!ebpfOptions.SharedNetwork.Enabled ||
-		len(ebpfOptions.SharedNetwork.IncludeInterface) != 1 ||
-		ebpfOptions.SharedNetwork.IncludeInterface[0] != "wlan2" {
-		t.Fatalf("unexpected eBPF shared-network options: %+v", ebpfOptions)
+	if ebpfOptions.Local.Enabled == nil || !*ebpfOptions.Local.Enabled ||
+		ebpfOptions.Shared.Enabled == nil || !*ebpfOptions.Shared.Enabled ||
+		ebpfOptions.TCPriority != 7 || len(ebpfOptions.Shared.Interface) != 2 ||
+		ebpfOptions.Shared.Interface[0] != "wlan2" || ebpfOptions.Shared.Interface[1] != "rndis0" ||
+		ebpfOptions.Shared.IPv6 == nil || *ebpfOptions.Shared.IPv6 || ebpfOptions.Shared.DNSMode != "off" {
+		t.Fatalf("unexpected eBPF shared options: %+v", ebpfOptions)
 	}
 }

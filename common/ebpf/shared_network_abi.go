@@ -1,3 +1,5 @@
+//go:build with_ebpf && (linux || android)
+
 package ebpf
 
 import (
@@ -9,23 +11,25 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-type SharedNetworkConfig struct {
-	ListenerPort         uint16
-	EnableTCP            bool
-	EnableUDP            bool
-	HijackDNS            bool
-	BypassPrivateAddress bool
-	RedirectIPv4         netip.Prefix
-	RedirectIPv6         netip.Prefix
-	IncludeSourceCIDR    []netip.Prefix
-	ExcludeSourceCIDR    []netip.Prefix
-	IncludeSourceMAC     []MACAddress
-	ExcludeSourceMAC     []MACAddress
-	MapCapacity          SharedNetworkMapCapacities
-	UDPTimeout           time.Duration
-}
+const sharedNetworkTCPReleaseGrace = time.Second
 
-type MACAddress [6]byte
+type SharedNetworkConfig struct {
+	ListenerPort uint16
+	EnableTCP    bool
+	EnableUDP    bool
+	RedirectIPv4 netip.Prefix
+	RedirectIPv6 netip.Prefix
+	Policy       CompiledPolicy
+	MapCapacity  SharedNetworkMapCapacities
+	UDPTimeout   time.Duration
+	// FakeIPICMPReply loads a FakeIPICMPBackend (see fakeip_icmp_backend.go)
+	// alongside this one, answering ICMP Echo Request to the FakeIP prefixes
+	// already in Policy the same way TCBackend's shared socket_assign path
+	// already does. IPv6 coverage follows RedirectIPv6.IsValid(), the same
+	// signal this config already uses to mean "IPv6 is enabled for this
+	// shared backend" -- not a second, independently-set toggle.
+	FakeIPICMPReply bool
+}
 
 type sharedNetworkMACKey struct {
 	Address  MACAddress
@@ -36,33 +40,29 @@ type sharedNetworkControl struct {
 	Enabled             uint32
 	Flags               uint32
 	ListenerPort        uint16
-	Reserved            uint16
+	DNSMode             DNSMode
 	TokenIPv4Prefix     [4]byte
 	TokenIPv4PrefixBits uint8
 	TokenIPv6PrefixBits uint8
 	Reserved2           [2]byte
 	TokenIPv6Prefix     [16]byte
 	UDPTimeoutSeconds   uint32
+	FakeIPIPv4Prefix    [4]byte
+	FakeIPIPv4Mask      [4]byte
+	FakeIPIPv6Prefix    [16]byte
+	FakeIPIPv6Mask      [16]byte
 }
 
 func sharedNetworkUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
-	return normalizedUDPTimeoutSeconds("shared-network", timeout)
-}
-
-func cgroupUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
-	return normalizedUDPTimeoutSeconds("local cgroup", timeout)
-}
-
-func normalizedUDPTimeoutSeconds(scope string, timeout time.Duration) (uint32, error) {
 	if timeout <= 0 {
-		return 0, E.New("invalid ", scope, " UDP timeout: ", timeout)
+		return 0, E.New("invalid shared packet-rewrite UDP timeout: ", timeout)
 	}
 	seconds := uint64(timeout / time.Second)
 	if timeout%time.Second != 0 {
 		seconds++
 	}
 	if seconds > math.MaxUint32 {
-		return 0, E.New(scope, " UDP timeout is too large: ", timeout)
+		return 0, E.New("shared packet-rewrite UDP timeout is too large: ", timeout)
 	}
 	return uint32(seconds), nil
 }
@@ -88,15 +88,11 @@ type sharedNetworkOriginalKey struct {
 	OriginalAddr   [16]byte
 }
 
-type sharedNetworkReplyKey struct {
-	InterfaceIndex uint32
-	Family         uint8
-	Protocol       uint8
-	ClientPort     uint16
-	ListenerPort   uint16
-	Reserved       uint16
-	ClientAddr     [16]byte
-	TokenAddr      [16]byte
+type sharedNetworkTokenValue struct {
+	TokenAddr  [16]byte
+	Generation uint64
+	LastSeenNS uint64
+	Reserved   uint64
 }
 
 type sharedNetworkOriginalValue struct {
@@ -105,15 +101,23 @@ type sharedNetworkOriginalValue struct {
 	Port           uint16
 	Addr           [16]byte
 	InterfaceIndex uint32
-	Reserved       uint32
+	Generation     uint64
 	SourceMAC      [6]byte
 	Reserved2      [2]byte
 }
 
 type SharedNetworkFlowHandle struct {
 	originalKey sharedNetworkOriginalKey
-	replyKey    sharedNetworkReplyKey
 	listenerKey sharedNetworkListenerKey
+	generation  uint64
+}
+
+type SharedNetworkFlowSweepResult struct {
+	Scanned  uint32
+	Removed  uint32
+	Retained uint32
+	Usage    MapUsage
+	Complete bool
 }
 
 const (
@@ -121,7 +125,7 @@ const (
 	sharedNetworkFlagIPv6
 	sharedNetworkFlagTCP
 	sharedNetworkFlagUDP
-	sharedNetworkFlagDNSHijack
+	_
 	sharedNetworkFlagHostIPv4
 	sharedNetworkFlagHostIPv6
 	sharedNetworkFlagBypassIPv4
@@ -132,6 +136,9 @@ const (
 	sharedNetworkFlagExcludeSourceMAC
 	sharedNetworkFlagBypassPrivateAddress
 	sharedNetworkFlagBypassFlowCache
+	_
+	sharedNetworkFlagFakeIPIPv4
+	sharedNetworkFlagFakeIPIPv6
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
@@ -178,13 +185,17 @@ func makeSharedNetworkListenerKey(
 }
 
 func sharedNetworkOriginalAddress(value sharedNetworkOriginalValue) (netip.Addr, error) {
-	switch value.Family {
+	return sharedNetworkAddress(value.Family, value.Addr)
+}
+
+func sharedNetworkAddress(family uint8, address [16]byte) (netip.Addr, error) {
+	switch family {
 	case addressFamilyIPv4:
-		return netip.AddrFrom4([4]byte(value.Addr[:4])), nil
+		return netip.AddrFrom4([4]byte(address[:4])), nil
 	case addressFamilyIPv6:
-		return netip.AddrFrom16(value.Addr), nil
+		return netip.AddrFrom16(address), nil
 	default:
-		return netip.Addr{}, E.New("invalid original destination family: ", value.Family)
+		return netip.Addr{}, E.New("invalid shared-network address family: ", family)
 	}
 }
 
@@ -203,15 +214,23 @@ func makeSharedNetworkFlowHandle(key sharedNetworkListenerKey, value sharedNetwo
 			ClientAddr:     key.ClientAddr,
 			OriginalAddr:   value.Addr,
 		},
-		replyKey: sharedNetworkReplyKey{
-			InterfaceIndex: value.InterfaceIndex,
-			Family:         key.Family,
-			Protocol:       key.Protocol,
-			ClientPort:     key.ClientPort,
-			ListenerPort:   key.ListenerPort,
-			ClientAddr:     key.ClientAddr,
-			TokenAddr:      key.TokenAddr,
-		},
 		listenerKey: key,
+		generation:  value.Generation,
+	}
+}
+
+func makeSharedNetworkFlowHandleFromOriginal(
+	key sharedNetworkOriginalKey,
+	token [16]byte,
+	listenerPort uint16,
+	generation uint64,
+) SharedNetworkFlowHandle {
+	return SharedNetworkFlowHandle{
+		originalKey: key,
+		listenerKey: sharedNetworkListenerKey{
+			Family: key.Family, Protocol: key.Protocol, ListenerPort: listenerPort,
+			TokenAddr: token, ClientPort: key.ClientPort, ClientAddr: key.ClientAddr,
+		},
+		generation: generation,
 	}
 }

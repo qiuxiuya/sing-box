@@ -37,7 +37,7 @@ func (c *systemTLSConfig) SetServerName(serverName string) {
 	c.serverName = serverName
 }
 
-func (c *systemTLSConfig) verificationServerName() string {
+func (c *systemTLSConfig) verificationServerName() string { //nolint:unused // Used by platform-specific TLS engines.
 	if c.certificateServerName != "" {
 		return c.certificateServerName
 	}

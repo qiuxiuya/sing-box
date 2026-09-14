@@ -25,7 +25,7 @@ import (
 func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections(ctx, trafficManager))
-	r.Delete("/", closeAllConnections(network, trafficManager))
+	r.Delete("/", closeAllConnections(ctx, network, trafficManager))
 	r.Delete("/{id}", closeConnection(trafficManager))
 	return r
 }
@@ -68,10 +68,10 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	}
 	var processPath string
 	if c.Metadata.ProcessInfo != nil {
-		if c.Metadata.ProcessInfo.ProcessPath != "" {
-			processPath = c.Metadata.ProcessInfo.ProcessPath
-		} else if len(c.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
-			processPath = c.Metadata.ProcessInfo.AndroidPackageNames[0]
+		if len(c.Metadata.ProcessInfo.PackageNames) > 0 {
+			processPath = c.Metadata.ProcessInfo.PackageNames[0]
+		} else if len(c.Metadata.ProcessInfo.ProcessPaths) > 0 {
+			processPath = c.Metadata.ProcessInfo.ProcessPaths[0]
 		}
 		if processPath == "" {
 			if c.Metadata.ProcessInfo.UserId != -1 {
@@ -179,10 +179,10 @@ func closeConnection(trafficManager *trafficcontrol.Manager) func(w http.Respons
 	}
 }
 
-func closeAllConnections(network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeAllConnections(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		trafficManager.CloseAllConnections()
-		network.ResetNetwork()
+		network.ResetNetwork(ctx)
 		render.NoContent(w, r)
 	}
 }

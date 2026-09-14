@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,8 +26,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
-
-	"golang.org/x/exp/slices"
 )
 
 var defaultPacketSniffers = []sniff.PacketSniffer{
@@ -164,6 +163,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
+	if selectedRule != nil {
+		metadata.RouteRule = selectedRule.String()
+	}
+	metadata.RouteOutbound = selectedOutbound.Tag()
 	metadata.InitExtended()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -289,16 +292,20 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		}
 		selectedOutbound = defaultOutbound
 	}
-	for _, buffer := range packetBuffers {
+	for _, buffer := range slices.Backward(packetBuffers) {
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
+	if selectedRule != nil {
+		metadata.RouteRule = selectedRule.String()
+	}
+	metadata.RouteOutbound = selectedOutbound.Tag()
 	metadata.InitExtended()
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
 	if metadata.FakeIP || metadata.DestOverride {
-		conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
+		conn = newFakeIPNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 	}
 	onClose = r.wrapQUICSniffIdleCache(metadata, onClose)
 	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandler); isHandler {
@@ -401,9 +408,20 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				}
 				return adapter.PreMatchResult{Action: adapter.PreMatchBypass}
 			}
-			return r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
+			if metadata.Destination.IsDomain() || metadata.Destination != packetDestination {
+				return r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
+			}
+			result := r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
+			if result.Action != adapter.PreMatchFlow {
+				return adapter.PreMatchResult{Action: adapter.PreMatchBypass}
+			}
+			result.Action = adapter.PreMatchBypass
+			return result
 		case *R.RuleActionReject:
 			rejectErr := action.Error(r.ctx)
+			if rejectErr == nil && metadata.Network == N.NetworkICMP {
+				return continueResult
+			}
 			if errors.Is(rejectErr, R.ErrDrop) {
 				return adapter.PreMatchResult{Action: adapter.PreMatchDrop}
 			}
@@ -525,9 +543,9 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	} else if metadata.Destination != packetDestination {
 		result.Destination = metadata.Destination.AddrPort()
 	}
-	r.logger.InfoContext(ctx, "pre-match: forward ", metadata.Network, " connection from ", metadata.Source.AddrString(), " to ", metadata.Destination.AddrString(), " via outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 	metadataCopy := *metadata
 	result.NewTracker = func() tun.FlowTracker {
+		r.logger.InfoContext(ctx, "pre-match: forward ", metadataCopy.Network, " connection from ", metadataCopy.Source.AddrString(), " to ", metadataCopy.Destination.AddrString(), " via outbound/", outbound.Type(), "[", outbound.Tag(), "]")
 		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+1)
 		flowTrackers = append(flowTrackers, newFlowLogger(ctx, r.logger, metadataCopy, outbound))
 		for _, tracker := range r.trackers {

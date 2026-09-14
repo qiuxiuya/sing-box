@@ -6,6 +6,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+
 	"github.com/stretchr/testify/require"
 )
 

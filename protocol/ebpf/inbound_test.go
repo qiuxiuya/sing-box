@@ -11,7 +11,7 @@ import (
 	"testing"
 	"unsafe"
 
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -44,8 +44,8 @@ func TestInternalListenerSetsSelectIndependentPorts(t *testing.T) {
 				Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
 				ListenPort: port,
 			},
-			DisablePacketOutput:  true,
-			DisableConnectionLog: true,
+			DisablePacketOutput: true,
+			DisableLog:          true,
 		})
 	}
 	var first internalListenerSet
@@ -73,39 +73,13 @@ func TestInternalListenerSetsSelectIndependentPorts(t *testing.T) {
 	}
 }
 
-func TestNormalizeCgroupPath(t *testing.T) {
-	for _, test := range []struct {
-		input  string
-		output string
-	}{
-		{"", ""},
-		{"/sys/fs/cgroup", "/sys/fs/cgroup"},
-		{"/sys/fs/cgroup/user.slice/../system.slice", "/sys/fs/cgroup/system.slice"},
-	} {
-		output, err := normalizeCgroupPath(test.input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if output != test.output {
-			t.Fatalf("unexpected normalized cgroup path: %q", output)
-		}
-	}
-}
-
-func TestNormalizeCgroupPathRejectsRelativePath(t *testing.T) {
-	if _, err := normalizeCgroupPath("user.slice/test.scope"); err == nil {
-		t.Fatal("expected a relative cgroup path to be rejected")
-	}
-}
-
-func TestValidateCgroupOptions(t *testing.T) {
-	if err := validateCgroupOptions(false, option.EBPFInboundOptions{}); err != nil {
+func TestValidateScopedOptions(t *testing.T) {
+	if err := validateLocalOptions(false, option.EBPFLocalOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	mapCapacity := option.EBPFMapCapacity(1024)
-	for _, options := range []option.EBPFInboundOptions{
-		{CgroupPath: "/sys/fs/cgroup"},
-		{CgroupIPv6Mode: cgroupIPv6ModeAuto},
+	for _, options := range []option.EBPFLocalOptions{
+		{IPv6: common.Ptr(false)},
+		{BypassPrivateAddress: common.Ptr(false)},
 		{IncludeUID: []uint32{1000}},
 		{IncludeUIDRange: []string{"1000:2000"}},
 		{ExcludeUID: []uint32{1000}},
@@ -113,133 +87,142 @@ func TestValidateCgroupOptions(t *testing.T) {
 		{IncludeAndroidUser: []int{0}},
 		{IncludePackage: []string{"com.example.include"}},
 		{ExcludePackage: []string{"com.example.exclude"}},
-		{MapCapacity: option.EBPFMapCapacityOptions{TCPRedirect: &mapCapacity}},
+		{BypassPort: []uint16{443}},
+		{BypassPortRange: []string{"8000:8080"}},
 	} {
-		if err := validateCgroupOptions(false, options); err == nil {
-			t.Fatalf("expected cgroup-only options to be rejected: %+v", options)
+		if err := validateLocalOptions(false, options); err == nil {
+			t.Fatalf("expected local-only options to be rejected: %+v", options)
 		}
 	}
-	if err := validateCgroupOptions(true, option.EBPFInboundOptions{
-		CgroupPath: "/sys/fs/cgroup",
-		IncludeUID: []uint32{1000},
-	}); err != nil {
-		t.Fatal(err)
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{Interface: []string{"ap0"}}); err == nil {
+		t.Fatal("expected shared-only options to be rejected")
+	}
+	if err := validateLocalOptions(false, option.EBPFLocalOptions{DataPlane: localDataPlaneCgroup}); err == nil {
+		t.Fatal("expected a local data plane to be rejected when local interception is disabled")
+	}
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{DataPlane: sharedDataPlanePacketRewrite}); err == nil {
+		t.Fatal("expected a shared data plane to be rejected when shared interception is disabled")
+	}
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{IPv6: common.Ptr(false)}); err == nil {
+		t.Fatal("expected shared IPv6 option to be rejected without shared mode")
+	}
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{BypassPrivateAddress: common.Ptr(false)}); err == nil {
+		t.Fatal("expected shared private-address policy to be rejected without shared mode")
 	}
 }
 
-func TestNormalizeCgroupIPv6Mode(t *testing.T) {
+func TestNormalizeLocalDataPlane(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		options    option.EBPFLocalOptions
+		dataPlane  string
+		cgroupPath string
+	}{
+		{name: "default", options: option.EBPFLocalOptions{}, dataPlane: localDataPlaneCgroup},
+		{name: "explicit tc", options: option.EBPFLocalOptions{DataPlane: "tc"}, dataPlane: localDataPlaneTC},
+		{name: "cgroup root", options: option.EBPFLocalOptions{DataPlane: "cgroup"}, dataPlane: localDataPlaneCgroup},
+		{name: "explicit cgroup", options: option.EBPFLocalOptions{DataPlane: "cgroup", CgroupPath: "/sys/fs/cgroup/sing-box"}, dataPlane: localDataPlaneCgroup, cgroupPath: "/sys/fs/cgroup/sing-box"},
+		{name: "implicit cgroup path", options: option.EBPFLocalOptions{CgroupPath: "/sys/fs/cgroup/sing-box"}, dataPlane: localDataPlaneCgroup, cgroupPath: "/sys/fs/cgroup/sing-box"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dataPlane, path, err := normalizeLocalDataPlane(testCase.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dataPlane != testCase.dataPlane || path != testCase.cgroupPath {
+				t.Fatalf("got data_plane=%q path=%q", dataPlane, path)
+			}
+		})
+	}
+	for _, options := range []option.EBPFLocalOptions{
+		{DataPlane: "invalid"},
+		{DataPlane: "tc", CgroupPath: "/sys/fs/cgroup/sing-box"},
+		{DataPlane: "cgroup", CgroupPath: "relative"},
+	} {
+		if _, _, err := normalizeLocalDataPlane(options); err == nil {
+			t.Fatalf("expected invalid local data plane options to fail: %+v", options)
+		}
+	}
+}
+
+func TestEnabledByDefault(t *testing.T) {
+	if !enabledByDefault(nil) || !enabledByDefault(common.Ptr(true)) || enabledByDefault(common.Ptr(false)) {
+		t.Fatal("unexpected default-enabled boolean behavior")
+	}
+}
+
+func TestParsePortRanges(t *testing.T) {
+	ranges, err := parsePortRanges("local.bypass_port", []uint16{443, 80}, []string{"8000:8002", "81:82", "82:83"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []commonEBPF.PortRange{{Start: 80, End: 83}, {Start: 443, End: 443}, {Start: 8000, End: 8002}}
+	if !slices.Equal(ranges, want) {
+		t.Fatalf("unexpected port ranges: got %v, want %v", ranges, want)
+	}
+	for _, invalid := range []string{"0:1", "2:1", "1", "1:65536"} {
+		if _, err = parsePortRanges("local.bypass_port", nil, []string{invalid}); err == nil {
+			t.Fatalf("expected invalid port range %q to fail", invalid)
+		}
+	}
+}
+
+func TestNormalizeEnablement(t *testing.T) {
+	tests := []struct {
+		name         string
+		localOption  *bool
+		sharedOption *bool
+		local        bool
+		shared       bool
+		wantErr      bool
+	}{
+		{name: "default", local: true},
+		{name: "local", localOption: common.Ptr(true), local: true},
+		{name: "shared", sharedOption: common.Ptr(true), shared: true},
+		{name: "hybrid", localOption: common.Ptr(true), sharedOption: common.Ptr(true), local: true, shared: true},
+		{name: "disabled local", localOption: common.Ptr(false), wantErr: true},
+		{name: "disabled shared", sharedOption: common.Ptr(false), wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			local, shared, err := normalizeEnablement(test.localOption, test.sharedOption)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected invalid enablement to be rejected")
+				}
+				return
+			}
+			if err != nil || local != test.local || shared != test.shared {
+				t.Fatalf("unexpected normalized enablement: local=%v shared=%v err=%v", local, shared, err)
+			}
+		})
+	}
+}
+
+func TestNormalizeSharedDataPlane(t *testing.T) {
 	for _, test := range []struct {
 		input  string
 		output string
 	}{
-		{"", cgroupIPv6ModeAlways},
-		{cgroupIPv6ModeAlways, cgroupIPv6ModeAlways},
-		{cgroupIPv6ModeAuto, cgroupIPv6ModeAuto},
-		{cgroupIPv6ModeOff, cgroupIPv6ModeOff},
+		{"", sharedDataPlanePacketRewrite},
+		{sharedDataPlaneSocketAssign, sharedDataPlaneSocketAssign},
+		{sharedDataPlanePacketRewrite, sharedDataPlanePacketRewrite},
 	} {
-		output, err := normalizeCgroupIPv6Mode(test.input)
+		output, err := normalizeSharedDataPlane(option.EBPFSharedOptions{DataPlane: test.input})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if output != test.output {
-			t.Fatalf("unexpected cgroup IPv6 mode for %q: %q", test.input, output)
+			t.Fatalf("unexpected shared data plane for %q: %q", test.input, output)
 		}
 	}
-	if _, err := normalizeCgroupIPv6Mode("prefer"); err == nil {
-		t.Fatal("expected an unknown cgroup IPv6 mode to be rejected")
+	if _, err := normalizeSharedDataPlane(option.EBPFSharedOptions{DataPlane: "invalid"}); err == nil {
+		t.Fatal("expected unknown shared data plane to be rejected")
 	}
 }
 
-func TestValidateCgroupAddressFamilies(t *testing.T) {
-	ipv4 := netip.MustParsePrefix("127.128.0.0/9")
-	ipv6 := netip.MustParsePrefix("fd53:696e:672d:626f::/64")
-	for _, test := range []struct {
-		mode string
-		ipv4 netip.Prefix
-		ipv6 netip.Prefix
-	}{
-		{cgroupIPv6ModeAlways, ipv4, netip.Prefix{}},
-		{cgroupIPv6ModeOff, ipv4, ipv6},
-		{cgroupIPv6ModeAlways, netip.Prefix{}, ipv6},
-		{cgroupIPv6ModeAuto, netip.Prefix{}, ipv6},
-	} {
-		if err := validateCgroupAddressFamilies(true, test.mode, test.ipv4, test.ipv6); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, mode := range []string{cgroupIPv6ModeAlways, cgroupIPv6ModeAuto, cgroupIPv6ModeOff} {
-		if err := validateCgroupAddressFamilies(true, mode, netip.Prefix{}, netip.Prefix{}); err == nil {
-			t.Fatalf("expected empty address families to be rejected for %s", mode)
-		}
-	}
-	if err := validateCgroupAddressFamilies(
-		true,
-		cgroupIPv6ModeOff,
-		netip.Prefix{},
-		ipv6,
-	); err == nil {
-		t.Fatal("expected IPv6-only cgroup with IPv6 disabled to be rejected")
-	}
-}
-
-func TestUsableNativeIPv6(t *testing.T) {
-	for _, address := range []string{"2001:db8::1", "fd00::1"} {
-		if !usableNativeIPv6(net.ParseIP(address)) {
-			t.Fatalf("expected %s to be usable", address)
-		}
-	}
-	for _, address := range []string{"", "127.0.0.1", "::", "::1", "fe80::1", "ff02::1"} {
-		if usableNativeIPv6(net.ParseIP(address)) {
-			t.Fatalf("expected %q to be unusable", address)
-		}
-	}
-}
-
-func TestValidateDataPaths(t *testing.T) {
-	if err := validateDataPaths(false, false); err == nil {
-		t.Fatal("expected an inbound without a data path to be rejected")
-	}
-	if err := validateDataPaths(true, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateDataPaths(false, true); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestDisabledSharedNetworkIgnoresSubOptions(t *testing.T) {
-	zeroCapacity := option.EBPFMapCapacity(0)
-	normalized, err := normalizeSharedNetworkOptions(option.EBPFSharedNetworkOptions{
-		IncludeInterface:  []string{""},
-		IncludeSourceCIDR: []netip.Prefix{{}},
-		ExcludeSourceCIDR: []netip.Prefix{{}},
-		IncludeMACAddress: []string{"invalid"},
-		ExcludeMACAddress: []string{"invalid"},
-		TCPriority:        option.EBPFTCPriority(42),
-		MapCapacity: option.EBPFSharedNetworkMapCapacityOptions{
-			Proxy: &zeroCapacity,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if normalized.Enabled || len(normalized.IncludeInterface) != 0 ||
-		len(normalized.IncludeSourceCIDR) != 0 || len(normalized.ExcludeSourceCIDR) != 0 ||
-		len(normalized.IncludeMACAddress) != 0 || len(normalized.ExcludeMACAddress) != 0 ||
-		normalized.TCPriority != 0 || normalized.MapCapacity != (option.EBPFSharedNetworkMapCapacityOptions{}) {
-		t.Fatalf("disabled shared-network options were not ignored: %+v", normalized)
-	}
-	capacity, err := normalizeSharedNetworkMapCapacity(normalized.MapCapacity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if capacity != ECommon.DefaultSharedNetworkMapCapacities() {
-		t.Fatalf("unexpected disabled shared-network map capacity: %+v", capacity)
-	}
-}
-
-func TestParseSharedNetworkMACAddresses(t *testing.T) {
-	addresses, err := parseSharedNetworkMACAddresses("include_mac_address", []string{
+func TestParseSharedMACAddresses(t *testing.T) {
+	addresses, err := parseSharedMACAddresses("include_mac_address", []string{
 		"02:00:00:00:00:01",
 		"02-00-00-00-00-01",
 		"02:00:00:00:00:02",
@@ -247,12 +230,12 @@ func TestParseSharedNetworkMACAddresses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(addresses) != 2 || addresses[0] != (ECommon.MACAddress{0x02, 0, 0, 0, 0, 1}) ||
-		addresses[1] != (ECommon.MACAddress{0x02, 0, 0, 0, 0, 2}) {
+	if len(addresses) != 2 || addresses[0] != (commonEBPF.MACAddress{0x02, 0, 0, 0, 0, 1}) ||
+		addresses[1] != (commonEBPF.MACAddress{0x02, 0, 0, 0, 0, 2}) {
 		t.Fatalf("unexpected parsed MAC addresses: %v", addresses)
 	}
 	for _, address := range []string{"invalid", "02:00:00:00:00:00:00:01"} {
-		if _, err = parseSharedNetworkMACAddresses("include_mac_address", []string{address}); err == nil {
+		if _, err = parseSharedMACAddresses("include_mac_address", []string{address}); err == nil {
 			t.Fatalf("expected MAC address to be rejected: %s", address)
 		}
 	}
@@ -263,8 +246,9 @@ func TestNormalizeDNSMode(t *testing.T) {
 		input  string
 		output string
 	}{
-		{"", dnsModeHijack},
+		{"", dnsModeRespectPolicy},
 		{dnsModeHijack, dnsModeHijack},
+		{dnsModeRespectPolicy, dnsModeRespectPolicy},
 		{dnsModeOff, dnsModeOff},
 	} {
 		output, err := normalizeDNSMode(test.input)
@@ -275,151 +259,14 @@ func TestNormalizeDNSMode(t *testing.T) {
 			t.Fatalf("unexpected DNS mode for %q: %q", test.input, output)
 		}
 	}
-	if _, err := normalizeDNSMode("disabled"); err == nil {
-		t.Fatal("expected an unknown DNS mode to be rejected")
-	}
-}
-
-func TestNormalizeMapCapacity(t *testing.T) {
-	capacity, err := normalizeCgroupMapCapacity(option.EBPFMapCapacityOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if capacity != ECommon.DefaultCgroupMapCapacity() {
-		t.Fatalf("unexpected default map capacity: %+v", capacity)
-	}
-	tcpCapacity := option.EBPFMapCapacity(32768)
-	udpCapacity := option.EBPFMapCapacity(131072)
-	socketCapacity := option.EBPFMapCapacity(16384)
-	capacity, err = normalizeCgroupMapCapacity(option.EBPFMapCapacityOptions{
-		TCPRedirect:  &tcpCapacity,
-		UDPRedirect:  &udpCapacity,
-		SocketBypass: &socketCapacity,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if capacity.TCPRedirect != uint32(tcpCapacity) ||
-		capacity.UDPRedirect != uint32(udpCapacity) ||
-		capacity.SocketBypass != uint32(socketCapacity) {
-		t.Fatalf("unexpected custom map capacity: %+v", capacity)
-	}
-}
-
-func TestNormalizeSharedNetworkMapCapacity(t *testing.T) {
-	capacity, err := normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if capacity != ECommon.DefaultSharedNetworkMapCapacities() {
-		t.Fatalf("unexpected default shared-network map capacity: %+v", capacity)
-	}
-	proxy := option.EBPFMapCapacity(32768)
-	bypass := option.EBPFMapCapacity(8192)
-	fragment := option.EBPFMapCapacity(131072)
-	capacity, err = normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{
-		Proxy:    &proxy,
-		Bypass:   &bypass,
-		Fragment: &fragment,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if capacity.Proxy != uint32(proxy) || capacity.Bypass != uint32(bypass) ||
-		capacity.Fragment != uint32(fragment) {
-		t.Fatalf("unexpected shared-network map capacity: %+v", capacity)
-	}
-}
-
-func TestNormalizeMapCapacityRejectsExplicitInvalidValues(t *testing.T) {
-	zero := option.EBPFMapCapacity(0)
-	tooLarge := option.EBPFMapCapacity(ECommon.MaxConfigurableMapCapacity + 1)
-	for _, configured := range []*option.EBPFMapCapacity{&zero, &tooLarge} {
-		if _, err := normalizeCgroupMapCapacity(option.EBPFMapCapacityOptions{
-			UDPRedirect: configured,
-		}); err == nil {
-			t.Fatalf("expected map capacity %d to be rejected", *configured)
-		}
-		if _, err := normalizeSharedNetworkMapCapacity(option.EBPFSharedNetworkMapCapacityOptions{
-			Proxy: configured,
-		}); err == nil {
-			t.Fatalf("expected shared-network map capacity %d to be rejected", *configured)
+	for _, mode := range []string{"disabled", "respect_bypass", "respect_bypass_hijack"} {
+		if _, err := normalizeDNSMode(mode); err == nil {
+			t.Fatalf("expected unknown DNS mode %q to be rejected", mode)
 		}
 	}
 }
 
-func TestNormalizeRedirectAddresses(t *testing.T) {
-	tests := []struct {
-		name      string
-		addresses []netip.Prefix
-		ipv4      string
-		ipv6      string
-	}{
-		{
-			name: "default",
-			ipv4: "127.128.0.0/9",
-		},
-		{
-			name:      "ipv4 only",
-			addresses: []netip.Prefix{netip.MustParsePrefix("127.42.0.1/9")},
-			ipv4:      "127.0.0.0/9",
-		},
-		{
-			name:      "ipv6 only",
-			addresses: []netip.Prefix{netip.MustParsePrefix("fd53:696e:672d:626f::1/64")},
-			ipv6:      "fd53:696e:672d:626f::/64",
-		},
-		{
-			name: "dual stack",
-			addresses: []netip.Prefix{
-				netip.MustParsePrefix("127.128.0.0/10"),
-				netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
-			},
-			ipv4: "127.128.0.0/10",
-			ipv6: "fd53:696e:672d:626f::/64",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			ipv4Prefix, ipv6Prefix, err := normalizeRedirectAddresses(test.addresses)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if prefixString(ipv4Prefix) != test.ipv4 || prefixString(ipv6Prefix) != test.ipv6 {
-				t.Fatalf("unexpected prefixes: IPv4=%v IPv6=%v", ipv4Prefix, ipv6Prefix)
-			}
-		})
-	}
-}
-
-func TestNormalizeRedirectAddressesRejectsInvalid(t *testing.T) {
-	tests := [][]netip.Prefix{
-		{
-			netip.MustParsePrefix("127.0.0.0/8"),
-			netip.MustParsePrefix("10.0.0.0/8"),
-		},
-		{
-			netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
-			netip.MustParsePrefix("fd00::/64"),
-		},
-		{netip.MustParsePrefix("127.0.0.0/7")},
-		{netip.MustParsePrefix("127.0.0.0/11")},
-		{netip.MustParsePrefix("10.0.0.0/8")},
-		{netip.MustParsePrefix("1.0.0.0/8")},
-		{netip.MustParsePrefix("2001:db8::/64")},
-		{netip.MustParsePrefix("fe80::/64")},
-		{netip.MustParsePrefix("fd53:696e:672d:626f::/96")},
-		{netip.MustParsePrefix("0.0.0.0/8")},
-		{netip.MustParsePrefix("ff00::/64")},
-	}
-	for _, addresses := range tests {
-		if _, _, err := normalizeRedirectAddresses(addresses); err == nil {
-			t.Fatalf("expected redirect addresses to be rejected: %v", addresses)
-		}
-	}
-}
-
-func TestLocalInterfacePrefixes(t *testing.T) {
+func TestCollectHostAddresses(t *testing.T) {
 	interfaces := []control.Interface{
 		{
 			Name: "lo",
@@ -431,20 +278,21 @@ func TestLocalInterfacePrefixes(t *testing.T) {
 		{
 			Name: "ap0",
 			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fe80::1/64"),
 				netip.MustParsePrefix("192.168.96.221/24"),
 				netip.MustParsePrefix("fe80::1/64"),
 				netip.MustParsePrefix("::ffff:192.168.97.1/120"),
 			},
 		},
 	}
-	prefixes := localInterfacePrefixes(interfaces)
-	expected := []netip.Prefix{
-		netip.MustParsePrefix("192.168.96.0/24"),
-		netip.MustParsePrefix("fe80::/64"),
-		netip.MustParsePrefix("192.168.97.0/24"),
+	addresses := collectHostAddresses(interfaces)
+	expected := []netip.Addr{
+		netip.MustParseAddr("192.168.96.221"),
+		netip.MustParseAddr("192.168.97.1"),
+		netip.MustParseAddr("fe80::1"),
 	}
-	if !slices.Equal(prefixes, expected) {
-		t.Fatalf("unexpected local interface prefixes: %v", prefixes)
+	if !slices.Equal(addresses, expected) {
+		t.Fatalf("unexpected host addresses: %v", addresses)
 	}
 }
 
@@ -469,16 +317,6 @@ func TestParseUIDRangesRejectsInvalid(t *testing.T) {
 		if _, err := parseUIDRanges(nil, []string{uidRange}); err == nil {
 			t.Fatalf("expected UID range to be rejected: %s", uidRange)
 		}
-	}
-}
-
-func TestPlatformExcludedUIDRanges(t *testing.T) {
-	if ranges := platformExcludedUIDRanges("linux"); len(ranges) != 0 {
-		t.Fatalf("unexpected Linux platform exclusions: %+v", ranges)
-	}
-	ranges := platformExcludedUIDRanges("android")
-	if len(ranges) != 1 || ranges[0].Start != androidTetheringDNSUID || ranges[0].End != androidTetheringDNSUID {
-		t.Fatalf("unexpected Android platform exclusions: %+v", ranges)
 	}
 }
 
@@ -564,11 +402,4 @@ func ipv6PacketInfo(address netip.Addr) []byte {
 	packetInfo := (*unix.Inet6Pktinfo)(unsafe.Pointer(&oob[unix.CmsgLen(0)]))
 	packetInfo.Addr = address.As16()
 	return oob
-}
-
-func prefixString(prefix netip.Prefix) string {
-	if !prefix.IsValid() {
-		return ""
-	}
-	return prefix.String()
 }

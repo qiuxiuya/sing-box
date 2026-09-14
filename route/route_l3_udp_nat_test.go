@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,10 +34,11 @@ func TestL3UDPDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), 0, 0)
 	defer dispatcher.Close()
+	stage := dispatcher.NewStage(nil)
 
 	request := buildTestIPv4UDPPacket(client, fakeDestination, []byte("request"))
-	require.True(t, dispatcher.Dispatch(request))
-	dispatcher.Flush()
+	require.True(t, stage.Dispatch(request))
+	stage.Flush()
 	require.Len(t, port.writtenPackets, 1)
 
 	forwardIP := header.IPv4(port.writtenPackets[0])
@@ -94,10 +96,11 @@ func TestL3UDPSniffOverrideDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), 0, 0)
 	defer dispatcher.Close()
+	stage := dispatcher.NewStage(nil)
 
 	request := buildTestIPv4UDPPacket(client, originalDestination, []byte("request"))
-	require.True(t, dispatcher.Dispatch(request))
-	dispatcher.Flush()
+	require.True(t, stage.Dispatch(request))
+	stage.Flush()
 	require.Equal(t, 1, dnsRouter.lookupCount)
 	require.Len(t, port.writtenPackets, 1)
 

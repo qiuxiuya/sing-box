@@ -57,9 +57,9 @@ func (r RuleAction) MarshalJSON() ([]byte, error) {
 		return nil, E.New("unknown rule action: " + r.Action)
 	}
 	if v == nil {
-		return badjson.MarshallObjects((_RuleAction)(r))
+		return badjson.MarshallObjects(_RuleAction(r))
 	}
-	return badjson.MarshallObjects((_RuleAction)(r), v)
+	return badjson.MarshallObjects(_RuleAction(r), v)
 }
 
 func (r *RuleAction) UnmarshalJSON(data []byte) error {
@@ -137,9 +137,9 @@ func (r DNSRuleAction) MarshalJSON() ([]byte, error) {
 		return nil, E.New("unknown DNS rule action: " + r.Action)
 	}
 	if v == nil {
-		return badjson.MarshallObjects((_DNSRuleAction)(r))
+		return badjson.MarshallObjects(_DNSRuleAction(r))
 	}
-	return badjson.MarshallObjects((_DNSRuleAction)(r), v)
+	return badjson.MarshallObjects(_DNSRuleAction(r), v)
 }
 
 func (r *DNSRuleAction) UnmarshalJSONContext(ctx context.Context, data []byte) error {
@@ -234,6 +234,7 @@ type AbstractDNSRouteActionOptions struct {
 	DisableOptimisticCache bool                  `json:"disable_optimistic_cache,omitempty"`
 	RewriteTTL             *uint32               `json:"rewrite_ttl,omitempty"`
 	ClientSubnet           *badoption.Prefixable `json:"client_subnet,omitempty"`
+	RemoveClientSubnet     bool                  `json:"remove_client_subnet,omitempty"`
 }
 
 type DNSRouteOptionsActionOptions AbstractDNSRouteActionOptions
@@ -303,7 +304,7 @@ func (r RejectActionOptions) MarshalJSON() ([]byte, error) {
 	case C.RuleActionRejectMethodDefault:
 		r.Method = ""
 	}
-	return json.Marshal((_RejectActionOptions)(r))
+	return json.Marshal(_RejectActionOptions(r))
 }
 
 func (r *RejectActionOptions) UnmarshalJSON(bytes []byte) error {
@@ -361,7 +362,7 @@ func (r DNSRejectActionOptions) MarshalJSON() ([]byte, error) {
 	case C.RuleActionRejectMethodDefault:
 		r.Method = ""
 	}
-	return json.Marshal((_DNSRejectActionOptions)(r))
+	return json.Marshal(_DNSRejectActionOptions(r))
 }
 
 func (r *DNSRejectActionOptions) UnmarshalJSON(bytes []byte) error {

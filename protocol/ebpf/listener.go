@@ -6,8 +6,10 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -40,17 +42,26 @@ func (i *Inbound) newInternalListener(
 			Listen:     common.Ptr(badoption.Addr(listenAddress)),
 			ListenPort: port,
 		},
-		ConnectionHandler:    handler,
-		OOBPacketHandler:     handler,
-		DisablePacketOutput:  true,
-		DisableConnectionLog: true,
-		DisableListenerLog:   true,
-		SocketControl:        i.socketControl(ipv6Listener),
+		ConnectionHandler:   handler,
+		OOBPacketHandler:    handler,
+		DisablePacketOutput: true,
+		DisableLog:          true,
+		SocketControl:       i.socketControl(ipv6Listener),
 	})
 }
 
 func (i *Inbound) newListener(network string, ipv6Listener bool, port uint16) *listener.Listener {
 	return i.newInternalListener(i, network, ipv6Listener, port)
+}
+
+func (i *Inbound) startTCListeners() error {
+	return i.listeners.start(
+		i.enableTCP,
+		i.enableUDP,
+		true,
+		i.localIPv6 || i.sharedIPv6,
+		i.newListener,
+	)
 }
 
 type internalListenerSet struct {
@@ -142,6 +153,57 @@ func (s *internalListenerSet) selectedPort() uint16 {
 	return s.port
 }
 
+func (s *internalListenerSet) registerTCTCPListeners(backend *commonEBPF.TCBackend) error {
+	for _, registration := range []struct {
+		ipv6     bool
+		listener net.Listener
+	}{
+		{false, listenerTCP(s.tcp4)},
+		{true, listenerTCP(s.tcp6)},
+	} {
+		if registration.listener == nil {
+			continue
+		}
+		conn, loaded := registration.listener.(syscall.Conn)
+		if !loaded {
+			return E.New("TC eBPF TCP listener does not expose syscall.Conn")
+		}
+		raw, err := conn.SyscallConn()
+		if err != nil {
+			return err
+		}
+		var registerErr error
+		if err = raw.Control(func(fd uintptr) {
+			registerErr = backend.RegisterTCPListener(registration.ipv6, int(fd))
+		}); err != nil {
+			return err
+		}
+		if registerErr != nil {
+			return registerErr
+		}
+	}
+	return nil
+}
+
+func listenerTCP(current *listener.Listener) net.Listener {
+	if current == nil {
+		return nil
+	}
+	return current.TCPListener()
+}
+
+func (s *internalListenerSet) writeUDP(payload, packetInfo []byte, client netip.AddrPort, source netip.Addr) error {
+	current := s.udp4
+	if source.Is6() {
+		current = s.udp6
+	}
+	if current == nil {
+		return E.New("eBPF UDP redirect listener is unavailable for ", source)
+	}
+	_, _, err := current.UDPConn().WriteMsgUDPAddrPort(payload, packetInfo, client)
+	return err
+}
+
 func (s *internalListenerSet) String() string {
 	var listeners []string
 	if s.tcp4 != nil {
@@ -157,29 +219,4 @@ func (s *internalListenerSet) String() string {
 		listeners = append(listeners, "udp6="+s.udp6.UDPConn().LocalAddr().String())
 	}
 	return strings.Join(listeners, ", ")
-}
-
-func (s *internalListenerSet) udp(ipv6 bool) *listener.Listener {
-	if ipv6 {
-		return s.udp6
-	}
-	return s.udp4
-}
-
-func (s *internalListenerSet) writeUDP(
-	payload []byte,
-	packetInfo []byte,
-	client netip.AddrPort,
-	redirectAddress netip.Addr,
-) error {
-	udpListener := s.udp(redirectAddress.Is6())
-	if udpListener == nil {
-		addressFamily := "IPv4"
-		if redirectAddress.Is6() {
-			addressFamily = "IPv6"
-		}
-		return E.New(addressFamily, " eBPF UDP redirect listener is unavailable")
-	}
-	_, _, err := udpListener.UDPConn().WriteMsgUDPAddrPort(payload, packetInfo, client)
-	return err
 }

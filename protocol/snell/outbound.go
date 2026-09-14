@@ -35,6 +35,7 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
+	reuse         bool
 	logger        logger.ContextLogger
 	dialer        N.Dialer
 	tcpDialer     N.Dialer
@@ -49,12 +50,18 @@ type Outbound struct {
 	quicDestSeq   atomic.Uint64
 }
 
-var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+var (
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
+)
 
 type snellClient interface {
 	snellprotocol.Method
 	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
 	Reset()
+	SetKeepIdleConnections(keep bool)
+	CloseIdleConnections()
 	Close() error
 }
 
@@ -138,6 +145,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		psk:           []byte(options.PSK),
 		userKey:       []byte(options.UserKey),
 		version:       version,
+		reuse:         options.Reuse,
 		quicProxyMode: version == 5 || version == 6 && options.V6Options.QUICProxyMode,
 	}
 	if outbound.quicProxyMode {
@@ -224,7 +232,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return h.dialUDPOverTCP(ctx)
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.client != nil {
 		h.client.Reset()
 	}
@@ -285,6 +293,22 @@ const quicDestCacheTTL = 5 * time.Minute
 type quicDestCacheKey struct {
 	source      M.Socksaddr
 	destination M.Socksaddr
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.reuse
+}
+
+func (h *Outbound) SetKeepIdleConnections(keep bool) {
+	if h.client != nil {
+		h.client.SetKeepIdleConnections(keep)
+	}
+}
+
+func (h *Outbound) CloseIdleConnections() {
+	if h.client != nil {
+		h.client.CloseIdleConnections()
+	}
 }
 
 func (h *Outbound) isRecentQUICDest(source M.Socksaddr, destination M.Socksaddr) bool {

@@ -1,16 +1,19 @@
 ---
-icon: material/new-box
+icon: material/lan-connect
 ---
 
-!!! question "Since sing-box 1.14.0"
+# eBPF
 
-The eBPF inbound transparently intercepts local TCP and UDP traffic through
-cgroup programs. The optional `shared_network` mode intercepts forwarded
-traffic from a hotspot or another downstream network through TC.
+!!! quote "Changes in sing-box 1.14.0"
 
-It is available on Android and Linux builds compiled with cgo and the
-`with_ebpf` build tag. Root or equivalent BPF and network-administration
-permissions are required.
+    eBPF inbound is experimental and only available in Linux and Android builds
+    with the `with_ebpf` build tag.
+
+The eBPF inbound transparently intercepts selected local or downstream TCP and
+UDP traffic. Intercepted connections enter the normal sing-box routing pipeline.
+Required system network state is installed and removed automatically.
+
+The eBPF inbound does not use [Listen Fields](/configuration/shared/listen/).
 
 ### Structure
 
@@ -18,378 +21,346 @@ permissions are required.
 {
   "type": "ebpf",
   "tag": "ebpf-in",
-
-  "network": "",
+  "network": ["tcp", "udp"],
   "udp_timeout": "5m",
-  "dns_mode": "hijack",
-  "cgroup_enabled": true,
-  "cgroup_path": "",
-  "cgroup_ipv6_mode": "always",
-  "redirect_address": [
-    "127.128.0.0/9",
-    "fd53:696e:672d:626f::/64"
-  ],
-  "bypass_private_address": true,
-  "bypass_rule_set": [
-    "geoip-cn"
-  ],
-  "include_uid": [],
-  "include_uid_range": [],
-  "exclude_uid": [],
-  "exclude_uid_range": [],
-  "include_android_user": [],
-  "include_package": [],
-  "exclude_package": [],
-  "map_capacity": {
-    "tcp_redirect": 65536,
-    "udp_redirect": 65536,
-    "socket_bypass": 65536
+  "tc_priority": 1,
+  "fakeip_icmp": "off",
+  "bypass_rule_set": [],
+  "local": {
+    "enabled": true,
+    "data_plane": "cgroup",
+    "dns_mode": "respect_policy",
+    "ipv6": true,
+    "bypass_private_address": true,
+    "include_uid": [],
+    "include_uid_range": [],
+    "exclude_uid": [],
+    "exclude_uid_range": [],
+    "include_android_user": [],
+    "include_package": [],
+    "exclude_package": [],
+    "bypass_port": [],
+    "bypass_port_range": []
   },
-  "shared_network": {
-    "enabled": false,
-    "include_interface": [],
+  "shared": {
+    "enabled": true,
+    "data_plane": "packet_rewrite",
+    "dns_mode": "respect_policy",
+    "interface": ["wlan1"],
+    "ipv6": true,
+    "bypass_private_address": true,
     "include_source_cidr": [],
     "exclude_source_cidr": [],
     "include_mac_address": [],
     "exclude_mac_address": [],
-    "tc_priority": 1,
-    "map_capacity": {
-      "proxy": 65536,
-      "bypass": 65536,
-      "fragment": 65536
-    }
+    "bypass_port": [],
+    "bypass_port_range": []
   }
 }
 ```
-
-The eBPF inbound does not use [Listen Fields](/configuration/shared/listen/).
-Its internal redirect listeners use system-selected ports and are not public
-proxy listeners.
 
 ### Fields
 
 #### network
 
-Enabled network protocols, one of `tcp` `udp`.
-
-Both are enabled if empty. Disabled protocols bypass this inbound.
+Enabled transport protocols, `tcp` and/or `udp`. Both are enabled by default.
 
 #### udp_timeout
 
-UDP NAT session timeout.
+UDP session timeout. Default is `5m`.
 
-Default is `5m`.
+#### tc_priority
 
-#### dns_mode
-
-DNS interception mode. One of:
-
-| Value | Behavior |
-|-------|----------|
-| `hijack` | Intercept TCP and UDP destination port 53 before destination CIDR bypass. |
-| `off` | Leave TCP and UDP destination port 53 on the normal kernel path. |
-
-Default is `hijack`.
-
-The mode applies to both local cgroup traffic and `shared_network`. Keep
-`hijack` for a hotspot unless the host provides an independent DNS service.
-It captures port 53 traffic but does not replace the `hijack-dns` route action.
-
-DHCP, self-protection, protocol selection, UID policy, and shared-network
-client selection are evaluated before DNS interception.
-
-#### cgroup_enabled
-
-Enable interception of locally generated traffic.
-
-Default is `true`.
-
-When disabled, `shared_network.enabled` must be enabled. The cgroup-specific
-fields are then unavailable. This permits a Linux or OpenWrt gateway to run
-only the TC shared-network path.
-
-#### cgroup_path
-
-Absolute cgroup v2 path to intercept.
-
-If empty, sing-box uses the root of the detected cgroup v2 hierarchy.
-
-#### cgroup_ipv6_mode
-
-Local native IPv6 interception mode. One of:
-
-| Value | Behavior |
-|-------|----------|
-| `always` | Intercept IPv6 when an IPv6 `redirect_address` is configured. |
-| `auto` | Intercept new IPv6 flows only while the current network has a usable IPv6 route. |
-| `off` | Do not intercept native IPv6. |
-
-Default is `always`.
-
-IPv4 and IPv4-mapped IPv6 sockets are unaffected. This field does not control
-`shared_network` IPv6.
-
-#### redirect_address
-
-Internal token prefixes used by the redirect listeners.
-
-At most one prefix per address family may be configured. IPv4 prefixes must
-be within `127.0.0.0/8` with a prefix length from `/8` to `/10`. IPv6 prefixes
-must be a ULA `/64`.
-
-Default is `127.128.0.0/9`, which enables IPv4 only. Configure an IPv6 prefix
-to enable IPv6 interception. These prefixes are internal token pools, not
-addresses for a TUN interface.
-
-sing-box creates the required local routes and removes only routes created by
-this inbound.
-
-#### bypass_private_address
-
-Bypass built-in private and special-use destination ranges before sing-box
-routing.
-
-Default is `true`. Set to `false` when traffic to private, carrier-grade NAT,
-link-local, loopback, multicast, or other non-public addresses should enter
-sing-box routing. This applies to both local cgroup traffic and
-`shared_network` traffic.
+TC filter priority in the range 1 through 65535. Default is `1`. Change it only
+when coordinating with other TC filters on the same interfaces.
+When left at the default, TCX links are used when supported; a custom priority
+keeps the traditional `clsact` attachment so its numeric ordering remains effective.
 
 #### bypass_rule_set
 
-List of rule-sets whose destination IP CIDRs bypass the eBPF inbound.
+Traffic to destination IP CIDRs contained in these rule sets bypasses this
+inbound. Non-IP rules are ignored. Runtime updates keep the last confirmed
+policy until every active data plane accepts the replacement.
+
+#### fakeip_icmp
+
+| Value | Behavior |
+| --- | --- |
+| `off` | ICMP Echo Request to the FakeIP pool is not answered. This is the default. |
+| `reply` | Synthesize a local Echo Reply for ICMP Echo Request destined to the configured FakeIP pool. |
+
+`reply` never proxies ICMP: it recognizes ICMP Echo Request destined to the
+FakeIP address pool and answers immediately with an in-place Echo Reply,
+without ever contacting the request's DNS-mapped destination. This makes a
+FakeIP address respond to `ping`, which some clients use to decide whether a
+destination is reachable. The reply's source address, identifier, sequence,
+and payload are unchanged from the request, and the reply is never longer
+than the request. A response therefore does not measure reachability of, or
+round-trip time to, the proxied destination — it measures only this host's
+own local response time.
 
-Only destination IP CIDR data is extracted. Domains, ports, processes,
-logical conditions, and other rule conditions are ignored. Use CIDR-only
-rule-sets for this field.
+`reply` requires at least one FakeIP prefix (IPv4 or IPv6) to be configured
+and at least one of the interception paths in the support matrix below.
+Configuring `reply` without a usable path is a startup error naming the
+unsupported combination, not a silent no-op.
 
-Matching traffic stays in the kernel and does not enter sing-box routing. The
-maps are refreshed when a referenced rule-set is updated. Existing flows keep
-their current proxy or bypass decision until they expire.
+Only the destination ICMP packet's own safe subset is answered: IPv4 with no
+options and no fragmentation, and IPv6 Echo with no extension header ahead of
+it. Anything else — including fragments, non-Echo ICMP, or a packet this
+object cannot safely parse in full — passes through unmodified.
 
-#### include_uid
+##### Support matrix
 
-List of process UIDs to intercept.
+| Data plane | `fakeip_icmp: reply` |
+| --- | --- |
+| `local.data_plane: tc` | Supported |
+| `local.data_plane: cgroup` | Not supported for local traffic |
+| `shared.data_plane: socket_assign` | Supported for shared clients |
+| `shared.data_plane: packet_rewrite` | Supported for shared clients |
 
-If an include UID or UID range is configured, unmatched UIDs bypass the
-inbound.
+`local.data_plane: cgroup` intercepts by rewriting a socket's destination
+address before a packet is ever built, and has no attachment on any network
+interface to answer from — this is the only combination `reply` refuses
+outright. Both shared data planes attach the same responder program on their
+own interfaces (through their own backend — `TCBackend` for
+`socket_assign`, `SharedNetworkBackend` for `packet_rewrite`), so either one
+answers shared clients on its own.
 
-#### include_uid_range
+Support is path-specific only when the enabled combination still includes
+`local.data_plane: cgroup`:
 
-List of process UID ranges to intercept, in `start:end` format.
+- `local: cgroup` plus a shared path is accepted, but only shared clients are
+  answered. Traffic generated by processes in the local cgroup receives no
+  FakeIP ICMP reply.
 
-#### exclude_uid
+Use `local.data_plane: tc` for local replies. Either shared data plane answers
+shared clients; combining `local: tc` with either one covers both paths.
 
-List of process UIDs to bypass.
+A supported path still needs a usable client source address and a route that
+delivers the request to the responder. On Android, switching between mobile
+data and Wi-Fi can cause tethering to withdraw the hotspot's global IPv6
+prefix and default route. Whether IPv6 remains available depends on the
+device and the new upstream.
 
-Exclude rules take priority over include rules. On Android, UID `1052`
-(`dns_tether`) is always excluded to protect the platform tethering DNS path.
+`local.data_plane: tc` has the equivalent dependency in the other direction:
+ordinary routing must select the local TC interface for an address in the
+FakeIP IPv6 prefix. A matching route or a default route through that interface
+is sufficient. sing-box logs a warning when no such route is available.
 
-#### exclude_uid_range
+### local
 
-List of process UID ranges to bypass, in `start:end` format.
+#### local.enabled
 
-#### include_android_user
+Enable interception of traffic generated on this host. When either path uses
+the new `enabled` field, an omitted `enabled` field on the other path means
+`false`. At least one path must be enabled.
 
-List of Android user IDs whose application traffic may be intercepted.
+The default cgroup data plane intercepts sockets in the visible cgroup v2
+hierarchy and does not follow a network interface. The optional TC data plane
+follows the current system default network interface and moves when it changes.
+During a short handoff, the previous attachment remains active until the
+replacement is ready.
 
-Only available on Android with `cgroup_enabled` enabled.
+#### local.data_plane
 
-#### include_package
+Selects the local interception backend. `cgroup` is the default and intercepts
+sockets in the visible cgroup v2 hierarchy. Set `tc` explicitly to intercept
+traffic on the current default interface instead.
 
-List of Android package names to intercept.
+#### local.cgroup_path
 
-Package UIDs are merged with `include_uid` and `include_uid_range`.
+Limits `data_plane: cgroup` interception to the specified absolute cgroup v2
+subtree. When omitted, the visible cgroup v2 root and all its descendants are
+intercepted. This is not the path of the sing-box service unless only that
+service subtree should be intercepted.
 
-#### exclude_package
+#### local.dns_mode
 
-List of Android package names to bypass.
+| Value | Behavior |
+| --- | --- |
+| `hijack` | Intercept enabled TCP/UDP traffic to destination port 53. |
+| `respect_policy` | Apply local UID and package selection before intercepting destination port 53. |
+| `off` | Do not intercept destination port 53. |
 
-Package UIDs are merged with `exclude_uid` and `exclude_uid_range`. Exclude
-rules take priority.
+Default is `respect_policy`. This setting applies only to enabled TCP/UDP
+protocols and does not identify DoH or DoT traffic.
 
-Package names are resolved once at startup. A missing package is reported as a
-warning; an unavailable package manager prevents startup. Restart sing-box
-after installing, removing, or reinstalling a configured package. Packages
-that share an Android UID cannot be distinguished by eBPF.
+#### local.ipv6
 
-#### map_capacity
+Enable local IPv6 interception. Default is `true`. When disabled, local IPv6
+traffic bypasses this inbound.
 
-Kernel map capacities for the local cgroup path.
+#### local.bypass_private_address
 
-| Field | Purpose |
-|-------|---------|
-| `tcp_redirect` | TCP original-destination state. |
-| `udp_redirect` | UDP redirect and flow state. |
-| `socket_bypass` | Self-protection state used by the socket-cookie fallback. |
+Bypass private and special-use destinations. Default is `true`.
 
-Each field defaults to `65536` and accepts values from `1` through `1048576`.
-Larger values support more concurrent state but consume more locked kernel
-memory.
+#### local.include_uid
 
-On supported kernels, sing-box uses a TGID self-bypass fast path and does not
-create the socket-cookie map. If the kernel rejects that path, sing-box
-automatically loads the socket-cookie fallback. The selected mode is shown as
-`self_bypass=tgid` or `self_bypass=socket_cookie` in the startup log.
+UIDs to intercept. Once an include UID, range, or package is configured, other
+UIDs bypass by default.
 
-### Shared network fields
+#### local.include_uid_range
 
-#### shared_network.enabled
+UID ranges to intercept, in `start:end` format.
 
-Enable interception of forwarded traffic from selected downstream interfaces.
+#### local.exclude_uid
 
-Default is `false`. When disabled, all other `shared_network` fields are
-ignored.
+UIDs to bypass. Exclude policy takes precedence over include policy.
 
-This option does not create a hotspot, bridge, DHCP server, NAT, IPv6 router
-advertisements, or IP forwarding. Those services remain the responsibility of
-Android, Linux, or OpenWrt.
+#### local.exclude_uid_range
 
-#### shared_network.include_interface
+UID ranges to bypass, in `start:end` format.
 
-==Required if `shared_network.enabled`==
+#### local.include_android_user
 
-List of downstream interfaces where client frames enter TC ingress.
+Android user IDs to intercept. Android only.
 
-Interfaces may be absent when sing-box starts. They are attached when they
-appear and detached when they disappear. Do not select `lo`, an upstream
-interface, or a layer-3-only interface.
+#### local.include_package
 
-On devices that use the same interface name for Wi-Fi client and hotspot
-traffic, use `include_source_cidr` to select the hotspot client subnet.
+Android package names to intercept. Android only.
 
-#### shared_network.include_source_cidr
+#### local.exclude_package
 
-List of client source CIDRs allowed to enter the shared-network proxy path.
+Android package names to bypass. Android only. Packages sharing one UID cannot
+be distinguished.
 
-When non-empty, unmatched clients bypass the inbound. If only one address
-family is listed, the other address family is not intercepted.
+#### local.bypass_port
 
-#### shared_network.exclude_source_cidr
+Destination ports to bypass local interception. This option is supported by
+both local data planes (`tc` and `cgroup`) and applies independently to TCP and
+UDP when those protocols are enabled by `network`. It matches the destination
+port only. FakeIP always forces interception. DNS handling also has precedence:
+`hijack` always intercepts port 53, `respect_policy` applies UID policy before
+DNS interception, and `off` already bypasses DNS. sing-box emits a startup
+warning when port 53 is listed.
 
-List of client source CIDRs to bypass.
+#### local.bypass_port_range
 
-Exclude rules take priority over include rules.
+Destination port ranges to bypass, in `start:end` format. The range is
+inclusive.
 
-#### shared_network.include_mac_address
+### shared
 
-List of client source MAC addresses allowed to enter the shared-network proxy
-path. When non-empty, unmatched clients bypass the inbound.
+#### shared.enabled
 
-The address is read from the TC Ethernet header and is passed to
-`source_mac_address` route and DNS rules.
+Enable interception of traffic arriving from the configured downstream
+interfaces.
 
-#### shared_network.exclude_mac_address
+#### shared.data_plane
 
-List of client source MAC addresses to bypass.
+| Value | Behavior |
+| --- | --- |
+| `socket_assign` | Assign selected traffic directly to the internal transparent listener. |
+| `packet_rewrite` | Rewrite selected traffic to an internal token address and restore reply packets on the downstream interface. This is the default. |
 
-Exclude rules take priority over include rules. MAC addresses can be
-randomized or spoofed and must not be used as authentication.
+`packet_rewrite` requires Ethernet-framed downstream interfaces and does not
+use the policy routing required by `socket_assign`. Neither shared data plane
+creates the delivery veth used by local TC. Local and shared data planes are
+selected independently.
 
-#### shared_network.tc_priority
+#### shared.dns_mode
 
-TC filter priority used on ingress and egress.
+Uses the same values as `local.dns_mode`. In `respect_policy` mode, source CIDR
+and MAC selection is applied before destination port 53 is intercepted.
 
-Default is `1`. Keep the default on Android so sing-box runs before Android
-tethering offload filters. Linux and OpenWrt may choose another value from `1`
-through `65535` to fit existing TC filters.
+#### shared.interface
 
-#### shared_network.map_capacity
+==Required when shared interception is enabled==
 
-Kernel map capacities for the shared-network path.
+Downstream interfaces where client traffic enters the host. The default
+`packet_rewrite` data plane requires Ethernet framing. Set `socket_assign`
+explicitly for Ethernet/IPoE, raw-IP (including Android rmnet), PPP/PPPoE, or
+IPIP/SIT/GRE tunnel interfaces.
+Multiple interfaces may be specified; interfaces that are temporarily absent
+are retried after network updates. An interface is temporarily excluded from
+shared interception while it is the current default upstream, then restored
+when it becomes downstream again. Loopback is not accepted.
 
-| Field | Purpose |
-|-------|---------|
-| `proxy` | Proxied-flow token, listener, and reply state. |
-| `bypass` | Cached bypass-flow decisions. |
-| `fragment` | IPv4 and IPv6 fragment association state. |
+#### shared.ipv6
 
-Each field defaults to `65536` and accepts values from `1` through `1048576`.
+Enable shared IPv6 interception. Default is `true`. When disabled, IPv6 traffic
+on shared interfaces bypasses this inbound.
 
-### Shared network behavior
+On Android, `shared.ipv6: true` enables interception; it does not assign IPv6
+addresses or send router advertisements to hotspot clients.
+Ordinary shared IPv6 use depends on Android actually providing usable IPv6
+addressing and routing to those clients. If an upstream change withdraws the
+hotspot's global prefix and default route, ordinary client IPv6 connectivity
+can be lost while link-local communication remains available. Enabling
+`shared.ipv6` or `fakeip_icmp` cannot restore the withdrawn network state.
 
-The shared-network policy for a new flow is evaluated in this order:
+The reported mobile-data setup supports shared IPv4 and IPv6. With Wi-Fi as
+upstream, dual-stack use remains conditional on the hotspot retaining valid
+IPv6 configuration and a working delivery path; it is not established by
+the link-local diagnostic test above. IPv6 prefix or route withdrawal alone
+does not affect shared IPv4.
 
-1. Source MAC exclude/include policy.
-2. Source CIDR exclude/include policy.
-3. DHCP bypass.
-4. `dns_mode`.
-5. Addresses assigned to the host.
-6. Built-in private and special-use destination ranges, when `bypass_private_address` is enabled.
-7. `bypass_rule_set` destination CIDRs.
+#### shared.bypass_private_address
 
-DHCP ports 67, 68, 546, and 547 always bypass interception. Selected TCP and
-UDP traffic is rewritten to an internal token address, and replies are restored
-by TC egress. The downstream source IP and source MAC are preserved in route
-metadata.
+Bypass private and special-use destinations. Default is `true`.
 
-IPv4 shared-network mode temporarily enables `route_localnet` on attached
-interfaces. IPv6 requires an IPv6 `/64` in `redirect_address`.
+#### shared.include_source_cidr
 
-IPv4 and IPv6 fragments for selected TCP and UDP flows are associated with the
-first fragment and transparently rewritten in both directions. Later fragments
-that arrive before the first fragment, or after the 30-second fragment state
-expires, are dropped to prevent a direct-path policy bypass.
+Client source CIDRs to intercept. When non-empty, non-matching sources bypass.
 
-The selected interface must expose Ethernet-like frames to TC. XDP, hardware
-flow offload, or vendor tethering offload that bypasses TC cannot be
-intercepted.
+#### shared.exclude_source_cidr
 
-### Kernel requirements
+Client source CIDRs to bypass. Exclude policy takes precedence over include
+policy.
 
-Use the included capability probe before deployment:
+#### shared.include_mac_address
 
-```sh
-sing-box tools ebpf status --mode local
-sing-box tools ebpf status --mode shared-network --interface br-lan
-```
+48-bit client source MAC addresses to intercept.
 
-The standalone script is also available at `common/ebpf/check-kernel.sh`.
+This option is available only on Ethernet-framed shared interfaces.
 
-| Data path | Required capabilities |
-|-----------|-----------------------|
-| All | BPF syscall, required map types, sufficient locked memory, and BPF/network-administration privileges. |
-| Local cgroup | cgroup v2, `CONFIG_CGROUP_BPF`, and the enabled connect/sendmsg/recvmsg attach types. |
-| `shared_network` | `sched_cls`, `clsact`, writable packet and checksum helpers, and TC administration. |
+#### shared.exclude_mac_address
 
-`BPF_CGROUP_INET_SOCK_RELEASE` is optional. Older kernels use a bounded LRU
-compatibility mode for UDP state. TGID self-bypass and map lookup-and-delete
-are optional performance optimizations. Batch map operations accelerate large
-UID and CIDR policy updates when supported; older kernels use individual map
-operations. `CONFIG_BPF_JIT` is strongly recommended.
+48-bit client source MAC addresses to bypass. Exclude policy takes precedence
+over include policy.
 
-There is no reliable kernel-version-only check because Android and vendor
-kernels frequently backport individual eBPF features. A successful program
-load on the target kernel is the final compatibility test.
+This option is available only on Ethernet-framed shared interfaces.
 
-### OpenWrt
+#### shared.bypass_port
 
-OpenWrt can run both data paths, or only `shared_network` with
-`cgroup_enabled: false`.
+Destination ports to bypass shared interception. This option is supported by
+both shared data planes (`socket_assign` and `packet_rewrite`) and applies
+independently to TCP and UDP when those protocols are enabled by `network`. It
+matches the destination port only. FakeIP and DNS handling have the same
+precedence described for `local.bypass_port`; listing port 53 in this mode is
+therefore warned about at startup.
 
-The shared-network path commonly requires `kmod-sched-core` and
-`kmod-sched-bpf`, although package names vary by release. Hardware flow
-offload may need to be disabled if it bypasses the selected TC hook. Use an
-OpenWrt SDK/toolchain matching the target architecture and libc.
+#### shared.bypass_port_range
 
-The target does not require Clang, `tc`, `bpftool`, libbpf, or libelf at
-runtime. `tc` and `bpftool` are useful only for diagnostics.
+Destination port ranges to bypass, in `start:end` format. The range is
+inclusive.
 
-### Build
+!!! note
 
-Enable cgo and append `with_ebpf` to the normal build tags:
+    Shared mode does not enable IP forwarding or provide NAT, DHCP, IPv6 router
+    advertisements, or hotspot management. Configure these functions in Android,
+    Linux, or the router operating system. Multiple downstream interfaces may be
+    configured for Wi-Fi, USB tethering, and similar links.
 
-```sh
-CGO_ENABLED=1 \
-TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS),with_ebpf" \
-make build
-```
+### Diagnostics
 
-For Android, set `GOOS`, `GOARCH`, and an Android NDK compiler. The build host
-must provide a Clang with the BPF target and Linux UAPI headers. The generated
-BPF objects are embedded in the binary and are not committed to Git.
+- `sing-box tools ebpf status` probes the current kernel's required eBPF
+  capabilities. It does not inspect a running inbound.
+- When the Clash API and at least one eBPF inbound are enabled, `GET /ebpf`
+  reports the running eBPF inbounds, attachments, recovery state, resource
+  usage, and failure counters:
 
-### Credits
+  ```
+  curl -H "Authorization: Bearer $SECRET" http://127.0.0.1:9090/ebpf
+  ```
 
-Thanks to [Asterisk4Magisk/bpf2socks](https://github.com/Asterisk4Magisk/bpf2socks)
-for the original eBPF interception implementation on which this inbound is
-based.
+### Limitations
+
+- A sing-box instance may contain only one eBPF inbound with local interception
+  enabled. Additional eBPF inbounds must be shared-only.
+- Fragmented IPv4 and IPv6 datagrams bypass interception. IPv6 atomic fragments
+  are processed as ordinary IPv6 packets.
+- Interception state is restored automatically after network changes.
+
+See [eBPF kernel requirements](/manual/misc/ebpf-kernel-requirements/) before
+enabling this inbound on vendor or Android kernels.

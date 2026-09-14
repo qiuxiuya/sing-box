@@ -1,7 +1,9 @@
 package rule
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"io/fs"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/hash"
+	"github.com/sagernet/sing-box/common/interrupt"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
@@ -32,6 +35,7 @@ type RemoteRuleSet struct {
 	cancel         context.CancelFunc
 	outbound       adapter.OutboundManager
 	url            string
+	urlHash        [32]byte
 	initialPath    string
 	options        option.RemoteRuleSet
 	updateInterval time.Duration
@@ -65,6 +69,7 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		initialPath = filemanager.BasePath(ctx, strings.ReplaceAll(options.RemoteOptions.InitialPath, C.RuleSetTagPlaceholder, tag))
 		initialPath, _ = filepath.Abs(initialPath)
 	}
+	url := strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag)
 	return &RemoteRuleSet{
 		abstractRuleSet: abstractRuleSet{
 			ctx:    ctx,
@@ -75,7 +80,8 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 			format: options.Format,
 		},
 		outbound:       service.FromContext[adapter.OutboundManager](ctx),
-		url:            strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag),
+		url:            url,
+		urlHash:        sha256.Sum256([]byte(url)),
 		initialPath:    initialPath,
 		cancel:         cancel,
 		options:        options.RemoteOptions,
@@ -146,6 +152,7 @@ func (s *RemoteRuleSet) Update(ctx context.Context) error {
 }
 
 func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
+	ctx = interrupt.ContextWithIsResourceDownload(ctx)
 	if s.updating.Swap(true) {
 		return E.New("rule-set is updating")
 	}
@@ -174,6 +181,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 		if s.cacheFile != nil {
 			if savedRuleSet := s.cacheFile.LoadRuleSet(s.tag); savedRuleSet != nil {
 				savedRuleSet.LastUpdated = lastUpdated
+				savedRuleSet.URLHash = s.urlHash[:]
 				if err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet); err != nil {
 					s.logger.Error("save rule-set updated time: ", err)
 				}
@@ -207,6 +215,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 		savedRuleSet := &adapter.SavedBinary{
 			LastUpdated: lastUpdated,
 			LastEtag:    s.lastEtag,
+			URLHash:     s.urlHash[:],
 		}
 		if s.path != "" {
 			savedRuleSet.Hash = s.hash
@@ -252,6 +261,10 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 	var savedSet *adapter.SavedBinary
 	if s.cacheFile != nil {
 		if savedSet = s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
+			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
+				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+				return false, nil
+			}
 			s.hash = savedSet.Hash
 		}
 	}

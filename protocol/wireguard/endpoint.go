@@ -4,12 +4,14 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/iponly"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -28,6 +30,7 @@ var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.FlowOutboundDomainResolver  = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 )
 
@@ -43,6 +46,8 @@ type Endpoint struct {
 	logger               logger.ContextLogger
 	localAddresses       []netip.Prefix
 	endpoint             *wireguard.Endpoint
+	onDemand             bool
+	bindAccess           sync.Mutex
 	started              atomic.Bool
 	innerDNSQueryOptions adapter.DNSQueryOptions
 }
@@ -55,6 +60,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
 		logger:         logger,
 		localAddresses: options.Address,
+		onDemand:       options.OnDemand,
 	}
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
@@ -110,6 +116,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 				},
 			}))
 		},
+		Tag:        tag,
 		Name:       options.Name,
 		MTU:        options.MTU,
 		Address:    options.Address,
@@ -159,12 +166,31 @@ func (w *Endpoint) Start(stage adapter.StartStage) error {
 }
 
 func (w *Endpoint) Close() error {
+	w.bindAccess.Lock()
 	w.started.Store(false)
+	w.bindAccess.Unlock()
 	return w.endpoint.Close()
 }
 
-func (w *Endpoint) InterfaceUpdated() {
+func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
 	if !w.started.Load() {
+		return
+	}
+	go w.updateBind(ctx)
+}
+
+func (w *Endpoint) OnDemand() bool {
+	return w.onDemand
+}
+
+func (w *Endpoint) SetKeepIdleConnections(keep bool) {
+	w.endpoint.SetIdle(!keep)
+}
+
+func (w *Endpoint) updateBind(ctx context.Context) {
+	w.bindAccess.Lock()
+	defer w.bindAccess.Unlock()
+	if ctx.Err() != nil || !w.started.Load() {
 		return
 	}
 	err := w.endpoint.BindUpdate()
@@ -302,16 +328,20 @@ func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}
-		return N.ListenSerial(ctx, w.endpoint, destination, destinationAddresses)
+		packetConn, destinationAddress, err := N.ListenSerial(ctx, w.endpoint, destination, destinationAddresses)
+		if err != nil {
+			return nil, netip.Addr{}, err
+		}
+		return iponly.NewPacketConn(w.logger, packetConn), destinationAddress, nil
 	}
 	packetConn, err := w.endpoint.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsIP() {
-		return packetConn, destination.Addr, nil
+		return iponly.NewPacketConn(w.logger, packetConn), destination.Addr, nil
 	}
-	return packetConn, netip.Addr{}, nil
+	return iponly.NewPacketConn(w.logger, packetConn), netip.Addr{}, nil
 }
 
 func (w *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

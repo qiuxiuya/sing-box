@@ -6,14 +6,14 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-tun"
 )
 
 func TestValidateAndroidUIDOptions(t *testing.T) {
-	androidOptions := option.EBPFInboundOptions{
+	androidOptions := option.EBPFLocalOptions{
 		IncludeAndroidUser: []int{0, 10},
 		IncludePackage:     []string{"com.example.include"},
 		ExcludePackage:     []string{"com.example.exclude"},
@@ -58,26 +58,26 @@ func TestResolveAndroidUIDPolicy(t *testing.T) {
 			includePackage:     []string{"com.example.include", "com.example.shared"},
 			excludePackage:     []string{"com.example.exclude"},
 		},
-		cgroupPolicy: ECommon.CgroupPolicy{
-			IncludeUID: []ECommon.UIDRange{{Start: 2000, End: 2000}},
-			ExcludeUID: []ECommon.UIDRange{{Start: 3000, End: 3000}},
+		localPolicy: commonEBPF.LocalPolicy{
+			IncludeUID: []commonEBPF.UIDRange{{Start: 2000, End: 2000}},
+			ExcludeUID: []commonEBPF.UIDRange{{Start: 3000, End: 3000}},
 		},
 	}
 	if err := inbound.resolveAndroidUIDPolicy(); err != nil {
 		t.Fatal(err)
 	}
 	for _, uid := range []uint32{2000, 10001, 10002, 1010001, 1010002} {
-		if !uidInRanges(uid, inbound.cgroupPolicy.IncludeUID) {
-			t.Fatalf("expected UID %d in include policy: %+v", uid, inbound.cgroupPolicy.IncludeUID)
+		if !uidInRanges(uid, inbound.localPolicy.IncludeUID) {
+			t.Fatalf("expected UID %d in include policy: %+v", uid, inbound.localPolicy.IncludeUID)
 		}
 	}
 	for _, uid := range []uint32{3000, 10003, 1010003, 500000, 1100000} {
-		if !uidInRanges(uid, inbound.cgroupPolicy.ExcludeUID) {
-			t.Fatalf("expected UID %d in exclude policy: %+v", uid, inbound.cgroupPolicy.ExcludeUID)
+		if !uidInRanges(uid, inbound.localPolicy.ExcludeUID) {
+			t.Fatalf("expected UID %d in exclude policy: %+v", uid, inbound.localPolicy.ExcludeUID)
 		}
 	}
 	for _, uid := range []uint32{10001, 1010001} {
-		if uidInRanges(uid, inbound.cgroupPolicy.ExcludeUID) {
+		if uidInRanges(uid, inbound.localPolicy.ExcludeUID) {
 			t.Fatalf("included package UID %d was unexpectedly excluded", uid)
 		}
 	}
@@ -94,7 +94,7 @@ func TestResolveAndroidUIDPolicyRequiresPackageManager(t *testing.T) {
 	}
 }
 
-func uidInRanges(uid uint32, uidRanges []ECommon.UIDRange) bool {
+func uidInRanges(uid uint32, uidRanges []commonEBPF.UIDRange) bool {
 	for _, uidRange := range uidRanges {
 		if uid >= uidRange.Start && uid <= uidRange.End {
 			return true

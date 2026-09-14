@@ -77,6 +77,10 @@ type DialerOptionsWrapper interface {
 	ReplaceDialerOptions(options DialerOptions)
 }
 
+type InnerDomainResolverOptionsWrapper interface {
+	TakeInnerDomainResolverOptions() *DomainResolveOptions
+}
+
 type DialerOptions struct {
 	Detour string `json:"detour,omitempty" reference:"outbound"`
 	AbstractDialerOptions
@@ -135,7 +139,7 @@ func (o DomainResolveOptions) MarshalJSON() ([]byte, error) {
 		o.ClientSubnet == nil {
 		return json.Marshal(o.Server)
 	} else {
-		return json.Marshal((_DomainResolveOptions)(o))
+		return json.Marshal(_DomainResolveOptions(o))
 	}
 }
 

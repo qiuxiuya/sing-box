@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,23 +22,18 @@ func TestMapBatchIntegration(t *testing.T) {
 		{name: "fallback", forceFallback: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			attribute := mapCreateAttr{
-				MapType:    1,
+			const maxEntries = 8
+			mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+				Type:       CiliumEBPF.Hash,
 				KeySize:    uint32(unsafe.Sizeof(uint32(0))),
 				ValueSize:  uint32(unsafe.Sizeof(uint64(0))),
-				MaxEntries: 8,
+				MaxEntries: maxEntries,
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			fd, _, errno := unix.Syscall(
-				unix.SYS_BPF,
-				bpfMapCreate,
-				uintptr(unsafe.Pointer(&attribute)),
-				unsafe.Sizeof(attribute),
-			)
-			if errno != 0 {
-				t.Fatal(errno)
-			}
-			mapFD := int(fd)
-			t.Cleanup(func() { _ = unix.Close(mapFD) })
+			t.Cleanup(func() { _ = mapInstance.Close() })
+			mapFD := mapInstance.FD()
 
 			keys := []uint32{1, 2, 3, 4}
 			values := []uint64{10, 20, 30, 40}
@@ -48,12 +44,9 @@ func TestMapBatchIntegration(t *testing.T) {
 				deleteSupport.mode.Store(mapBatchUnsupported)
 			}
 			processed, err := updateMapBatch(
-				mapFD,
-				unsafe.Pointer(&keys[0]),
-				unsafe.Pointer(&values[0]),
-				uint32(len(keys)),
-				unsafe.Sizeof(keys[0]),
-				unsafe.Sizeof(values[0]),
+				mapInstance,
+				keys,
+				values,
 				0,
 				&updateSupport,
 			)
@@ -71,12 +64,16 @@ func TestMapBatchIntegration(t *testing.T) {
 					t.Fatalf("unexpected value for key %d: %d", key, value)
 				}
 			}
-
+			entries, err := countMapEntries(mapFD, unsafe.Sizeof(keys[0]), maxEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entries != uint32(len(keys)) {
+				t.Fatalf("unexpected map entry count: %d", entries)
+			}
 			processed, err = deleteMapBatch(
-				mapFD,
-				unsafe.Pointer(&keys[0]),
-				uint32(len(keys)),
-				unsafe.Sizeof(keys[0]),
+				mapInstance,
+				keys,
 				&deleteSupport,
 			)
 			runtime.KeepAlive(keys)
@@ -89,6 +86,41 @@ func TestMapBatchIntegration(t *testing.T) {
 					t.Fatalf("deleted key %d remains: %v", key, err)
 				}
 			}
+			entries, err = countMapEntries(mapFD, unsafe.Sizeof(keys[0]), maxEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entries != 0 {
+				t.Fatalf("unexpected map entry count after delete: %d", entries)
+			}
 		})
+	}
+}
+
+func TestLRUFallbackBoundedIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "test bounded LRU fallback")
+	const maxEntries = 8
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Type:       CiliumEBPF.LRUHash,
+		KeySize:    uint32(unsafe.Sizeof(uint64(0))),
+		ValueSize:  uint32(unsafe.Sizeof(uint64(0))),
+		MaxEntries: maxEntries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mapInstance.Close() })
+	for key := uint64(0); key < 256; key++ {
+		value := key + 1
+		if err = updateMap(mapInstance.FD(), unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+			t.Fatalf("update LRU fallback at key %d: %v", key, err)
+		}
+	}
+	entries, err := countMapEntries(mapInstance.FD(), unsafe.Sizeof(uint64(0)), maxEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries != maxEntries {
+		t.Fatalf("unexpected bounded LRU entry count: %d", entries)
 	}
 }

@@ -105,7 +105,11 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Outbound) fetchMyAddresses() {
-	myInterfaceNames := h.network.InterfaceMonitor().MyInterfaces()
+	interfaceMonitor := h.network.InterfaceMonitor()
+	if interfaceMonitor == nil {
+		return
+	}
+	myInterfaceNames := interfaceMonitor.MyInterfaces()
 	if len(myInterfaceNames) == 0 {
 		return
 	}
@@ -127,7 +131,7 @@ func (h *Outbound) fetchMyAddresses() {
 	h.myAddresses.Store(myAddresses)
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.fetchMyAddresses()
 	if h.icmpPort != nil {
 		h.icmpPort.Close()

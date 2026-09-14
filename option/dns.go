@@ -17,11 +17,12 @@ import (
 )
 
 type RawDNSOptions struct {
-	Servers            []DNSServerOptions `json:"servers,omitempty"`
-	Rules              []DNSRule          `json:"rules,omitempty"`
-	Final              string             `json:"final,omitempty" reference:"dns_server"`
-	ReverseMapping     bool               `json:"reverse_mapping,omitempty"`
-	DefaultRejectRcode *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
+	Servers                []DNSServerOptions `json:"servers,omitempty"`
+	Rules                  []DNSRule          `json:"rules,omitempty"`
+	Final                  string             `json:"final,omitempty" reference:"dns_server"`
+	ReverseMapping         bool               `json:"reverse_mapping,omitempty"`
+	DefaultRejectRcode     *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
+	AllowResolverDiscovery bool               `json:"allow_resolver_discovery,omitempty"`
 	DNSClientOptions
 }
 
@@ -86,7 +87,7 @@ func (o OptimisticDNSOptions) MarshalJSON() ([]byte, error) {
 	if o.Timeout == 0 {
 		return json.Marshal(o.Enabled)
 	}
-	return json.Marshal((_OptimisticDNSOptions)(o))
+	return json.Marshal(_OptimisticDNSOptions(o))
 }
 
 func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {

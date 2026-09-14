@@ -35,7 +35,10 @@ import (
 
 const MimeType = "application/dns-message"
 
-var _ adapter.DNSTransport = (*HTTPSTransport)(nil)
+var (
+	_ adapter.DNSTransport         = (*HTTPSTransport)(nil)
+	_ adapter.IdleConnectionKeeper = (*HTTPSTransport)(nil)
+)
 
 func RegisterHTTPS(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteHTTPSDNSServerOptions](registry, C.DNSTypeHTTPS, NewHTTPS)
@@ -50,6 +53,7 @@ type HTTPSTransport struct {
 	headers          http.Header
 	serverAddr       M.Socksaddr
 	fallback         *atomic.Bool
+	keepIdle         atomic.Bool
 	transportAccess  sync.Mutex
 	transport        *HTTPSTransportWrapper
 	transportResetAt time.Time
@@ -135,7 +139,7 @@ func NewHTTPSRaw(
 		// plain HTTP DoH used by Tailscale
 		fallback.Store(true)
 	}
-	return &HTTPSTransport{
+	transport := &HTTPSTransport{
 		TransportAdapter: adapter,
 		logger:           logger,
 		dialer:           dialer,
@@ -146,6 +150,8 @@ func NewHTTPSRaw(
 		fallback:         fallback,
 		transport:        NewHTTPSTransportWrapper(dialer, serverAddr, fallback),
 	}
+	transport.keepIdle.Store(true)
+	return transport
 }
 
 func (t *HTTPSTransport) Start(stage adapter.StartStage) error {
@@ -166,6 +172,19 @@ func (t *HTTPSTransport) Reset() {
 	t.resetTransportLocked()
 }
 
+func (t *HTTPSTransport) SetKeepIdleConnections(keep bool) {
+	t.keepIdle.Store(keep)
+	if !keep {
+		t.CloseIdleConnections()
+	}
+}
+
+func (t *HTTPSTransport) CloseIdleConnections() {
+	t.transportAccess.Lock()
+	defer t.transportAccess.Unlock()
+	t.transport.CloseIdleConnections()
+}
+
 func (t *HTTPSTransport) resetTransportLocked() {
 	oldTransport := t.transport
 	t.transport = NewHTTPSTransportWrapper(t.dialer, t.serverAddr, t.fallback)
@@ -176,6 +195,9 @@ func (t *HTTPSTransport) resetTransportLocked() {
 func (t *HTTPSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	startAt := time.Now()
 	response, err := t.exchange(ctx, message)
+	if !t.keepIdle.Load() {
+		t.CloseIdleConnections()
+	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			t.transportAccess.Lock()

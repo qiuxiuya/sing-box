@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/iponly"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -35,6 +36,7 @@ var (
 	_ adapter.OutboundWithPreferredRoutes = (*ClientEndpoint)(nil)
 	_ adapter.FlowOutbound                = (*ClientEndpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*ClientEndpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*ClientEndpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*ClientEndpoint)(nil)
 	_ tun.Port                            = (*ClientEndpoint)(nil)
 )
@@ -49,6 +51,7 @@ type ClientEndpoint struct {
 	queryOptions      adapter.DNSQueryOptions
 	client            *ovpn.Client
 	device            ovpntransport.Device
+	onDemand          bool
 	stateAccess       sync.Mutex
 	state             atomic.Pointer[clientState]
 	dnsTransport      *DNSTransport
@@ -84,6 +87,7 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		cancelLoop:    cancelLoop,
 		dnsRouter:     service.FromContext[adapter.DNSRouter](ctx),
 		statusUpdated: make(chan struct{}),
+		onDemand:      options.OnDemand,
 	}
 	success := false
 	defer func() {
@@ -404,11 +408,11 @@ func buildClientDataChannelOptions(options option.OpenVPNClientEndpointOptions) 
 }
 
 func buildClientTunnelOptions(options option.OpenVPNClientEndpointOptions, requirePeerAddress bool) (ovpn.ClientTunnelOptions, error) {
-	vpnGateway := netip.Addr(options.PeerAddress)
+	vpnGateway := options.PeerAddress.Build(netip.Addr{})
 	if vpnGateway.IsValid() && !vpnGateway.Is4() {
 		return ovpn.ClientTunnelOptions{}, E.New("`peer_address` must be an IPv4 address")
 	}
-	vpnGatewayIPv6 := netip.Addr(options.PeerAddressIPv6)
+	vpnGatewayIPv6 := options.PeerAddressIPv6.Build(netip.Addr{})
 	if vpnGatewayIPv6.IsValid() && !vpnGatewayIPv6.Is6() {
 		return ovpn.ClientTunnelOptions{}, E.New("`peer_address_ipv6` must be an IPv6 address")
 	}
@@ -658,8 +662,51 @@ func (c *ClientEndpoint) Close() error {
 	return err
 }
 
-func (c *ClientEndpoint) InterfaceUpdated() {
+func (c *ClientEndpoint) InterfaceUpdated(ctx context.Context) {
 	c.client.RestartSession()
+}
+
+func (c *ClientEndpoint) OnDemand() bool {
+	return c.onDemand
+}
+
+func (c *ClientEndpoint) SetKeepIdleConnections(keep bool) {
+	if !keep {
+		c.client.Suspend()
+	}
+}
+
+func (c *ClientEndpoint) waitReady(ctx context.Context) error {
+	if !c.onDemand {
+		if !c.ready() || !c.client.Ready() {
+			return E.New("endpoint is not ready yet")
+		}
+		return nil
+	}
+	c.client.Resume()
+	waitCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+	defer cancel()
+	err := c.client.WaitReady(waitCtx)
+	if err != nil {
+		return err
+	}
+	for {
+		c.statusAccess.Lock()
+		statusUpdated := c.statusUpdated
+		terminalError := c.terminalError
+		c.statusAccess.Unlock()
+		if terminalError != "" {
+			return E.New(terminalError)
+		}
+		if c.ready() {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-statusUpdated:
+		}
+	}
 }
 
 func (c *ClientEndpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
@@ -696,6 +743,9 @@ func (c *ClientEndpoint) ready() bool {
 }
 
 func (c *ClientEndpoint) WritePackets(packets [][]byte) error {
+	if c.onDemand {
+		c.client.Resume()
+	}
 	state := c.state.Load()
 	if !state.started || !state.tunnelConfigured {
 		return E.New("endpoint is not ready yet")
@@ -724,6 +774,9 @@ func (c *ClientEndpoint) WritePackets(packets [][]byte) error {
 }
 
 func (c *ClientEndpoint) writePacketBuffers(packetBuffers []*buf.Buffer) error {
+	if c.onDemand {
+		c.client.Resume()
+	}
 	state := c.state.Load()
 	if !state.started || !state.tunnelConfigured {
 		buf.ReleaseMulti(packetBuffers)
@@ -765,8 +818,9 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 	case N.NetworkUDP:
 		c.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	if !c.ready() || !c.client.Ready() {
-		return nil, E.New("endpoint is not ready yet")
+	readyErr := c.waitReady(ctx)
+	if readyErr != nil {
+		return nil, readyErr
 	}
 	if destination.IsDomain() {
 		destinationAddresses, err := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
@@ -783,24 +837,29 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 
 func (c *ClientEndpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	c.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	if !c.ready() || !c.client.Ready() {
-		return nil, netip.Addr{}, E.New("endpoint is not ready yet")
+	readyErr := c.waitReady(ctx)
+	if readyErr != nil {
+		return nil, netip.Addr{}, readyErr
 	}
 	if destination.IsDomain() {
 		destinationAddresses, err := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}
-		return N.ListenSerial(ctx, c.device, destination, destinationAddresses)
+		packetConn, destinationAddress, err := N.ListenSerial(ctx, c.device, destination, destinationAddresses)
+		if err != nil {
+			return nil, netip.Addr{}, err
+		}
+		return iponly.NewPacketConn(c.logger, packetConn), destinationAddress, nil
 	}
 	packetConn, err := c.device.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsIP() {
-		return packetConn, destination.Addr, nil
+		return iponly.NewPacketConn(c.logger, packetConn), destination.Addr, nil
 	}
-	return packetConn, netip.Addr{}, nil
+	return iponly.NewPacketConn(c.logger, packetConn), netip.Addr{}, nil
 }
 
 func (c *ClientEndpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

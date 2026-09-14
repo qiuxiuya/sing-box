@@ -15,6 +15,7 @@ import (
 	snellprotocol "github.com/sagernet/sing-snell"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +35,48 @@ func TestBuildSnellNetworks(t *testing.T) {
 	networks, err := buildSnellNetworks(5, option.NetworkList(N.NetworkUDP))
 	require.NoError(t, err)
 	require.Equal(t, []string{N.NetworkUDP}, networks)
+}
+
+func TestOutboundMultiplexEnabled(t *testing.T) {
+	for _, version := range []int{4, 5, 6} {
+		for _, reuse := range []bool{false, true} {
+			created, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().NewLogger("snell"), "test", option.SnellOutboundOptions{
+				AbstractSnellOutboundOptions: option.AbstractSnellOutboundOptions{
+					ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 1080},
+					PSK:           "test-password",
+					Reuse:         reuse,
+				},
+				Version: version,
+			})
+			require.NoError(t, err)
+			require.Equal(t, reuse, created.(*Outbound).MultiplexEnabled())
+			require.NoError(t, created.(*Outbound).Close())
+		}
+	}
+}
+
+type keepSessionTestClient struct {
+	lazyPacketTestClient
+	keep bool
+}
+
+func (c *keepSessionTestClient) DialContext(ctx context.Context, _ M.Socksaddr) (net.Conn, error) {
+	c.keep = snellprotocol.KeepSessionFromContext(ctx)
+	return nil, os.ErrInvalid
+}
+
+func TestOutboundPreservesKeepSession(t *testing.T) {
+	client := new(keepSessionTestClient)
+	outbound := &Outbound{client: client, logger: log.NewNOPFactory().NewLogger("snell")}
+	for _, keep := range []bool{true, false} {
+		ctx := context.Background()
+		if keep {
+			ctx = snellprotocol.ContextWithKeepSession(ctx)
+		}
+		_, err := outbound.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+		require.ErrorIs(t, err, os.ErrInvalid)
+		require.Equal(t, keep, client.keep)
+	}
 }
 
 func TestValidateSnellOutboundVersionOptions(t *testing.T) {
@@ -319,6 +362,8 @@ func (d *lazyPacketTestDialer) ListenPacket(context.Context, M.Socksaddr) (net.P
 type lazyPacketTestClient struct {
 	writeStarted chan struct{}
 	resetCalled  bool
+	keepIdle     bool
+	idleClosed   bool
 }
 
 func (c *lazyPacketTestClient) DialContext(context.Context, M.Socksaddr) (net.Conn, error) {
@@ -341,16 +386,42 @@ func (c *lazyPacketTestClient) DialPacketConn(conn net.Conn) (N.NetPacketConn, e
 
 func (c *lazyPacketTestClient) Reset() { c.resetCalled = true }
 
+func (c *lazyPacketTestClient) SetKeepIdleConnections(keep bool) { c.keepIdle = keep }
+
+func (c *lazyPacketTestClient) CloseIdleConnections() { c.idleClosed = true }
+
 func (c *lazyPacketTestClient) Close() error { return nil }
 
-func TestInterfaceUpdated(t *testing.T) {
+func TestOutboundIdleConnections(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) {
-		require.NotPanics(t, (&Outbound{}).InterfaceUpdated)
+		outbound := &Outbound{}
+		require.NotPanics(t, func() {
+			outbound.SetKeepIdleConnections(true)
+			outbound.SetKeepIdleConnections(false)
+			outbound.CloseIdleConnections()
+		})
+		require.NoError(t, outbound.Close())
 	})
 	t.Run("client", func(t *testing.T) {
 		client := &lazyPacketTestClient{}
 		outbound := &Outbound{client: client}
-		outbound.InterfaceUpdated()
+		outbound.SetKeepIdleConnections(true)
+		require.True(t, client.keepIdle)
+		outbound.SetKeepIdleConnections(false)
+		require.False(t, client.keepIdle)
+		outbound.CloseIdleConnections()
+		require.True(t, client.idleClosed)
+	})
+}
+
+func TestInterfaceUpdated(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) {
+		require.NotPanics(t, func() { (&Outbound{}).InterfaceUpdated(context.Background()) })
+	})
+	t.Run("client", func(t *testing.T) {
+		client := &lazyPacketTestClient{}
+		outbound := &Outbound{client: client}
+		outbound.InterfaceUpdated(context.Background())
 		require.True(t, client.resetCalled)
 	})
 }

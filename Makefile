@@ -16,10 +16,6 @@ LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
 .PHONY: test release docs build schema ebpf_generate ebpf_check
 
-ifneq (,$(findstring with_ebpf,$(TAGS)))
-build race ci_build install: ebpf_generate
-endif
-
 build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
@@ -66,8 +62,7 @@ lint_install:
 
 proto:
 	@go run ./cmd/internal/protogen
-	@gofumpt -l -w .
-	@gofumpt -l -w .
+	@golangci-lint fmt
 
 proto_install:
 	go install -v google.golang.org/protobuf/cmd/protoc-gen-go@latest

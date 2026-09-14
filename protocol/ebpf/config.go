@@ -6,40 +6,117 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
-func validateCgroupOptions(enabled bool, options option.EBPFInboundOptions) error {
+func normalizeEnablement(localOption, sharedOption *bool) (bool, bool, error) {
+	if localOption != nil || sharedOption != nil {
+		localEnabled := localOption != nil && *localOption
+		sharedEnabled := sharedOption != nil && *sharedOption
+		if !localEnabled && !sharedEnabled {
+			return false, false, E.New("local.enabled or shared.enabled must be enabled")
+		}
+		return localEnabled, sharedEnabled, nil
+	}
+	return true, false, nil
+}
+
+type normalizedDataPlanes struct {
+	localEnabled    bool
+	localDataPlane  string
+	cgroupPath      string
+	sharedEnabled   bool
+	sharedDataPlane string
+}
+
+func normalizeDataPlanes(options option.EBPFInboundOptions) (normalizedDataPlanes, error) {
+	localEnabled, sharedEnabled, err := normalizeEnablement(options.Local.Enabled, options.Shared.Enabled)
+	if err != nil {
+		return normalizedDataPlanes{}, err
+	}
+	localDataPlane, cgroupPath, err := normalizeLocalDataPlane(options.Local)
+	if err != nil {
+		return normalizedDataPlanes{}, err
+	}
+	sharedDataPlane, err := normalizeSharedDataPlane(options.Shared)
+	if err != nil {
+		return normalizedDataPlanes{}, err
+	}
+	return normalizedDataPlanes{localEnabled: localEnabled, localDataPlane: localDataPlane, cgroupPath: cgroupPath, sharedEnabled: sharedEnabled, sharedDataPlane: sharedDataPlane}, nil
+}
+
+func normalizeSharedDataPlane(options option.EBPFSharedOptions) (string, error) {
+	switch options.DataPlane {
+	case "", sharedDataPlanePacketRewrite:
+		return sharedDataPlanePacketRewrite, nil
+	case sharedDataPlaneSocketAssign:
+		return sharedDataPlaneSocketAssign, nil
+	default:
+		return "", E.New("unknown shared.data_plane: ", options.DataPlane)
+	}
+}
+
+const (
+	localDataPlaneTC     = "tc"
+	localDataPlaneCgroup = "cgroup"
+)
+
+func normalizeLocalDataPlane(options option.EBPFLocalOptions) (string, string, error) {
+	dataPlane := options.DataPlane
+	if dataPlane == "" {
+		dataPlane = localDataPlaneCgroup
+	}
+	if dataPlane != localDataPlaneTC && dataPlane != localDataPlaneCgroup {
+		return "", "", E.New("unknown local.data_plane: ", dataPlane)
+	}
+	if dataPlane != localDataPlaneCgroup && options.CgroupPath != "" {
+		return "", "", E.New("local.cgroup_path requires local.data_plane=cgroup")
+	}
+	if options.CgroupPath == "" {
+		return dataPlane, "", nil
+	}
+	if !filepath.IsAbs(options.CgroupPath) {
+		return "", "", E.New("local.cgroup_path must be absolute")
+	}
+	return dataPlane, filepath.Clean(options.CgroupPath), nil
+}
+
+func validateLocalOptions(enabled bool, options option.EBPFLocalOptions) error {
 	if enabled {
 		return nil
 	}
-	if options.CgroupPath != "" {
-		return E.New("cgroup_path requires cgroup_enabled")
+	if options.DataPlane != "" {
+		return E.New("local.data_plane requires local interception")
 	}
-	if options.CgroupIPv6Mode != "" {
-		return E.New("cgroup_ipv6_mode requires cgroup_enabled")
+	if options.CgroupPath != "" {
+		return E.New("local.cgroup_path requires local interception")
+	}
+	if options.DNSMode != "" {
+		return E.New("local.dns_mode requires local interception")
+	}
+	if options.IPv6 != nil {
+		return E.New("local.ipv6 requires local interception")
+	}
+	if options.BypassPrivateAddress != nil {
+		return E.New("local.bypass_private_address requires local interception")
 	}
 	if len(options.IncludeUID) > 0 || len(options.IncludeUIDRange) > 0 ||
 		len(options.ExcludeUID) > 0 || len(options.ExcludeUIDRange) > 0 ||
 		len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 ||
-		len(options.ExcludePackage) > 0 {
-		return E.New("UID policy requires cgroup_enabled")
-	}
-	if options.MapCapacity.TCPRedirect != nil ||
-		options.MapCapacity.UDPRedirect != nil ||
-		options.MapCapacity.SocketBypass != nil {
-		return E.New("map_capacity requires cgroup_enabled")
+		len(options.ExcludePackage) > 0 || len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {
+		return E.New("local options require local interception")
 	}
 	return nil
 }
 
-func validateAndroidUIDOptions(goos string, options option.EBPFInboundOptions) error {
+func validateAndroidUIDOptions(goos string, options option.EBPFLocalOptions) error {
 	if !hasAndroidUIDOptions(options) {
 		return nil
 	}
@@ -55,157 +132,91 @@ func validateAndroidUIDOptions(goos string, options option.EBPFInboundOptions) e
 	return nil
 }
 
-func hasAndroidUIDOptions(options option.EBPFInboundOptions) bool {
+func hasAndroidUIDOptions(options option.EBPFLocalOptions) bool {
 	return len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 || len(options.ExcludePackage) > 0
 }
 
-func validateDataPaths(cgroupEnabled bool, sharedNetworkEnabled bool) error {
-	if !cgroupEnabled && !sharedNetworkEnabled {
-		return E.New("eBPF inbound requires cgroup_enabled or shared_network.enabled")
+const (
+	fakeIPICMPOff   = "off"
+	fakeIPICMPReply = "reply"
+)
+
+// normalizeFakeIPICMP parses the fakeip_icmp option. It does not know yet
+// whether a FakeIP prefix exists or which data planes are active — that
+// depends on state (the DNS transport manager's FakeIP store) normalizeFakeIPICMP
+// is not given, so those checks run later, in validateFakeIPICMP.
+func normalizeFakeIPICMP(mode string) (bool, error) {
+	switch mode {
+	case "", fakeIPICMPOff:
+		return false, nil
+	case fakeIPICMPReply:
+		return true, nil
+	default:
+		return false, E.New("unknown fakeip_icmp: ", mode)
 	}
-	return nil
+}
+
+// validateFakeIPICMP is the second half of fakeip_icmp validation, run once
+// the FakeIP prefixes are resolved and normalized and the local/shared data
+// planes are known. fakeip_icmp=reply needs something to match against and
+// somewhere to attach: refusing explicitly here, rather than accepting a
+// configuration that can never do anything, is what "确认某种模式无法安全支持时，
+// 应在显式开启时返回配置或能力错误" asks for.
+//
+// Every path with a TC attachment can host the responder: local.data_plane=tc
+// and shared.data_plane=socket_assign both attach through commonEBPF.TCBackend
+// (see tc_fakeip_icmp.go and tc_dataplane.go), and shared.data_plane=packet_rewrite
+// attaches its own copy through commonEBPF.SharedNetworkBackend
+// (shared_rewrite_dataplane.go) -- both load the same underlying
+// FakeIPICMPBackend (fakeip_icmp_backend.go), just on their own interfaces.
+// Only local.data_plane=cgroup has no attachment at all to answer from: its
+// connect()/sendmsg() hooks rewrite a destination before a packet is ever
+// built, so there is nothing there that could see or answer an ICMP request.
+func validateFakeIPICMP(
+	enabled bool,
+	fakeIPIPv4, fakeIPIPv6 netip.Prefix,
+	localEnabled bool, localDataPlane string,
+	sharedEnabled bool, sharedDataPlane string,
+) error {
+	if !enabled {
+		return nil
+	}
+	if !fakeIPIPv4.IsValid() && !fakeIPIPv6.IsValid() {
+		return E.New("fakeip_icmp=reply requires a FakeIP range to be configured (dns fakeip transport)")
+	}
+	hasLocalTC := localEnabled && localDataPlane == localDataPlaneTC
+	hasSharedAttachment := sharedEnabled && (sharedDataPlane == sharedDataPlaneSocketAssign || sharedDataPlane == sharedDataPlanePacketRewrite)
+	if hasLocalTC || hasSharedAttachment {
+		return nil
+	}
+	if localEnabled && localDataPlane == localDataPlaneCgroup && !sharedEnabled {
+		return E.New(
+			"fakeip_icmp=reply is not supported with local.data_plane=cgroup and no shared interception enabled: ",
+			"cgroup's connect()/sendmsg() hooks cannot see or answer ICMP; switch to local.data_plane=tc, or enable shared interception",
+		)
+	}
+	return E.New("fakeip_icmp=reply requires local.data_plane=tc or shared interception (either shared.data_plane) to be enabled")
 }
 
 func normalizeDNSMode(mode string) (string, error) {
 	switch mode {
-	case "", dnsModeHijack:
-		return dnsModeHijack, nil
-	case dnsModeOff:
-		return dnsModeOff, nil
+	case "", dnsModeRespectPolicy:
+		return dnsModeRespectPolicy, nil
+	case dnsModeHijack, dnsModeOff:
+		return mode, nil
 	default:
 		return "", E.New("unknown eBPF dns_mode: ", mode)
 	}
 }
 
-func normalizeCgroupIPv6Mode(mode string) (string, error) {
-	switch mode {
-	case "", cgroupIPv6ModeAlways:
-		return cgroupIPv6ModeAlways, nil
-	case cgroupIPv6ModeAuto, cgroupIPv6ModeOff:
-		return mode, nil
-	default:
-		return "", E.New("unknown eBPF cgroup_ipv6_mode: ", mode)
-	}
+func enabledByDefault(value *bool) bool {
+	return value == nil || *value
 }
 
-func validateCgroupAddressFamilies(
-	enabled bool,
-	ipv6Mode string,
-	ipv4Prefix netip.Prefix,
-	ipv6Prefix netip.Prefix,
-) error {
-	if !enabled {
-		return nil
-	}
-	if !ipv4Prefix.IsValid() && (!ipv6Prefix.IsValid() || ipv6Mode == cgroupIPv6ModeOff) {
-		return E.New("eBPF local cgroup interception has no enabled address family")
-	}
-	return nil
-}
-
-func normalizeCgroupMapCapacity(options option.EBPFMapCapacityOptions) (ECommon.CgroupMapCapacity, error) {
-	capacity := ECommon.DefaultCgroupMapCapacity()
-	var err error
-	capacity.TCPRedirect, err = normalizeMapCapacityValue(
-		"map_capacity.tcp_redirect", options.TCPRedirect, capacity.TCPRedirect,
-	)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
-	}
-	capacity.UDPRedirect, err = normalizeMapCapacityValue(
-		"map_capacity.udp_redirect", options.UDPRedirect, capacity.UDPRedirect,
-	)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
-	}
-	capacity.SocketBypass, err = normalizeMapCapacityValue(
-		"map_capacity.socket_bypass", options.SocketBypass, capacity.SocketBypass,
-	)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
-	}
-	return capacity, nil
-}
-
-func normalizeSharedNetworkMapCapacity(options option.EBPFSharedNetworkMapCapacityOptions) (ECommon.SharedNetworkMapCapacities, error) {
-	capacity := ECommon.DefaultSharedNetworkMapCapacities()
-	var err error
-	capacity.Proxy, err = normalizeMapCapacityValue("shared_network.map_capacity.proxy", options.Proxy, capacity.Proxy)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
-	}
-	capacity.Bypass, err = normalizeMapCapacityValue("shared_network.map_capacity.bypass", options.Bypass, capacity.Bypass)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
-	}
-	capacity.Fragment, err = normalizeMapCapacityValue("shared_network.map_capacity.fragment", options.Fragment, capacity.Fragment)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
-	}
-	return capacity, nil
-}
-
-func normalizeMapCapacityValue(name string, configured *option.EBPFMapCapacity, defaultValue uint32) (uint32, error) {
-	if configured == nil {
-		return defaultValue, nil
-	}
-	value := uint32(*configured)
-	if value == 0 || value > ECommon.MaxConfigurableMapCapacity {
-		return 0, E.New(
-			name,
-			" must be between 1 and ",
-			ECommon.MaxConfigurableMapCapacity,
-		)
-	}
-	return value, nil
-}
-
-func normalizeCgroupPath(cgroupPath string) (string, error) {
-	if cgroupPath == "" {
-		return "", nil
-	}
-	if !filepath.IsAbs(cgroupPath) {
-		return "", E.New("eBPF cgroup_path must be absolute")
-	}
-	return filepath.Clean(cgroupPath), nil
-}
-
-func normalizeRedirectAddresses(addresses []netip.Prefix) (netip.Prefix, netip.Prefix, error) {
-	if len(addresses) == 0 {
-		return defaultRedirectIPv4Prefix, netip.Prefix{}, nil
-	}
-	var ipv4Prefix netip.Prefix
-	var ipv6Prefix netip.Prefix
-	for _, address := range addresses {
-		if !address.IsValid() {
-			return netip.Prefix{}, netip.Prefix{}, E.New("invalid eBPF redirect address")
-		}
-		address = address.Masked()
-		if err := ECommon.ValidateRedirectPrefix(address); err != nil {
-			return netip.Prefix{}, netip.Prefix{}, err
-		}
-		switch {
-		case address.Addr().Is4():
-			if ipv4Prefix.IsValid() {
-				return netip.Prefix{}, netip.Prefix{}, E.New("duplicate IPv4 eBPF redirect address")
-			}
-			ipv4Prefix = address
-		case address.Addr().Is6() && !address.Addr().Is4In6():
-			if ipv6Prefix.IsValid() {
-				return netip.Prefix{}, netip.Prefix{}, E.New("duplicate IPv6 eBPF redirect address")
-			}
-			ipv6Prefix = address
-		default:
-			return netip.Prefix{}, netip.Prefix{}, E.New("invalid eBPF redirect address family: ", address)
-		}
-	}
-	return ipv4Prefix, ipv6Prefix, nil
-}
-
-func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, error) {
-	uidRanges := make([]ECommon.UIDRange, 0, len(uidList)+len(rangeList))
+func parseUIDRanges(uidList []uint32, rangeList []string) ([]commonEBPF.UIDRange, error) {
+	uidRanges := make([]commonEBPF.UIDRange, 0, len(uidList)+len(rangeList))
 	for _, uid := range uidList {
-		uidRanges = append(uidRanges, ECommon.UIDRange{Start: uid, End: uid})
+		uidRanges = append(uidRanges, commonEBPF.UIDRange{Start: uid, End: uid})
 	}
 	for _, uidRange := range rangeList {
 		separator := strings.IndexByte(uidRange, ':')
@@ -229,37 +240,79 @@ func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, e
 		if start > end {
 			return nil, E.New("range start is greater than range end: ", uidRange)
 		}
-		uidRanges = append(uidRanges, ECommon.UIDRange{Start: uint32(start), End: uint32(end)})
+		uidRanges = append(uidRanges, commonEBPF.UIDRange{Start: uint32(start), End: uint32(end)})
 	}
 	return uidRanges, nil
 }
 
-func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {
-	if goos != "android" {
+func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error {
+	if enabled {
 		return nil
 	}
-	return []ECommon.UIDRange{{Start: androidTetheringDNSUID, End: androidTetheringDNSUID}}
+	if options.DataPlane != "" || options.DNSMode != "" || len(options.Interface) > 0 || options.IPv6 != nil || options.BypassPrivateAddress != nil ||
+		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
+		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
+		len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {
+		return E.New("shared options require shared interception")
+	}
+	return nil
 }
 
-func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (option.EBPFSharedNetworkOptions, error) {
-	if !options.Enabled {
-		return option.EBPFSharedNetworkOptions{}, nil
+func parsePortRanges(name string, ports []uint16, ranges []string) ([]commonEBPF.PortRange, error) {
+	result := make([]commonEBPF.PortRange, 0, len(ports)+len(ranges))
+	for _, port := range ports {
+		if port == 0 {
+			return nil, E.New(name, " contains port 0")
+		}
+		result = append(result, commonEBPF.PortRange{Start: port, End: port})
 	}
-	if len(options.IncludeInterface) == 0 {
-		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.include_interface must not be empty")
+	for _, value := range ranges {
+		separator := strings.IndexByte(value, ':')
+		if separator <= 0 || separator == len(value)-1 {
+			return nil, E.New(name, " invalid range: ", value)
+		}
+		start, err := strconv.ParseUint(value[:separator], 10, 16)
+		if err != nil || start == 0 {
+			return nil, E.New(name, " invalid range start: ", value)
+		}
+		end, err := strconv.ParseUint(value[separator+1:], 10, 16)
+		if err != nil || end == 0 || start > end {
+			return nil, E.New(name, " invalid range end: ", value)
+		}
+		result = append(result, commonEBPF.PortRange{Start: uint16(start), End: uint16(end)})
 	}
-	if options.TCPriority == 0 {
-		options.TCPriority = option.EBPFTCPriority(defaultSharedNetworkTCPriority)
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Start != result[j].Start {
+			return result[i].Start < result[j].Start
+		}
+		return result[i].End < result[j].End
+	})
+	merged := result[:0]
+	for _, current := range result {
+		if len(merged) == 0 || uint32(current.Start) > uint32(merged[len(merged)-1].End)+1 {
+			merged = append(merged, current)
+			continue
+		}
+		if current.End > merged[len(merged)-1].End {
+			merged[len(merged)-1].End = current.End
+		}
 	}
-	seen := make(map[string]struct{}, len(options.IncludeInterface))
-	interfaces := make(badoption.Listable[string], 0, len(options.IncludeInterface))
-	for _, interfaceName := range options.IncludeInterface {
+	return merged, nil
+}
+
+func normalizeSharedOptions(options option.EBPFSharedOptions) (option.EBPFSharedOptions, error) {
+	if len(options.Interface) == 0 {
+		return option.EBPFSharedOptions{}, E.New("shared.interface must not be empty")
+	}
+	seen := make(map[string]struct{}, len(options.Interface))
+	interfaces := make(badoption.Listable[string], 0, len(options.Interface))
+	for _, interfaceName := range options.Interface {
 		interfaceName = strings.TrimSpace(interfaceName)
 		if interfaceName == "" {
-			return option.EBPFSharedNetworkOptions{}, E.New("shared_network.include_interface contains an empty interface name")
+			return option.EBPFSharedOptions{}, E.New("shared.interface contains an empty interface name")
 		}
 		if interfaceName == "lo" {
-			return option.EBPFSharedNetworkOptions{}, E.New("shared_network.include_interface must not contain lo")
+			return option.EBPFSharedOptions{}, E.New("shared.interface must not contain lo")
 		}
 		if _, loaded := seen[interfaceName]; loaded {
 			continue
@@ -267,15 +320,15 @@ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (opt
 		seen[interfaceName] = struct{}{}
 		interfaces = append(interfaces, interfaceName)
 	}
-	options.IncludeInterface = interfaces
+	options.Interface = interfaces
 	var err error
 	options.IncludeSourceCIDR, err = normalizeSourceCIDR("include_source_cidr", options.IncludeSourceCIDR)
 	if err != nil {
-		return option.EBPFSharedNetworkOptions{}, err
+		return option.EBPFSharedOptions{}, err
 	}
 	options.ExcludeSourceCIDR, err = normalizeSourceCIDR("exclude_source_cidr", options.ExcludeSourceCIDR)
 	if err != nil {
-		return option.EBPFSharedNetworkOptions{}, err
+		return option.EBPFSharedOptions{}, err
 	}
 	return options, nil
 }
@@ -285,7 +338,7 @@ func normalizeSourceCIDR(name string, prefixes []netip.Prefix) (badoption.Listab
 	seen := make(map[netip.Prefix]struct{}, len(prefixes))
 	for _, prefix := range prefixes {
 		if !prefix.IsValid() {
-			return nil, E.New("invalid shared_network.", name)
+			return nil, E.New("invalid shared.", name)
 		}
 		prefix = prefix.Masked()
 		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
@@ -300,18 +353,18 @@ func normalizeSourceCIDR(name string, prefixes []netip.Prefix) (badoption.Listab
 	return normalized, nil
 }
 
-func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.MACAddress, error) {
-	parsed := make([]ECommon.MACAddress, 0, len(addresses))
-	seen := make(map[ECommon.MACAddress]struct{}, len(addresses))
+func parseSharedMACAddresses(name string, addresses []string) ([]commonEBPF.MACAddress, error) {
+	parsed := make([]commonEBPF.MACAddress, 0, len(addresses))
+	seen := make(map[commonEBPF.MACAddress]struct{}, len(addresses))
 	for index, address := range addresses {
 		hardwareAddress, err := net.ParseMAC(address)
 		if err != nil {
-			return nil, E.Cause(err, "parse shared_network.", name, "[", index, "]")
+			return nil, E.Cause(err, "parse shared.", name, "[", index, "]")
 		}
-		if len(hardwareAddress) != len(ECommon.MACAddress{}) {
-			return nil, E.New("shared_network.", name, "[", index, "] must be a 48-bit MAC address")
+		if len(hardwareAddress) != len(commonEBPF.MACAddress{}) {
+			return nil, E.New("shared.", name, "[", index, "] must be a 48-bit MAC address")
 		}
-		var mac ECommon.MACAddress
+		var mac commonEBPF.MACAddress
 		copy(mac[:], hardwareAddress)
 		if _, loaded := seen[mac]; loaded {
 			continue
@@ -320,11 +373,4 @@ func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.
 		parsed = append(parsed, mac)
 	}
 	return parsed, nil
-}
-
-func validateSharedNetworkProtocols(options option.EBPFSharedNetworkOptions, enableUDP bool, dnsMode string) error {
-	if options.Enabled && dnsMode == dnsModeHijack && !enableUDP {
-		return E.New("shared_network with dns_mode hijack requires UDP")
-	}
-	return nil
 }

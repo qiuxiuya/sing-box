@@ -30,6 +30,13 @@ type SOCKSOutboundOptions struct {
 	InnerDomainResolver *DomainResolveOptions `json:"inner_domain_resolver,omitempty"`
 }
 
+func (o *SOCKSOutboundOptions) TakeInnerDomainResolverOptions() *DomainResolveOptions {
+	if o.Version != "4" {
+		return nil
+	}
+	return o.InnerDomainResolver
+}
+
 type HTTPOutboundOptions struct {
 	DialerOptions
 	ServerOptions

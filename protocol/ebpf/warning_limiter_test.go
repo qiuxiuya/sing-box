@@ -16,11 +16,11 @@ func TestWarningLimiter(t *testing.T) {
 	if !allowed || suppressed != 0 {
 		t.Fatalf("unexpected first result: allowed=%v suppressed=%d", allowed, suppressed)
 	}
-	allowed, suppressed = limiter.allow(baseTime.Add(packetWarningInterval / 2))
+	allowed, suppressed = limiter.allow(baseTime.Add(warningInterval / 2))
 	if allowed || suppressed != 0 {
 		t.Fatalf("unexpected limited result: allowed=%v suppressed=%d", allowed, suppressed)
 	}
-	allowed, suppressed = limiter.allow(baseTime.Add(packetWarningInterval))
+	allowed, suppressed = limiter.allow(baseTime.Add(warningInterval))
 	if !allowed || suppressed != 1 {
 		t.Fatalf("unexpected resumed result: allowed=%v suppressed=%d", allowed, suppressed)
 	}
@@ -33,19 +33,17 @@ func TestWarningLimiterConcurrent(t *testing.T) {
 	baseTime := time.Unix(1, 0)
 	var group sync.WaitGroup
 	for range attempts {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			if allowed, _ := limiter.allow(baseTime); allowed {
 				allowedCount.Add(1)
 			}
-		}()
+		})
 	}
 	group.Wait()
 	if allowedCount.Load() != 1 {
 		t.Fatalf("unexpected concurrent allowance count: %d", allowedCount.Load())
 	}
-	allowed, suppressed := limiter.allow(baseTime.Add(packetWarningInterval))
+	allowed, suppressed := limiter.allow(baseTime.Add(warningInterval))
 	if !allowed || suppressed != attempts-1 {
 		t.Fatalf("unexpected suppression summary: allowed=%v suppressed=%d", allowed, suppressed)
 	}

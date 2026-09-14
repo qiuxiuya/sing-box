@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -17,6 +18,8 @@ import (
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
+
+const defaultExternalUIDownloadURL = "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip"
 
 func (s *Server) checkAndDownloadExternalUI(update bool) error {
 	if s.externalUI == "" {
@@ -47,12 +50,6 @@ func (s *Server) checkAndDownloadExternalUI(update bool) error {
 }
 
 func (s *Server) downloadExternalUI() error {
-	var downloadURL string
-	if s.externalUIDownloadURL != "" {
-		downloadURL = s.externalUIDownloadURL
-	} else {
-		downloadURL = "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip"
-	}
 	transport, err := s.resolveExternalUITransport()
 	if err != nil {
 		return E.Cause(err, "create external UI http client")
@@ -60,14 +57,14 @@ func (s *Server) downloadExternalUI() error {
 	httpClient := &http.Client{Transport: transport}
 	defer httpClient.CloseIdleConnections()
 	s.logger.Info("downloading external UI")
-	request, err := http.NewRequest("GET", downloadURL, nil)
+	request, err := http.NewRequest("GET", s.externalUIDownloadURL, nil)
 	if err != nil {
 		return err
 	}
 	if s.lastEtag != "" {
 		request.Header.Set("If-None-Match", s.lastEtag)
 	}
-	response, err := httpClient.Do(request.WithContext(s.ctx))
+	response, err := httpClient.Do(request.WithContext(interrupt.ContextWithIsResourceDownload(s.ctx)))
 	if err != nil {
 		return err
 	}
@@ -78,6 +75,7 @@ func (s *Server) downloadExternalUI() error {
 		if s.cacheFile != nil {
 			if savedExternalUI := s.cacheFile.LoadExternalUI("ExternalUI"); savedExternalUI != nil {
 				savedExternalUI.LastUpdated = s.lastUpdated
+				savedExternalUI.URLHash = s.externalUIDownloadURLHash[:]
 				err = s.cacheFile.SaveExternalUI("ExternalUI", savedExternalUI)
 				if err != nil {
 					s.logger.Error("save external UI updated time: ", err)
@@ -106,6 +104,7 @@ func (s *Server) downloadExternalUI() error {
 		err = s.cacheFile.SaveExternalUI("ExternalUI", &adapter.SavedBinary{
 			LastEtag:    s.lastEtag,
 			LastUpdated: s.lastUpdated,
+			URLHash:     s.externalUIDownloadURLHash[:],
 		})
 		if err != nil {
 			s.logger.Error("save external UI cache file: ", err)

@@ -5,9 +5,10 @@ import (
 	"testing"
 	"time"
 
-	mDNS "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/logger"
+
+	mDNS "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
 

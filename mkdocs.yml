@@ -79,8 +79,8 @@ nav:
       - Misc:
           - TunnelVision: manual/misc/tunnelvision.md
           - AnyTLS client metadata: manual/misc/anytls-client-metadata.md
-          - eBPF inbound comparison: manual/misc/ebpf-inbound-comparison.md
-          - Transparent inbound benchmark: manual/misc/interception-benchmark.md
+          - eBPF troubleshooting: manual/misc/ebpf-troubleshooting.md
+          - eBPF kernel requirements: manual/misc/ebpf-kernel-requirements.md
   - Configuration:
       - configuration/index.md
       - JSON Schema: configuration/schema.md
@@ -128,6 +128,7 @@ nav:
           - configuration/experimental/index.md
           - Cache File: configuration/experimental/cache-file.md
           - Clash API: configuration/experimental/clash-api.md
+          - Observability: configuration/experimental/observability.md
           - V2Ray API: configuration/experimental/v2ray-api.md
       - Shared:
           - Listen Fields: configuration/shared/listen.md
@@ -332,5 +333,6 @@ plugins:
             AnyTLS Fields Override: AnyTLS 字段覆写
 
             Manual: 手册
+            eBPF troubleshooting: eBPF 问题排查
       reconfigure_material: true
       reconfigure_search: true

@@ -10,7 +10,7 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 40 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 80 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkListenerKey{}); size != 40 {
@@ -22,14 +22,11 @@ func TestSharedNetworkABI(t *testing.T) {
 	if size := unsafe.Sizeof(sharedNetworkMACKey{}); size != 8 {
 		t.Fatalf("unexpected shared-network MAC key size: %d", size)
 	}
-	if size := unsafe.Sizeof(sharedNetworkReplyKey{}); size != 44 {
-		t.Fatalf("unexpected shared-network reply key size: %d", size)
-	}
-	if size := unsafe.Sizeof(sharedNetworkOriginalValue{}); size != 36 {
+	if size := unsafe.Sizeof(sharedNetworkOriginalValue{}); size != 40 {
 		t.Fatalf("unexpected shared-network original value size: %d", size)
 	}
-	if sharedNetworkFlagDNSHijack != 1<<4 {
-		t.Fatalf("unexpected shared-network DNS flag: %#x", sharedNetworkFlagDNSHijack)
+	if size := unsafe.Sizeof(sharedNetworkTokenValue{}); size != 40 {
+		t.Fatalf("unexpected shared-network token value size: %d", size)
 	}
 	if sharedNetworkFlagBypassPrivateAddress != 1<<13 {
 		t.Fatalf("unexpected shared-network private-address flag: %#x", sharedNetworkFlagBypassPrivateAddress)
@@ -37,8 +34,27 @@ func TestSharedNetworkABI(t *testing.T) {
 	if sharedNetworkFlagBypassFlowCache != 1<<14 {
 		t.Fatalf("unexpected shared-network bypass-flow-cache flag: %#x", sharedNetworkFlagBypassFlowCache)
 	}
+	if sharedNetworkFlagFakeIPIPv4 != 1<<16 || sharedNetworkFlagFakeIPIPv6 != 1<<17 {
+		t.Fatalf(
+			"unexpected shared-network FakeIP flags: IPv4=%#x IPv6=%#x",
+			sharedNetworkFlagFakeIPIPv4,
+			sharedNetworkFlagFakeIPIPv6,
+		)
+	}
 	if sharedNetworkPolicyFlags != 0x5fe0 {
 		t.Fatalf("unexpected shared-network policy flags: %#x", sharedNetworkPolicyFlags)
+	}
+}
+
+func TestSharedSourceMACMapCapacity(t *testing.T) {
+	for entries, expected := range map[int]uint32{
+		0: 1,
+		1: 1,
+		8: 8,
+	} {
+		if capacity := sharedSourceMACMapCapacity(entries); capacity != expected {
+			t.Fatalf("unexpected source MAC map capacity for %d entries: %d", entries, capacity)
+		}
 	}
 }
 
@@ -108,19 +124,28 @@ func TestMakeSharedNetworkFlowHandle(t *testing.T) {
 		Protocol:       ProtocolUDP,
 		Port:           original.Port(),
 		InterfaceIndex: 42,
+		Generation:     99,
 		SourceMAC:      [6]byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
 	}
 	copy(value.Addr[:], original.Addr().AsSlice())
 	flow := makeSharedNetworkFlowHandle(key, value)
 	if flow.originalKey.InterfaceIndex != 42 ||
 		flow.originalKey.OriginalPort != original.Port() ||
-		flow.replyKey.InterfaceIndex != 42 ||
-		flow.replyKey.ListenerPort != tokenDestination.Port() ||
-		flow.listenerKey != key {
+		flow.listenerKey != key ||
+		flow.generation != 99 {
 		t.Fatalf("unexpected shared-network flow: %+v", flow)
 	}
 	if actual := sharedNetworkOriginalMAC(value); actual.String() != "02:00:00:00:00:01" {
 		t.Fatalf("unexpected source MAC: %s", actual)
+	}
+	fromOriginal := makeSharedNetworkFlowHandleFromOriginal(
+		flow.originalKey,
+		flow.listenerKey.TokenAddr,
+		tokenDestination.Port(),
+		flow.generation,
+	)
+	if fromOriginal != flow {
+		t.Fatalf("reconstructed shared-network flow differs: got=%+v want=%+v", fromOriginal, flow)
 	}
 }
 
@@ -152,7 +177,7 @@ func TestMakeSharedNetworkListenerKey(t *testing.T) {
 }
 
 func TestCompileSharedHostPrefixes(t *testing.T) {
-	ipv4, ipv6 := compileSharedHostPrefixes([]netip.Addr{
+	ipv4, ipv6 := compileHostPrefixes([]netip.Addr{
 		netip.MustParseAddr("192.0.2.2"),
 		netip.MustParseAddr("192.0.2.1"),
 		netip.MustParseAddr("192.0.2.2"),
@@ -175,5 +200,42 @@ func TestCompileSharedHostPrefixes(t *testing.T) {
 	}
 	if len(ipv6) != 1 || ipv6[0] != wantIPv6[0] {
 		t.Fatalf("unexpected IPv6 host prefixes: %v", ipv6)
+	}
+}
+
+// TestSharedNetworkBackendRequiresRebuild covers the state a caller cannot
+// distinguish from the outside: the backend is still open, so IsClosed reports
+// false, but a failed policy rollback left it unusable and every later operation
+// will fail the same way.
+func TestSharedNetworkBackendRequiresRebuild(t *testing.T) {
+	var backend SharedNetworkBackend
+	if backend.RequiresRebuild() {
+		t.Fatal("a fresh backend reports that it requires a rebuild")
+	}
+
+	// A runtime makes it report itself open, which is the case that matters:
+	// "closed" would already stop a caller on its own.
+	backend.runtime = &sharedNetworkRuntime{}
+	if backend.IsClosed() {
+		t.Fatal("a backend with a runtime reports itself closed")
+	}
+	if backend.RequiresRebuild() {
+		t.Fatal("an open backend reports that it requires a rebuild")
+	}
+
+	backend.health.invalidate("shared-network", "test policy")
+	if backend.IsClosed() {
+		t.Fatal("invalidation must not make the backend look closed")
+	}
+	if !backend.RequiresRebuild() {
+		t.Fatal("an invalidated backend does not report that it requires a rebuild")
+	}
+	if backend.requireUsableLocked() == nil {
+		t.Fatal("an invalidated backend still reports itself usable")
+	}
+
+	var absent *SharedNetworkBackend
+	if absent.RequiresRebuild() {
+		t.Fatal("a nil backend reports that it requires a rebuild")
 	}
 }

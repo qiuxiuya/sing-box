@@ -7,6 +7,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	U "github.com/sagernet/sing-box/common/urltest"
 	N "github.com/sagernet/sing/common/network"
+
 	"github.com/stretchr/testify/require"
 )
 

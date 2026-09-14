@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -61,6 +62,7 @@ type ProviderRemote struct {
 	httpClientOptions *option.HTTPClientOptions
 	downloadDetour    string
 	url               string
+	urlHash           [32]byte
 	path              string
 	initialPath       string
 	userAgent         string
@@ -130,6 +132,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	outbound := service.FromContext[adapter.OutboundManager](ctx)
 	endpointMgr := service.FromContext[adapter.EndpointManager](ctx)
 	logger := logFactory.NewLogger(F.ToString("provider/remote", "[", tag, "]"))
+	url := options.URL
 	return &ProviderRemote{
 		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
 		ctx:      ctx,
@@ -139,7 +142,8 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		provider: service.FromContext[adapter.ProviderManager](ctx),
 
 		httpClientOptions: options.HTTPClient,
-		url:               options.URL,
+		url:               url,
+		urlHash:           sha256.Sum256([]byte(url)),
 		path:              path,
 		initialPath:       initialPath,
 		userAgent:         userAgent,
@@ -181,7 +185,6 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
 	if !loadedFromCache && !loadedFromInitialPath {
-		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
 			return E.Cause(err, "initial outbound provider: ", s.Tag())
@@ -196,8 +199,7 @@ func (s *ProviderRemote) Update() error {
 	if s.ticker != nil {
 		s.ticker.Reset(s.updateInterval)
 	}
-	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	return s.fetch(ctx, false)
+	return s.fetch(s.ctx, false)
 }
 
 func (s *ProviderRemote) UpdatedAt() time.Time {
@@ -245,13 +247,13 @@ func (s *ProviderRemote) resolveTransport() (adapter.HTTPTransport, error) {
 }
 
 func (s *ProviderRemote) updateOnce() {
-	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	if err := s.fetch(ctx, false); err != nil {
+	if err := s.fetch(s.ctx, false); err != nil {
 		s.logger.Error("update outbound provider: ", err)
 	}
 }
 
 func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
+	ctx = interrupt.ContextWithIsResourceDownload(ctx)
 	if s.updating.Swap(true) {
 		return E.New("provider is updating")
 	}
@@ -293,6 +295,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 					}
 				}
 				saveSub.LastUpdated = s.lastUpdated
+				saveSub.URLHash = s.urlHash[:]
 				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
 					s.logger.Error("save outbound provider cache file: ", err)
 				}
@@ -355,6 +358,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 			saveSub := &adapter.SavedBinary{
 				LastUpdated: s.lastUpdated,
 				LastEtag:    s.lastEtag,
+				URLHash:     s.urlHash[:],
 			}
 			if s.path != "" {
 				saveSub.Hash = s.hash
@@ -377,6 +381,10 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	var saveSub *adapter.SavedBinary
 	if s.cacheFile != nil {
 		if saveSub = s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
+			if len(saveSub.URLHash) > 0 && !bytes.Equal(saveSub.URLHash, s.urlHash[:]) {
+				s.logger.Info("cached outbound provider was downloaded from another URL, will refetch")
+				return false, nil
+			}
 			s.hash = saveSub.Hash
 		}
 	}

@@ -20,11 +20,10 @@ import (
 	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing-box/service/oomkiller"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/batch"
 	"github.com/sagernet/sing/common/memory"
 	"github.com/sagernet/sing/common/observable"
-	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 
 	"github.com/gofrs/uuid/v5"
@@ -34,7 +33,12 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-const APIVersion = 3
+const APIVersion = 4
+
+const (
+	urlTestPushMinInterval = 250 * time.Millisecond
+	notificationQueueSize  = 16
+)
 
 var _ StartedServiceServer = (*StartedService)(nil)
 
@@ -43,7 +47,6 @@ type StartedService struct {
 	// platform adapter.PlatformInterface
 	handler           PlatformHandler
 	debug             bool
-	logMaxLines       int
 	oomKillerEnabled  bool
 	oomKillerDisabled bool
 	oomMemoryLimit    uint64
@@ -52,12 +55,15 @@ type StartedService struct {
 	// userID           int
 	// groupID          int
 	// systemProxyEnabled      bool
+	lifecycleAccess         sync.Mutex
 	serviceAccess           sync.RWMutex
+	closed                  bool
+	startInterrupted        bool
 	serviceStatus           *ServiceStatus
 	serviceStatusSubscriber *observable.Subscriber[*ServiceStatus]
 	serviceStatusObserver   *observable.Observer[*ServiceStatus]
 	logAccess               sync.RWMutex
-	logLines                list.List[*log.Entry]
+	logLines                logRing
 	logSubscriber           *observable.Subscriber[*log.Entry]
 	logObserver             *observable.Observer[*log.Entry]
 	instance                *Instance
@@ -66,6 +72,8 @@ type StartedService struct {
 	urlTestObserver         *observable.Observer[struct{}]
 	clashModeSubscriber     *observable.Subscriber[struct{}]
 	clashModeObserver       *observable.Observer[struct{}]
+	notificationSubscriber  *observable.Subscriber[*NotificationEvent]
+	notificationObserver    *observable.Observer[*NotificationEvent]
 }
 
 type ServiceOptions struct {
@@ -90,7 +98,7 @@ func NewStartedService(options ServiceOptions) *StartedService {
 		// platform:                options.Platform,
 		handler:           options.Handler,
 		debug:             options.Debug,
-		logMaxLines:       options.LogMaxLines,
+		logLines:          logRing{maxLines: options.LogMaxLines},
 		oomKillerEnabled:  options.OOMKillerEnabled,
 		oomKillerDisabled: options.OOMKillerDisabled,
 		oomMemoryLimit:    options.OOMMemoryLimit,
@@ -104,11 +112,13 @@ func NewStartedService(options ServiceOptions) *StartedService {
 		logSubscriber:           observable.NewSubscriber[*log.Entry](128),
 		urlTestSubscriber:       observable.NewSubscriber[struct{}](1),
 		clashModeSubscriber:     observable.NewSubscriber[struct{}](1),
+		notificationSubscriber:  observable.NewSubscriber[*NotificationEvent](notificationQueueSize),
 	}
 	s.serviceStatusObserver = observable.NewObserver(s.serviceStatusSubscriber, 2)
 	s.logObserver = observable.NewObserver(s.logSubscriber, 64)
 	s.urlTestObserver = observable.NewObserver(s.urlTestSubscriber, 1)
 	s.clashModeObserver = observable.NewObserver(s.clashModeSubscriber, 1)
+	s.notificationObserver = observable.NewObserver(s.notificationSubscriber, notificationQueueSize)
 	return s
 }
 
@@ -129,7 +139,7 @@ func (s *StartedService) GetVersion(ctx context.Context, empty *emptypb.Empty) (
 
 func (s *StartedService) resetLogs() {
 	s.logAccess.Lock()
-	s.logLines = list.List[*log.Entry]{}
+	s.logLines.reset()
 	s.logAccess.Unlock()
 	s.logSubscriber.Emit(nil)
 }
@@ -140,12 +150,19 @@ func (s *StartedService) updateStatus(newStatus ServiceStatus_Type) {
 	s.serviceStatus = statusObject
 }
 
-func (s *StartedService) updateStatusError(err error) error {
+func (s *StartedService) updateStatusError(err error) {
 	statusObject := &ServiceStatus{Status: ServiceStatus_FATAL, ErrorMessage: err.Error()}
 	s.serviceStatusSubscriber.Emit(statusObject)
 	s.serviceStatus = statusObject
+}
+
+func (s *StartedService) interruptStart() {
+	s.serviceAccess.Lock()
+	if s.serviceStatus.Status == ServiceStatus_STARTING && s.instance != nil {
+		s.startInterrupted = true
+		s.instance.cancel()
+	}
 	s.serviceAccess.Unlock()
-	return err
 }
 
 func (s *StartedService) waitForStarted(ctx context.Context) error {
@@ -230,44 +247,65 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
 }
 
 func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
+	s.interruptStart()
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
 	s.serviceAccess.Lock()
-	switch s.serviceStatus.Status {
-	case ServiceStatus_IDLE, ServiceStatus_STARTED, ServiceStatus_STARTING, ServiceStatus_FATAL:
-	default:
+	if s.closed {
 		s.serviceAccess.Unlock()
-		return os.ErrInvalid
+		return os.ErrClosed
 	}
 	oldInstance := s.instance
 	if oldInstance != nil {
 		s.instance = nil
 		s.updateStatus(ServiceStatus_STOPPING)
 		s.serviceAccess.Unlock()
+		oomRecorder := service.FromContext[*oomkiller.Recorder](s.ctx)
+		if oomRecorder != nil {
+			oomRecorder.BeginReload()
+			defer oomRecorder.EndReload()
+		}
 		_ = oldInstance.Close()
 		runtimeDebug.FreeOSMemory()
 		s.serviceAccess.Lock()
 	}
+	s.startInterrupted = false
 	s.updateStatus(ServiceStatus_STARTING)
-	s.resetLogs()
-	instance, err := s.newInstance(ctx, profileContent, options)
+	if oldInstance == nil {
+		s.resetLogs()
+	}
+	s.serviceAccess.Unlock()
+	instance, err := s.newInstance(ctx, profileContent, options, oldInstance != nil)
 	if err != nil {
-		return s.updateStatusError(err)
+		s.serviceAccess.Lock()
+		s.updateStatusError(err)
+		s.serviceAccess.Unlock()
+		return err
 	}
-	s.instance = instance
 	instance.urlTestHistoryStorage.AddUpdateHook(s.urlTestSubscriber)
-	if instance.clashServer != nil {
-		instance.clashServer.AddModeUpdateHook(s.clashModeSubscriber)
+	if instance.clashMode != nil {
+		instance.clashMode.AddUpdateHook(s.clashModeSubscriber)
 	}
+	s.serviceAccess.Lock()
+	s.instance = instance
 	s.serviceAccess.Unlock()
 	err = instance.Start()
 	s.serviceAccess.Lock()
-	if s.serviceStatus.Status != ServiceStatus_STARTING {
+	if s.startInterrupted {
+		s.startInterrupted = false
+		s.instance = nil
 		s.serviceAccess.Unlock()
+		_ = instance.Close()
+		runtimeDebug.FreeOSMemory()
 		return nil
 	}
 	if err != nil {
 		s.instance = nil
+		s.updateStatusError(err)
+		s.serviceAccess.Unlock()
 		_ = instance.Close()
-		return s.updateStatusError(err)
+		runtimeDebug.FreeOSMemory()
+		return err
 	}
 	s.startedAt = time.Now()
 	s.updateStatus(ServiceStatus_STARTED)
@@ -277,26 +315,33 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 }
 
 func (s *StartedService) Close() {
+	s.serviceAccess.Lock()
+	s.closed = true
+	s.serviceAccess.Unlock()
 	s.serviceStatusSubscriber.Close()
 	s.logSubscriber.Close()
 	s.urlTestSubscriber.Close()
 	s.clashModeSubscriber.Close()
+	s.notificationSubscriber.Close()
 }
 
 func (s *StartedService) CloseService() error {
+	s.interruptStart()
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
 	s.serviceAccess.Lock()
-	switch s.serviceStatus.Status {
-	case ServiceStatus_STARTING, ServiceStatus_STARTED:
-	default:
+	instance := s.instance
+	if instance == nil && s.serviceStatus.Status != ServiceStatus_STARTING && s.serviceStatus.Status != ServiceStatus_STARTED {
 		s.serviceAccess.Unlock()
 		return nil
 	}
-	s.updateStatus(ServiceStatus_STOPPING)
-	instance := s.instance
 	s.instance = nil
+	s.updateStatus(ServiceStatus_STOPPING)
+	s.serviceAccess.Unlock()
 	if instance != nil {
 		_ = instance.Close()
 	}
+	s.serviceAccess.Lock()
 	s.startedAt = time.Time{}
 	s.updateStatus(ServiceStatus_IDLE)
 	s.serviceAccess.Unlock()
@@ -307,6 +352,7 @@ func (s *StartedService) CloseService() error {
 func (s *StartedService) SetError(err error) {
 	s.serviceAccess.Lock()
 	s.updateStatusError(err)
+	s.serviceAccess.Unlock()
 	s.WriteMessage(log.LevelError, err.Error())
 }
 
@@ -338,12 +384,8 @@ func (s *StartedService) SubscribeServiceStatus(empty *emptypb.Empty, server grp
 }
 
 func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerStreamingServer[Log]) error {
-	var savedLines []*log.Entry
 	s.logAccess.Lock()
-	savedLines = make([]*log.Entry, 0, s.logLines.Len())
-	for element := s.logLines.Front(); element != nil; element = element.Next() {
-		savedLines = append(savedLines, element.Value)
-	}
+	savedLines := s.logLines.array()
 	subscription, done, err := s.logObserver.Subscribe()
 	s.logAccess.Unlock()
 	if err != nil {
@@ -407,15 +449,12 @@ func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerSt
 
 func (s *StartedService) GetDefaultLogLevel(ctx context.Context, empty *emptypb.Empty) (*DefaultLogLevel, error) {
 	s.serviceAccess.RLock()
-	switch s.serviceStatus.Status {
-	case ServiceStatus_STARTING, ServiceStatus_STARTED:
-	default:
-		s.serviceAccess.RUnlock()
+	boxService := s.instance
+	s.serviceAccess.RUnlock()
+	if boxService == nil {
 		return nil, os.ErrInvalid
 	}
-	logLevel := s.instance.logFactory.Level()
-	s.serviceAccess.RUnlock()
-	return &DefaultLogLevel{Level: LogLevel(logLevel)}, nil
+	return &DefaultLogLevel{Level: LogLevel(boxService.logFactory.Level())}, nil
 }
 
 func (s *StartedService) ClearLogs(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
@@ -488,6 +527,7 @@ func (s *StartedService) SubscribeGroups(empty *emptypb.Empty, server grpc.Serve
 		return err
 	}
 	defer s.serviceStatusObserver.UnSubscribe(statusSubscription)
+	var lastSendTime time.Time
 	for {
 		s.serviceAccess.RLock()
 		var groups *Groups
@@ -501,6 +541,7 @@ func (s *StartedService) SubscribeGroups(empty *emptypb.Empty, server grpc.Serve
 		if err != nil {
 			return err
 		}
+		lastSendTime = time.Now()
 		select {
 		case <-subscription:
 		case <-statusSubscription:
@@ -512,6 +553,34 @@ func (s *StartedService) SubscribeGroups(empty *emptypb.Empty, server grpc.Serve
 			return nil
 		case <-statusDone:
 			return nil
+		}
+		throttleDelay := urlTestPushMinInterval - time.Since(lastSendTime)
+		if throttleDelay <= 0 {
+			continue
+		}
+		throttleTimer := time.NewTimer(throttleDelay)
+		select {
+		case <-throttleTimer.C:
+		case <-s.ctx.Done():
+			throttleTimer.Stop()
+			return s.ctx.Err()
+		case <-server.Context().Done():
+			throttleTimer.Stop()
+			return server.Context().Err()
+		case <-done:
+			throttleTimer.Stop()
+			return nil
+		case <-statusDone:
+			throttleTimer.Stop()
+			return nil
+		}
+		select {
+		case <-subscription:
+		default:
+		}
+		select {
+		case <-statusSubscription:
+		default:
 		}
 	}
 }
@@ -548,13 +617,13 @@ func (s *StartedService) readGroups() *Groups {
 			var item GroupItem
 			item.Tag = itemTag
 			item.Type = itemOutbound.Type()
-			if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(itemOutbound)); history != nil {
+			if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, itemOutbound)); history != nil {
 				item.UrlTestTime = history.Time.Unix()
 				item.UrlTestDelay = int32(history.Delay)
 			}
 			g.Items = append(g.Items, &item)
 		}
-		if len(g.Items) < 2 {
+		if len(g.Items) == 0 {
 			continue
 		}
 		gs.Group = append(gs.Group, &g)
@@ -568,14 +637,14 @@ func (s *StartedService) GetClashModeStatus(ctx context.Context, empty *emptypb.
 		s.serviceAccess.RUnlock()
 		return nil, os.ErrInvalid
 	}
-	clashServer := s.instance.clashServer
+	clashMode := s.instance.clashMode
 	s.serviceAccess.RUnlock()
-	if clashServer == nil {
+	if clashMode == nil {
 		return nil, status.Error(codes.NotFound, "clash mode not available")
 	}
 	return &ClashModeStatus{
-		ModeList:    clashServer.ModeList(),
-		CurrentMode: clashServer.Mode(),
+		ModeList:    clashMode.ModeList(),
+		CurrentMode: clashMode.Mode(),
 	}, nil
 }
 
@@ -598,12 +667,12 @@ func (s *StartedService) SubscribeClashMode(empty *emptypb.Empty, server grpc.Se
 		s.serviceAccess.RLock()
 		var message *ClashMode
 		if s.serviceStatus.Status == ServiceStatus_STARTED {
-			clashServer := s.instance.clashServer
-			if clashServer == nil {
+			clashMode := s.instance.clashMode
+			if clashMode == nil {
 				s.serviceAccess.RUnlock()
 				return status.Error(codes.NotFound, "clash mode not available")
 			}
-			message = &ClashMode{Mode: clashServer.Mode()}
+			message = &ClashMode{Mode: clashMode.Mode()}
 		} else {
 			message = &ClashMode{}
 		}
@@ -633,12 +702,12 @@ func (s *StartedService) SetClashMode(ctx context.Context, request *ClashMode) (
 		s.serviceAccess.RUnlock()
 		return nil, os.ErrInvalid
 	}
-	clashServer := s.instance.clashServer
+	clashMode := s.instance.clashMode
 	s.serviceAccess.RUnlock()
-	if clashServer == nil {
+	if clashMode == nil {
 		return nil, status.Error(codes.NotFound, "clash mode not available")
 	}
-	clashServer.SetMode(request.Mode)
+	clashMode.SetMode(request.Mode)
 	return &emptypb.Empty{}, nil
 }
 
@@ -657,37 +726,18 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	}
 	historyStorage := boxService.urlTestHistoryStorage
 	urlTest, isURLTest := outbound.(*group.URLTest)
+	loadBalance, isLoadBalance := outbound.(adapter.LoadBalanceGroup)
 	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
 	if isURLTest {
 		go urlTest.CheckOutbounds()
+	} else if isLoadBalance {
+		go loadBalance.URLTest(boxService.ctx)
 	} else if isOutboundGroup {
-		outbounds := common.Filter(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
+		outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
 			itOutbound, _ := boxService.outboundManager.Outbound(it)
 			return itOutbound
-		}), func(it adapter.Outbound) bool {
-			if it == nil {
-				return false
-			}
-			_, isGroup := it.(adapter.OutboundGroup)
-			return !isGroup
-		})
-		b, _ := batch.New(boxService.ctx, batch.WithConcurrencyNum[any](10))
-		for _, detour := range outbounds {
-			outboundToTest := detour
-			itemTag := outboundToTest.Tag()
-			b.Go(itemTag, func() (any, error) {
-				t, err := urltest.URLTest(boxService.ctx, "", outboundToTest)
-				if err != nil {
-					historyStorage.DeleteURLTestHistory(itemTag)
-				} else {
-					historyStorage.StoreURLTestHistory(itemTag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: t,
-					})
-				}
-				return nil, nil
-			})
-		}
+		}))
+		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
 	} else {
 		go func() {
 			t, err := urltest.URLTest(boxService.ctx, "", outbound)
@@ -706,14 +756,11 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 
 func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutboundRequest) (*emptypb.Empty, error) {
 	s.serviceAccess.RLock()
-	switch s.serviceStatus.Status {
-	case ServiceStatus_STARTING, ServiceStatus_STARTED:
-	default:
-		s.serviceAccess.RUnlock()
-		return nil, os.ErrInvalid
-	}
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
+	if boxService == nil {
+		return nil, os.ErrInvalid
+	}
 	outboundGroup, isLoaded := boxService.outboundManager.Outbound(request.GroupTag)
 	if !isLoaded {
 		return nil, status.Error(codes.NotFound, "selector not found: "+request.GroupTag)
@@ -1011,8 +1058,10 @@ func buildConnectionProto(metadata *trafficcontrol.TrackerMetadata) *Connection 
 			ProcessId:    metadata.Metadata.ProcessInfo.ProcessID,
 			UserId:       metadata.Metadata.ProcessInfo.UserId,
 			UserName:     metadata.Metadata.ProcessInfo.UserName,
-			ProcessPath:  metadata.Metadata.ProcessInfo.ProcessPath,
-			PackageNames: metadata.Metadata.ProcessInfo.AndroidPackageNames,
+			PackageNames: metadata.Metadata.ProcessInfo.PackageNames,
+		}
+		if len(metadata.Metadata.ProcessInfo.ProcessPaths) > 0 {
+			processInfo.ProcessPath = metadata.Metadata.ProcessInfo.ProcessPaths[0]
 		}
 	}
 	return &Connection{
@@ -1040,14 +1089,11 @@ func buildConnectionProto(metadata *trafficcontrol.TrackerMetadata) *Connection 
 
 func (s *StartedService) CloseConnection(ctx context.Context, request *CloseConnectionRequest) (*emptypb.Empty, error) {
 	s.serviceAccess.RLock()
-	switch s.serviceStatus.Status {
-	case ServiceStatus_STARTING, ServiceStatus_STARTED:
-	default:
-		s.serviceAccess.RUnlock()
-		return nil, os.ErrInvalid
-	}
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
+	if boxService == nil {
+		return nil, os.ErrInvalid
+	}
 	if boxService.trafficManager == nil {
 		return nil, status.Error(codes.Unimplemented, "connection tracking not available")
 	}
@@ -1122,6 +1168,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 		return err
 	}
 	defer s.serviceStatusObserver.UnSubscribe(statusSubscription)
+	var lastSendTime time.Time
 	for {
 		s.serviceAccess.RLock()
 		boxService := s.instance
@@ -1135,7 +1182,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 					Tag:  ob.Tag(),
 					Type: ob.Type(),
 				}
-				if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(ob)); history != nil {
+				if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, ob)); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}
@@ -1146,7 +1193,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 					Tag:  ep.Tag(),
 					Type: ep.Type(),
 				}
-				if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(ep)); history != nil {
+				if history := historyStorage.LoadURLTestHistory(group.RealTag(boxService.outboundManager, ep)); history != nil {
 					item.UrlTestTime = history.Time.Unix()
 					item.UrlTestDelay = int32(history.Delay)
 				}
@@ -1157,6 +1204,7 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 		if err != nil {
 			return err
 		}
+		lastSendTime = time.Now()
 		select {
 		case <-subscription:
 		case <-statusSubscription:
@@ -1168,6 +1216,34 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 			return nil
 		case <-statusDone:
 			return nil
+		}
+		throttleDelay := urlTestPushMinInterval - time.Since(lastSendTime)
+		if throttleDelay <= 0 {
+			continue
+		}
+		throttleTimer := time.NewTimer(throttleDelay)
+		select {
+		case <-throttleTimer.C:
+		case <-s.ctx.Done():
+			throttleTimer.Stop()
+			return s.ctx.Err()
+		case <-server.Context().Done():
+			throttleTimer.Stop()
+			return server.Context().Err()
+		case <-done:
+			throttleTimer.Stop()
+			return nil
+		case <-statusDone:
+			throttleTimer.Stop()
+			return nil
+		}
+		select {
+		case <-subscription:
+		default:
+		}
+		select {
+		case <-statusSubscription:
+		default:
 		}
 	}
 }
@@ -1310,6 +1386,107 @@ func subscribeEndpointStatus[T endpointStatusProvider](ctx context.Context, star
 	})
 }
 
+type taggedStatusSource[T any] struct {
+	tag       string
+	subscribe func(ctx context.Context, listener func(T))
+}
+
+func streamTaggedStatus[T any](ctx context.Context, sources []taggedStatusSource[T], send func(statuses map[string]T) error) error {
+	type subscription struct {
+		tag      string
+		latest   chan T
+		finished chan struct{}
+	}
+	var waitGroup sync.WaitGroup
+	subscriptions := make([]subscription, 0, len(sources))
+	for _, source := range sources {
+		current := subscription{
+			tag:      source.tag,
+			latest:   make(chan T, 1),
+			finished: make(chan struct{}),
+		}
+		subscriptions = append(subscriptions, current)
+		waitGroup.Go(func() {
+			defer close(current.finished)
+			source.subscribe(ctx, func(status T) {
+				storeLatestStatus(current.latest, status)
+			})
+		})
+	}
+
+	statuses := make(map[string]T, len(sources))
+	for _, current := range subscriptions {
+		select {
+		case status := <-current.latest:
+			statuses[current.tag] = status
+		case <-current.finished:
+			select {
+			case status := <-current.latest:
+				statuses[current.tag] = status
+			default:
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	err := send(statuses)
+	if err != nil {
+		return err
+	}
+
+	type taggedStatus struct {
+		tag    string
+		status T
+	}
+	updates := make(chan taggedStatus, len(sources))
+	for _, current := range subscriptions {
+		waitGroup.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case status := <-current.latest:
+					select {
+					case updates <- taggedStatus{tag: current.tag, status: status}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		})
+	}
+	go func() {
+		waitGroup.Wait()
+		close(updates)
+	}()
+
+	for update := range updates {
+		statuses[update.tag] = update.status
+		err = send(statuses)
+		if err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return nil
+}
+
+func storeLatestStatus[T any](slot chan T, status T) {
+	select {
+	case slot <- status:
+		return
+	default:
+	}
+	select {
+	case <-slot:
+	default:
+	}
+	select {
+	case slot <- status:
+	default:
+	}
+}
+
 func (s *StartedService) StartNetworkQualityTest(
 	request *NetworkQualityTestRequest,
 	server grpc.ServerStreamingServer[NetworkQualityTestProgress],
@@ -1422,60 +1599,27 @@ func (s *StartedService) SubscribeTailscaleStatus(
 				})
 			}
 		}
-		if len(endpoints) == 0 {
-			sendErr := server.Send(&TailscaleStatusUpdate{})
-			if sendErr != nil {
-				return sendErr
+		sources := common.Map(endpoints, func(endpoint tailscaleEndpoint) taggedStatusSource[*adapter.TailscaleEndpointStatus] {
+			return taggedStatusSource[*adapter.TailscaleEndpointStatus]{
+				tag: endpoint.tag,
+				subscribe: func(subscribeCtx context.Context, listener func(*adapter.TailscaleEndpointStatus)) {
+					_ = endpoint.provider.SubscribeTailscaleStatus(subscribeCtx, listener)
+				},
 			}
-			<-ctx.Done()
-			return nil
-		}
-
-		type taggedStatus struct {
-			tag    string
-			status *adapter.TailscaleEndpointStatus
-		}
-		updates := make(chan taggedStatus, len(endpoints))
-
-		var waitGroup sync.WaitGroup
-		for _, endpoint := range endpoints {
-			waitGroup.Add(1)
-			go func(tag string, provider adapter.TailscaleEndpoint) {
-				defer waitGroup.Done()
-				_ = provider.SubscribeTailscaleStatus(ctx, func(endpointStatus *adapter.TailscaleEndpointStatus) {
-					select {
-					case updates <- taggedStatus{tag: tag, status: endpointStatus}:
-					case <-ctx.Done():
-					}
-				})
-			}(endpoint.tag, endpoint.provider)
-		}
-
-		go func() {
-			waitGroup.Wait()
-			close(updates)
-		}()
-
-		var tags []string
-		statuses := make(map[string]*adapter.TailscaleEndpointStatus, len(endpoints))
-		for update := range updates {
-			if _, exists := statuses[update.tag]; !exists {
-				tags = append(tags, update.tag)
+		})
+		return streamTaggedStatus(ctx, sources, func(statuses map[string]*adapter.TailscaleEndpointStatus) error {
+			protoEndpoints := make([]*TailscaleEndpointStatus, 0, len(endpoints))
+			for _, endpoint := range endpoints {
+				endpointStatus, found := statuses[endpoint.tag]
+				if !found {
+					continue
+				}
+				protoEndpoints = append(protoEndpoints, tailscaleEndpointStatusToProto(endpoint.tag, endpointStatus, selectedLocale))
 			}
-			statuses[update.tag] = update.status
-			protoEndpoints := make([]*TailscaleEndpointStatus, 0, len(statuses))
-			for _, tag := range tags {
-				protoEndpoints = append(protoEndpoints, tailscaleEndpointStatusToProto(tag, statuses[tag], selectedLocale))
-			}
-			sendErr := server.Send(&TailscaleStatusUpdate{
+			return server.Send(&TailscaleStatusUpdate{
 				Endpoints: protoEndpoints,
 			})
-			if sendErr != nil {
-				return sendErr
-			}
-		}
-		<-ctx.Done()
-		return nil
+		})
 	})
 }
 
@@ -1495,14 +1639,19 @@ func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStat
 		}
 	}
 	result := &TailscaleEndpointStatus{
-		EndpointTag:    tag,
-		BackendState:   s.BackendState,
-		StateText:      selectedLocale.TailscaleStateText(s.BackendState),
-		AuthURL:        s.AuthURL,
-		NetworkName:    s.NetworkName,
-		MagicDNSSuffix: s.MagicDNSSuffix,
-		UserGroups:     userGroups,
-		KeyAuth:        s.KeyAuth,
+		EndpointTag:        tag,
+		BackendState:       s.BackendState,
+		StateText:          selectedLocale.TailscaleStateText(s.BackendState),
+		AuthURL:            s.AuthURL,
+		NetworkName:        s.NetworkName,
+		MagicDNSSuffix:     s.MagicDNSSuffix,
+		UserGroups:         userGroups,
+		KeyAuth:            s.KeyAuth,
+		CanShareFiles:      s.CanShareFiles,
+		WaitingFileCount:   s.WaitingFileCount,
+		ReceivingFileCount: s.ReceivingFileCount,
+		UnreadFileCount:    s.UnreadFileCount,
+		CertDomains:        s.CertDomains,
 	}
 	if s.Self != nil {
 		result.Self = tailscalePeerToProto(s.Self)
@@ -1515,22 +1664,23 @@ func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStat
 
 func tailscalePeerToProto(peer *adapter.TailscalePeer) *TailscalePeer {
 	return &TailscalePeer{
-		StableID:       peer.StableID,
-		HostName:       peer.HostName,
-		DnsName:        peer.DNSName,
-		Os:             peer.OS,
-		TailscaleIPs:   peer.TailscaleIPs,
-		SshHostKeys:    peer.SSHHostKeys,
-		Online:         peer.Online,
-		ExitNode:       peer.ExitNode,
-		ExitNodeOption: peer.ExitNodeOption,
-		ShareeNode:     peer.ShareeNode,
-		Expired:        peer.Expired,
-		Active:         peer.Active,
-		RxBytes:        peer.RxBytes,
-		TxBytes:        peer.TxBytes,
-		KeyExpiry:      peer.KeyExpiry,
-		LastSeen:       peer.LastSeen,
+		StableID:        peer.StableID,
+		HostName:        peer.HostName,
+		DnsName:         peer.DNSName,
+		Os:              peer.OS,
+		TailscaleIPs:    peer.TailscaleIPs,
+		SshHostKeys:     peer.SSHHostKeys,
+		Online:          peer.Online,
+		ExitNode:        peer.ExitNode,
+		ExitNodeOption:  peer.ExitNodeOption,
+		ShareeNode:      peer.ShareeNode,
+		Expired:         peer.Expired,
+		Active:          peer.Active,
+		CanReceiveFiles: peer.CanReceiveFiles,
+		RxBytes:         peer.RxBytes,
+		TxBytes:         peer.TxBytes,
+		KeyExpiry:       peer.KeyExpiry,
+		LastSeen:        peer.LastSeen,
 	}
 }
 
@@ -1546,35 +1696,9 @@ func (s *StartedService) StartTailscalePing(
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
 
-	var provider adapter.TailscaleEndpoint
-	if request.EndpointTag != "" {
-		endpoint, err := resolveTailscaleEndpoint(boxService, request.EndpointTag)
-		if err != nil {
-			return err
-		}
-		pingProvider, loaded := endpoint.(adapter.TailscaleEndpoint)
-		if !loaded {
-			return status.Error(codes.FailedPrecondition, "endpoint does not support ping")
-		}
-		provider = pingProvider
-	} else {
-		endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx)
-		if endpointManager == nil {
-			return status.Error(codes.FailedPrecondition, "endpoint manager not available")
-		}
-		for _, endpoint := range endpointManager.Endpoints() {
-			if endpoint.Type() != C.TypeTailscale {
-				continue
-			}
-			pingProvider, loaded := endpoint.(adapter.TailscaleEndpoint)
-			if loaded {
-				provider = pingProvider
-				break
-			}
-		}
-		if provider == nil {
-			return status.Error(codes.NotFound, "no Tailscale endpoint found")
-		}
+	provider, _, err := resolveTailscaleProvider(boxService, request.EndpointTag)
+	if err != nil {
+		return err
 	}
 
 	return provider.StartTailscalePing(server.Context(), request.PeerIP, func(result *adapter.TailscalePingResult) {
@@ -1582,6 +1706,7 @@ func (s *StartedService) StartTailscalePing(
 			LatencyMs:      result.LatencyMs,
 			IsDirect:       result.IsDirect,
 			Endpoint:       result.Endpoint,
+			PeerRelay:      result.PeerRelay,
 			DerpRegionID:   result.DERPRegionID,
 			DerpRegionCode: result.DERPRegionCode,
 			Error:          result.Error,
@@ -1635,6 +1760,33 @@ func (s *StartedService) TailscaleLogout(ctx context.Context, request *Tailscale
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
+}
+
+func (s *StartedService) GetTailscaleCertificate(ctx context.Context, request *TailscaleCertificateRequest) (*TailscaleCertificate, error) {
+	err := s.waitForStarted(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.serviceAccess.RLock()
+	boxService := s.instance
+	s.serviceAccess.RUnlock()
+
+	endpoint, err := resolveTailscaleEndpoint(boxService, request.EndpointTag)
+	if err != nil {
+		return nil, err
+	}
+	tsEndpoint, loaded := endpoint.(adapter.TailscaleEndpoint)
+	if !loaded {
+		return nil, status.Error(codes.FailedPrecondition, "endpoint does not support tailscale")
+	}
+	certificatePEM, privateKeyPEM, err := tsEndpoint.GetTailscaleCertificate(ctx, request.Domain, time.Duration(request.MinValiditySeconds)*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return &TailscaleCertificate{
+		CertificatePEM: certificatePEM,
+		PrivateKeyPEM:  privateKeyPEM,
+	}, nil
 }
 
 func (s *StartedService) SubscribeOpenConnectStatus(
@@ -1889,16 +2041,65 @@ func (s *StartedService) CancelOpenVPNChallenge(ctx context.Context, request *Op
 	return &emptypb.Empty{}, nil
 }
 
+func (s *StartedService) SendNotification(notification *adapter.Notification) error {
+	s.notificationSubscriber.Emit(&NotificationEvent{
+		Event: &NotificationEvent_Send{
+			Send: &Notification{
+				Identifier: notification.Identifier,
+				TypeName:   notification.TypeName,
+				TypeID:     notification.TypeID,
+				Title:      notification.Title,
+				Subtitle:   notification.Subtitle,
+				Body:       notification.Body,
+				OpenURL:    notification.OpenURL,
+			},
+		},
+	})
+	return nil
+}
+
+func (s *StartedService) CancelNotification(identifier string, typeID int32) error {
+	s.notificationSubscriber.Emit(&NotificationEvent{
+		Event: &NotificationEvent_Cancel{
+			Cancel: &NotificationCancel{
+				Identifier: identifier,
+				TypeID:     typeID,
+			},
+		},
+	})
+	return nil
+}
+
+func (s *StartedService) SubscribeNotifications(empty *emptypb.Empty, server grpc.ServerStreamingServer[NotificationEvent]) error {
+	subscription, done, err := s.notificationObserver.Subscribe()
+	if err != nil {
+		return err
+	}
+	defer s.notificationObserver.UnSubscribe(subscription)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-server.Context().Done():
+			return server.Context().Err()
+		case <-done:
+			return nil
+		case event := <-subscription:
+			err = server.Send(event)
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (s *StartedService) mustEmbedUnimplementedStartedServiceServer() {
 }
 
 func (s *StartedService) WriteMessage(level log.Level, message string) {
 	item := &log.Entry{Level: level, Message: message}
 	s.logAccess.Lock()
-	s.logLines.PushBack(item)
-	if s.logLines.Len() > s.logMaxLines {
-		s.logLines.Remove(s.logLines.Front())
-	}
+	s.logLines.push(item)
 	s.logAccess.Unlock()
 	s.logSubscriber.Emit(item)
 	if s.debug {
@@ -1909,7 +2110,7 @@ func (s *StartedService) WriteMessage(level log.Level, message string) {
 func (s *StartedService) SavedLog() []*log.Entry {
 	s.logAccess.RLock()
 	defer s.logAccess.RUnlock()
-	return s.logLines.Array()
+	return s.logLines.array()
 }
 
 func (s *StartedService) Instance() *Instance {

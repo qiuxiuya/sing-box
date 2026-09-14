@@ -4,14 +4,15 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
 	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
-	"github.com/sagernet/sing-box/log"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -21,79 +22,99 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (i *Inbound) startListeners() error {
-	err := i.listeners.start(
-		i.enableTCP,
-		i.enableUDP,
-		i.redirectIPv4Prefix.IsValid(),
-		i.cgroupIPv6Enabled(),
-		i.newListener,
-	)
-	if err == nil {
-		i.logger.Debug("eBPF local cgroup redirect listeners ready: [", i.listeners.String(), "]")
-	}
-	return err
-}
-
 func (i *Inbound) closeListeners() error {
 	return i.listeners.close()
 }
 
-func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	backend := i.cgroupBackendInstance()
+func (i *Inbound) NewConnection(
+	ctx context.Context,
+	conn net.Conn,
+	metadata adapter.InboundContext,
+	onClose N.CloseHandlerFunc,
+) {
+	if i.localCgroupEnabled() && i.isCgroupRedirectAddress(M.SocksaddrFromNet(conn.LocalAddr()).AddrPort().Addr()) {
+		backend := i.cgroupBackendInstance()
+		if backend == nil {
+			_ = conn.Close()
+			return
+		}
+		listenerDestination := M.SocksaddrFromNet(conn.LocalAddr()).AddrPort()
+		original, err := backend.TakeOriginal(commonEBPF.ProtocolTCP, listenerDestination)
+		if err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				i.tcpWarnings.errorContext(i.logger, ctx, "lookup cgroup eBPF TCP original destination: ", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		metadata.Inbound = i.Tag()
+		metadata.InboundType = i.Type()
+		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr())
+		metadata.Destination = M.SocksaddrFromNetIP(original.Destination)
+		metadata.ProcessInfo = i.lookupProcessInfo(original.SocketCookie)
+		i.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+		return
+	}
+	backend := i.tcBackend()
 	if backend == nil {
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
-	original, err := backend.TakeOriginal(
-		ECommon.ProtocolTCP,
-		M.SocksaddrFromNet(conn.LocalAddr()).AddrPort(),
-	)
-	if err != nil {
-		i.logger.ErrorContext(ctx, "lookup TCP original destination: ", err)
-		conn.Close()
-		return
-	}
-	metadata.Inbound = i.Tag()
-	metadata.InboundType = i.Type()
-	metadata.Destination = M.SocksaddrFromNetIP(original.Destination)
-	i.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+	i.newTCConnection(ctx, backend, conn, metadata, onClose)
 }
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
-	backend := i.cgroupBackendInstance()
+	if i.localCgroupEnabled() {
+		if redirectAddress, err := redirectAddressFromOOB(oob); err == nil && i.isCgroupRedirectAddress(redirectAddress) {
+			i.newCgroupPacket(buffer, oob, source)
+			return
+		}
+	}
+	backend := i.tcBackend()
 	if backend == nil {
 		return
 	}
-	redirectAddress, err := redirectAddressFromOOB(oob)
+	i.newTCPacket(backend, buffer, oob, source)
+}
+
+func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+	redirectAddress, _, _, err := packetDestinationsFromOOB(oob)
 	if err != nil {
-		i.udpWarnings.packetInfo.warn(i.logger, "read UDP redirect address: ", err)
+		i.udpWarnings.packetInfo.warn(i.logger, "read cgroup eBPF UDP redirect address: ", err)
+		return
+	}
+	backend := i.cgroupBackendInstance()
+	if backend == nil || !i.isCgroupRedirectAddress(redirectAddress) {
+		i.udpWarnings.originalDestination.warn(i.logger, "cgroup eBPF UDP redirect address is not owned: ", redirectAddress)
 		return
 	}
 	client := source.AddrPort()
 	redirectDestination := netip.AddrPortFrom(redirectAddress, i.listeners.selectedPort())
-	cached, bindingReady, loaded := i.udpClientTable.cachedPacketState(client, redirectAddress)
-	original := cached.original
+	original, loaded := i.udpClientTable.cachedCgroupOriginal(client, redirectAddress)
 	if !loaded {
-		original, err = backend.LookupOriginal(ECommon.ProtocolUDP, redirectDestination)
+		original, err = backend.LookupOriginal(commonEBPF.ProtocolUDP, redirectDestination)
+		if errors.Is(err, unix.ENOENT) {
+			original, err = backend.RecoverUDPOriginal(redirectDestination)
+		}
+		if errors.Is(err, unix.ENOENT) {
+			original, err = backend.RecoverConnectedUDPOriginal(redirectDestination)
+		}
 		if err != nil {
-			i.udpWarnings.originalDestination.warn(i.logger, "lookup UDP original destination: ", err)
+			i.udpWarnings.originalDestination.warn(i.logger, "lookup cgroup eBPF UDP original destination: ", err)
 			return
 		}
-	}
-	if !bindingReady {
-		releasedRedirects := i.udpClientTable.setBinding(
-			client,
-			original.Destination,
-			redirectAddress,
-			original.ConnectedUDP,
-		)
-		i.deleteUDPRedirects(releasedRedirects)
+		i.udpClientTable.setCgroupBinding(client, original, redirectAddress)
 	}
 	i.udpNat.NewPacket([][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), original.ConnectedUDP)
 }
 
-func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (i *Inbound) NewPacketConnectionEx(
+	ctx context.Context,
+	conn N.PacketConn,
+	source M.Socksaddr,
+	destination M.Socksaddr,
+	onClose N.CloseHandlerFunc,
+) {
 	metadata := adapter.InboundContext{
 		Inbound:     i.Tag(),
 		InboundType: i.Type(),
@@ -101,47 +122,28 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		Destination: destination,
 	}
 	if clientState, loaded := i.udpClientTable.load(source.AddrPort()); loaded {
-		metadata.UDPConnect = clientState.isConnected()
+		metadata.SourceMACAddress = clientState.sourceMACAddress()
+		metadata.ProcessInfo = i.lookupProcessInfo(clientState.processSocketCookie())
+		if binding, found := clientState.redirectBinding(destination.AddrPort()); found {
+			metadata.UDPConnect = binding.connected
+		}
 	}
 	i.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (i *Inbound) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
-	connectedUDP, _ := userData.(bool)
-	ctx := log.ContextWithNewID(i.ctx)
-	client := source.AddrPort()
-	clientState := i.udpClientTable.loadOrCreate(client)
-	clientState.setConnected(connectedUDP)
-	writer := &udpPacketWriter{
-		inbound:     i,
-		client:      client,
-		clientState: clientState,
-	}
-	return true, ctx, writer, func(error) {
-		i.deleteUDPRedirects(i.udpClientTable.delete(writer.client, writer.clientState))
-	}
-}
-
-func (i *Inbound) deleteUDPRedirects(redirectAddresses []netip.Addr) {
-	if len(redirectAddresses) == 0 {
-		return
-	}
-	backend := i.cgroupBackendInstance()
-	if backend == nil {
-		return
-	}
-	for _, redirectAddress := range redirectAddresses {
-		redirectDestination := netip.AddrPortFrom(redirectAddress, i.listeners.selectedPort())
-		if err := backend.DeleteRedirect(ECommon.ProtocolUDP, redirectDestination); err != nil {
-			i.udpWarnings.cleanup.warn(i.logger, "delete UDP redirect mapping for ", redirectDestination, ": ", err)
-		}
-	}
+func (i *Inbound) preparePacketConnection(
+	source M.Socksaddr,
+	destination M.Socksaddr,
+	_ any,
+) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+	return i.prepareTCPacketConnection(source, destination)
 }
 
 func (i *Inbound) socketControl(ipv6Listener bool) control.Func {
-	return func(network string, address string, rawConn syscall.RawConn) error {
+	return func(network string, _ string, rawConn syscall.RawConn) error {
+		var configureErr error
 		if ipv6Listener {
-			return control.Raw(rawConn, func(fd uintptr) error {
+			configureErr = control.Raw(rawConn, func(fd uintptr) error {
 				if err := unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1); err != nil {
 					return err
 				}
@@ -149,58 +151,82 @@ func (i *Inbound) socketControl(ipv6Listener bool) control.Func {
 					return err
 				}
 				if strings.HasPrefix(network, "udp") {
-					return unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVPKTINFO, 1)
+					if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVPKTINFO, 1); err != nil {
+						return err
+					}
+					return unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
 				}
 				return nil
 			})
-		}
-		if network == "udp4" {
-			return control.Raw(rawConn, func(fd uintptr) error {
-				return unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_PKTINFO, 1)
+		} else if network == "udp4" {
+			configureErr = control.Raw(rawConn, func(fd uintptr) error {
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1); err != nil {
+					return err
+				}
+				if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_PKTINFO, 1); err != nil {
+					return err
+				}
+				return unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_RECVORIGDSTADDR, 1)
+			})
+		} else if network == "tcp4" || network == "tcp" {
+			configureErr = control.Raw(rawConn, func(fd uintptr) error {
+				return unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
 			})
 		}
-		return nil
+		if configureErr != nil {
+			return configureErr
+		}
+		if i.selfBypass == nil {
+			return nil
+		}
+		return i.selfBypass.RegisterSocket(rawConn)
 	}
-}
-
-type udpPacketWriter struct {
-	inbound     *Inbound
-	client      netip.AddrPort
-	clientState *udpClientState
-}
-
-func (w *udpPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	defer buffer.Release()
-	binding, loaded := w.clientState.redirectBinding(destination.AddrPort())
-	if !loaded {
-		return E.New("missing UDP redirect binding for ", destination)
-	}
-	return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.client, binding.address)
 }
 
 func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {
+	address, _, _, err := packetDestinationsFromOOB(oob)
+	return address, err
+}
+
+func packetDestinationsFromOOB(oob []byte) (netip.Addr, netip.AddrPort, uint32, error) {
+	var packetAddress netip.Addr
+	var originalDestination netip.AddrPort
+	var interfaceIndex uint32
 	for len(oob) > 0 {
 		header, data, remainder, err := unix.ParseOneSocketControlMessage(oob)
 		if err != nil {
-			return netip.Addr{}, E.Cause(err, "parse IP packet info")
+			return netip.Addr{}, netip.AddrPort{}, 0, E.Cause(err, "parse IP packet info")
 		}
 		switch {
 		case header.Level == unix.IPPROTO_IP && header.Type == unix.IP_PKTINFO:
 			if len(data) < unix.SizeofInet4Pktinfo {
-				return netip.Addr{}, E.New("invalid IPv4 packet info length: ", len(data))
+				return netip.Addr{}, netip.AddrPort{}, 0, E.New("invalid IPv4 packet info length: ", len(data))
 			}
+			interfaceIndex = binary.NativeEndian.Uint32(data[:4])
 			var address [4]byte
 			copy(address[:], data[8:12])
-			return netip.AddrFrom4(address), nil
+			packetAddress = netip.AddrFrom4(address)
 		case header.Level == unix.IPPROTO_IPV6 && header.Type == unix.IPV6_PKTINFO:
 			if len(data) < unix.SizeofInet6Pktinfo {
-				return netip.Addr{}, E.New("invalid IPv6 packet info length: ", len(data))
+				return netip.Addr{}, netip.AddrPort{}, 0, E.New("invalid IPv6 packet info length: ", len(data))
 			}
+			interfaceIndex = binary.NativeEndian.Uint32(data[16:20])
 			var address [16]byte
 			copy(address[:], data[:16])
-			return netip.AddrFrom16(address), nil
+			packetAddress = netip.AddrFrom16(address)
+		case header.Level == unix.SOL_IP && header.Type == unix.IP_RECVORIGDSTADDR && len(data) >= 8:
+			var address [4]byte
+			copy(address[:], data[4:8])
+			originalDestination = netip.AddrPortFrom(netip.AddrFrom4(address), binary.BigEndian.Uint16(data[2:4]))
+		case header.Level == unix.SOL_IPV6 && header.Type == unix.IPV6_RECVORIGDSTADDR && len(data) >= 24:
+			var address [16]byte
+			copy(address[:], data[8:24])
+			originalDestination = netip.AddrPortFrom(netip.AddrFrom16(address), binary.BigEndian.Uint16(data[2:4]))
 		}
 		oob = remainder
 	}
-	return netip.Addr{}, E.New("IP packet info is missing")
+	if !packetAddress.IsValid() {
+		return netip.Addr{}, netip.AddrPort{}, 0, E.New("IP packet info is missing")
+	}
+	return packetAddress, originalDestination, interfaceIndex, nil
 }

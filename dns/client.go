@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"hash/fnv"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
+	"github.com/sagernet/sing/service"
 
 	"github.com/miekg/dns"
 )
@@ -110,6 +112,7 @@ type Client struct {
 	initRDRCFunc      func() adapter.RDRCStore
 	dnsCache          adapter.DNSCacheStore
 	initDNSCacheFunc  func() adapter.DNSCacheStore
+	networkManager    adapter.NetworkManager
 	logger            logger.ContextLogger
 	cache             *freelru.Cache[dnsCacheKey, *dnsMsg]
 	roundRobinIndex   *freelru.Cache[dnsCacheKey, *dnsMsg]
@@ -181,53 +184,59 @@ func (k dnsCacheKey) persistentName() string {
 }
 
 func (c *Client) newCacheKey(transport adapter.DNSTransport, question dns.Question, message *dns.Msg, options adapter.DNSQueryOptions) dnsCacheKey {
-	cacheKey := dnsCacheKey{Question: question, transportTag: transport.Tag(), clientSubnet: c.effectiveClientSubnet(message, options)}
-	environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
-	if withEnvironment {
-		cacheKey.environment = environmentHash(environmentTransport.Environment())
+	var clientSubnet netip.Prefix
+	if !options.RemoveClientSubnet {
+		clientSubnet = options.ClientSubnet
+		if !clientSubnet.IsValid() {
+			clientSubnet = c.clientSubnet
+		}
+		if !clientSubnet.IsValid() {
+			clientSubnet = clientSubnetFromMessage(message)
+		}
 	}
-	return cacheKey
+	return dnsCacheKey{
+		Question:     question,
+		transportTag: transport.Tag(),
+		clientSubnet: clientSubnet,
+		environment:  c.environmentHash(transport),
+	}
 }
 
 func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey) (dnsCacheKey, bool) {
-	environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
-	if !withEnvironment {
-		return key, true
-	}
-	environment := environmentHash(environmentTransport.Environment())
-	if environment == key.environment {
-		return key, true
-	}
-	if key.environment == 0 {
+	environment := c.environmentHash(transport)
+	if environment == key.environment || key.environment == 0 {
 		key.environment = environment
 		return key, true
 	}
 	return key, false
 }
 
-func environmentHash(environment []string) uint64 {
-	if len(environment) == 0 {
+func (c *Client) environmentHash(transport adapter.DNSTransport) uint64 {
+	environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
+	if !withEnvironment {
 		return 0
+	}
+	var networkEnvironment uint64
+	if c.networkManager != nil {
+		networkEnvironment = c.networkManager.NetworkEnvironment()
+	}
+	environment := environmentTransport.Environment()
+	if len(environment) == 0 {
+		return networkEnvironment
 	}
 	digest := fnv.New64a()
 	for _, entry := range environment {
 		digest.Write([]byte(entry))
 		digest.Write([]byte{0})
 	}
+	var hashBytes [8]byte
+	binary.BigEndian.PutUint64(hashBytes[:], networkEnvironment)
+	digest.Write(hashBytes[:])
 	return digest.Sum64()
 }
 
-func (c *Client) effectiveClientSubnet(message *dns.Msg, options adapter.DNSQueryOptions) netip.Prefix {
-	if options.ClientSubnet.IsValid() {
-		return options.ClientSubnet
-	}
-	if c.clientSubnet.IsValid() {
-		return c.clientSubnet
-	}
-	return clientSubnetFromMessage(message)
-}
-
 func (c *Client) Start() {
+	c.networkManager = service.FromContext[adapter.NetworkManager](c.ctx)
 	if c.initRDRCFunc != nil {
 		c.rdrc = c.initRDRCFunc()
 	}
@@ -391,12 +400,12 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		}
 	}
 
-	contextTransport, transportTagLoaded := transportTagFromContext(ctx)
+	contextTransport, transportTagLoaded := adapter.DNSTransportTagFromContext(ctx)
 	if transportTagLoaded && transport.Tag() == contextTransport {
 		operation.release()
 		return nil, nil, exchangeDone, E.New("DNS query loopback in transport[", contextTransport, "]")
 	}
-	operation.ctx = contextWithTransportTag(ctx, transport.Tag())
+	operation.ctx = adapter.ContextWithDNSTransportTag(ctx, transport.Tag())
 	if !disableCache && responseChecker != nil && c.rdrc != nil {
 		rejected := c.rdrc.LoadRDRC(transport.Tag(), question.Name, question.Qtype)
 		if rejected {
@@ -738,7 +747,7 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 	}
 	go func() {
 		defer c.backgroundRefresh.Delete(key)
-		ctx := contextWithTransportTag(c.ctx, transport.Tag())
+		ctx := adapter.ContextWithDNSTransportTag(c.ctx, transport.Tag())
 		response, err := c.exchangeToTransport(ctx, transport, message, options.Timeout)
 		if err != nil {
 			if c.logger != nil {
@@ -776,6 +785,9 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 }
 
 func (c *Client) prepareExchangeMessage(message *dns.Msg, options adapter.DNSQueryOptions) *dns.Msg {
+	if options.RemoveClientSubnet {
+		return removeClientSubnet(message)
+	}
 	clientSubnet := options.ClientSubnet
 	if !clientSubnet.IsValid() {
 		clientSubnet = c.clientSubnet
@@ -839,17 +851,6 @@ func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter
 
 func MessageToAddresses(response *dns.Msg) []netip.Addr {
 	return adapter.DNSResponseAddresses(response)
-}
-
-type transportKey struct{}
-
-func contextWithTransportTag(ctx context.Context, transportTag string) context.Context {
-	return context.WithValue(ctx, transportKey{}, transportTag)
-}
-
-func transportTagFromContext(ctx context.Context) (string, bool) {
-	value, loaded := ctx.Value(transportKey{}).(string)
-	return value, loaded
 }
 
 type aliasChainContextKey struct{}

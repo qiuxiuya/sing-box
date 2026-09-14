@@ -6,374 +6,213 @@ import (
 	"bytes"
 	"net"
 	"net/netip"
-	"runtime"
-	"sync"
-	"sync/atomic"
 	"testing"
 
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
-
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 )
 
-func TestUDPClientTableBindings(t *testing.T) {
+func TestUDPDirectBinding(t *testing.T) {
 	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:1234")
-	destination := netip.MustParseAddrPort("1.1.1.1:443")
-	redirectAddress := netip.MustParseAddr("127.128.0.1")
-
-	table.setBinding(client, destination, redirectAddress, false)
-	clientState, loaded := table.load(client)
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	sourceMAC := net.HardwareAddr{0x02, 0, 0, 0, 0, 1}
+	table.setDirectBinding(client, destination, sourceMAC, 42)
+	state, loaded := table.load(client)
 	if !loaded {
 		t.Fatal("client state was not created")
 	}
-	if actual, loaded := clientState.redirectBinding(destination); !loaded || actual.address != redirectAddress {
-		t.Fatalf("unexpected redirect binding: %v, %v", actual.address, loaded)
+	if _, loaded := state.redirectBinding(destination); !loaded {
+		t.Fatal("direct binding was not installed")
 	}
-	clientState.setConnected(true)
-	if !clientState.isConnected() {
-		t.Fatal("connected UDP state was not retained")
-	}
-	cached, bindingReady, loaded := table.cachedPacketState(client, redirectAddress)
-	if !loaded || !bindingReady || cached.original.Destination != destination {
-		t.Fatalf("packet state was not cached: %+v, ready=%v, loaded=%v", cached, bindingReady, loaded)
-	}
-	table.setBinding(client, destination, redirectAddress, false)
-}
-
-func TestUDPClientTableCachesPacketInfo(t *testing.T) {
-	testCases := []netip.Addr{
-		netip.MustParseAddr("127.128.0.9"),
-		netip.MustParseAddr("fd53:696e:672d:626f::9"),
-	}
-	for _, redirectAddress := range testCases {
-		t.Run(redirectAddress.String(), func(t *testing.T) {
-			var table udpClientTable
-			client := netip.MustParseAddrPort("127.0.0.1:9001")
-			destination := netip.AddrPortFrom(netip.MustParseAddr("1.1.1.1"), 53)
-			table.setBinding(client, destination, redirectAddress, false)
-			clientState, _ := table.load(client)
-			binding, loaded := clientState.redirectBinding(destination)
-			if !loaded || len(binding.packetInfo) == 0 {
-				t.Fatal("source packet info was not cached")
-			}
-			var expectedPacketInfo []byte
-			if redirectAddress.Is4() {
-				expectedPacketInfo = (&ipv4.ControlMessage{Src: net.IP(redirectAddress.AsSlice())}).Marshal()
-			} else {
-				expectedPacketInfo = (&ipv6.ControlMessage{Src: net.IP(redirectAddress.AsSlice())}).Marshal()
-			}
-			if !bytes.Equal(binding.packetInfo, expectedPacketInfo) {
-				t.Fatal("cached packet info does not contain the redirect source")
-			}
-		})
-	}
-}
-
-func TestUDPClientTableRetainsSharedNetworkSourceMAC(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("192.168.43.10:9001")
-	redirectAddress := netip.MustParseAddr("127.128.0.9")
-	sourceMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-	table.setSharedBinding(client, ECommon.OriginalDestination{
-		Destination: netip.MustParseAddrPort("1.1.1.1:53"),
-		SourceMAC:   sourceMAC,
-	}, redirectAddress, nil)
-	clientState, loaded := table.load(client)
-	if !loaded {
-		t.Fatal("client state was not created")
-	}
-	if actual := clientState.sourceMACAddress(); !bytes.Equal(actual, sourceMAC) {
+	if actual := state.sourceMACAddress(); !bytes.Equal(actual, sourceMAC) {
 		t.Fatalf("unexpected source MAC: %s", actual)
 	}
+	if state.processSocketCookie() != 42 {
+		t.Fatalf("unexpected process socket cookie: %d", state.processSocketCookie())
+	}
 }
 
-func BenchmarkUDPClientTableCacheHit(b *testing.B) {
+func TestUDPCgroupBindingLifecycle(t *testing.T) {
 	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:9001")
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
-	redirectAddress := netip.MustParseAddr("127.128.0.9")
-	table.setBinding(client, destination, redirectAddress, false)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		cached, bindingReady, loaded := table.cachedPacketState(client, redirectAddress)
-		if !loaded || !bindingReady || cached.original.Destination != destination {
-			b.Fatal("cached original destination was lost")
-		}
+	redirect := netip.MustParseAddr("127.128.0.7")
+	table.setCgroupBinding(client, commonEBPF.OriginalDestination{
+		Destination:  destination,
+		ConnectedUDP: true,
+		SocketCookie: 42,
+	}, redirect)
+	state, loaded := table.load(client)
+	if !loaded || !state.isCgroupDataPlane() {
+		t.Fatal("cgroup client state was not created")
+	}
+	binding, loaded := state.redirectBinding(destination)
+	if !loaded || binding.redirectAddress != redirect || !binding.connected {
+		t.Fatalf("unexpected cgroup binding: %+v", binding)
+	}
+	released := table.delete(client, state)
+	if len(released) != 1 || released[0] != redirect {
+		t.Fatalf("unexpected released redirects: %v", released)
 	}
 }
 
-func BenchmarkUDPClientTableCacheHitParallel(b *testing.B) {
-	workerCount := runtime.GOMAXPROCS(0)
-	clients := make([]netip.AddrPort, workerCount)
-	destinations := make([]netip.AddrPort, workerCount)
-	redirectAddresses := make([]netip.Addr, workerCount)
+func TestUDPReplySocketLifecycle(t *testing.T) {
+	var pool udpReplySocketPool
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	created := 0
+	create := func(netip.AddrPort) (*net.UDPConn, error) {
+		created++
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	}
+	first, release1, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release1()
+	second, release2, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release2()
+	if first != second || created != 1 {
+		t.Fatalf("reply socket was not reused: first=%p second=%p created=%d", first, second, created)
+	}
+	if err = pool.close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = pool.get(destination, create); err == nil {
+		t.Fatal("closed inbound accepted a reply socket")
+	}
+	if _, err = first.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
+		t.Fatal("UDP reply socket remained open after inbound closure")
+	}
+}
+
+func TestUDPReplySocketPoolSharesAcrossClients(t *testing.T) {
+	var pool udpReplySocketPool
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	created := 0
+	create := func(netip.AddrPort) (*net.UDPConn, error) {
+		created++
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	}
+	first, release1, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release1()
+	second, release2, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release2()
+	if first != second || created != 1 {
+		t.Fatalf("reply socket was not shared: first=%p second=%p created=%d", first, second, created)
+	}
+	_ = pool.close()
+}
+
+func TestUDPReplySocketPoolResetsForNetworkChange(t *testing.T) {
+	var pool udpReplySocketPool
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	created := 0
+	create := func(netip.AddrPort) (*net.UDPConn, error) {
+		created++
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	}
+	first, release1, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release1()
+	if err = pool.reset(); err != nil {
+		t.Fatal(err)
+	}
+	second, release2, err := pool.get(destination, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release2()
+	if first == second || created != 2 {
+		t.Fatalf("network reset did not replace the reply socket: first=%p second=%p created=%d", first, second, created)
+	}
+	if _, err = first.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
+		t.Fatal("reset reply socket remained open")
+	}
+	_ = pool.close()
+}
+
+func TestUDPDirectReplyBindingChecksGeneration(t *testing.T) {
 	var table udpClientTable
-	for index := range workerCount {
-		clients[index] = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(9000+index))
-		destinations[index] = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 1, byte(index >> 8), byte(index)}), 53)
-		redirectAddresses[index] = netip.AddrFrom4([4]byte{127, 128, byte(index >> 8), byte(index + 1)})
-		table.setBinding(clients[index], destinations[index], redirectAddresses[index], false)
-	}
-	var nextWorker atomic.Uint32
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		worker := int(nextWorker.Add(1)-1) % workerCount
-		for pb.Next() {
-			cached, bindingReady, loaded := table.cachedPacketState(clients[worker], redirectAddresses[worker])
-			if !loaded || !bindingReady || cached.original.Destination != destinations[worker] {
-				b.Fatal("cached original destination was lost")
-			}
-		}
-	})
-}
-
-var benchmarkPacketInfo []byte
-
-func BenchmarkUDPSourcePacketInfo(b *testing.B) {
-	redirectAddress := netip.MustParseAddr("127.128.0.9")
-	b.Run("marshal", func(b *testing.B) {
-		for range b.N {
-			benchmarkPacketInfo = sourcePacketInfo(redirectAddress)
-		}
-	})
-	b.Run("cached", func(b *testing.B) {
-		var table udpClientTable
-		client := netip.MustParseAddrPort("127.0.0.1:9001")
-		destination := netip.MustParseAddrPort("1.1.1.1:53")
-		table.setBinding(client, destination, redirectAddress, false)
-		clientState, _ := table.load(client)
-		b.ResetTimer()
-		for range b.N {
-			binding, loaded := clientState.redirectBinding(destination)
-			if !loaded {
-				b.Fatal("redirect binding was lost")
-			}
-			benchmarkPacketInfo = binding.packetInfo
-		}
-	})
-}
-
-func TestUDPClientTableDeleteChecksGeneration(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("[::1]:1234")
-	oldState := table.loadOrCreate(client)
-	table.delete(client, oldState)
-	newState := table.loadOrCreate(client)
-	table.delete(client, oldState)
-	if actual, loaded := table.load(client); !loaded || actual != newState {
-		t.Fatal("an old session removed the current UDP client state")
-	}
-}
-
-func TestUDPClientTableConcurrentBindings(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:4321")
-	redirectAddress := netip.MustParseAddr("127.128.0.2")
-	const destinationCount = 64
-	var waitGroup sync.WaitGroup
-	for index := 0; index < destinationCount; index++ {
-		waitGroup.Add(1)
-		go func(index int) {
-			defer waitGroup.Done()
-			destination := netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 0, 0, byte(index + 1)}), 443)
-			table.setBinding(client, destination, redirectAddress, false)
-		}(index)
-	}
-	waitGroup.Wait()
-	clientState, loaded := table.load(client)
-	if !loaded {
-		t.Fatal("client state was not created")
-	}
-	clientState.access.RLock()
-	bindingCount := len(clientState.bindings)
-	clientState.access.RUnlock()
-	if bindingCount != destinationCount {
-		t.Fatalf("unexpected binding count: got %d, want %d", bindingCount, destinationCount)
-	}
-}
-
-func TestUDPClientTableSharesUnconnectedRedirect(t *testing.T) {
-	var table udpClientTable
-	destination := netip.MustParseAddrPort("1.1.1.1:443")
-	redirectAddress := netip.MustParseAddr("127.128.0.3")
-	client1 := netip.MustParseAddrPort("127.0.0.1:1001")
-	client2 := netip.MustParseAddrPort("127.0.0.1:1002")
-
-	table.setBinding(client1, destination, redirectAddress, false)
-	table.setBinding(client2, destination, redirectAddress, false)
-	if references := redirectReferenceCount(&table, redirectAddress); references != 2 {
-		t.Fatalf("unexpected shared redirect references: %d", references)
-	}
-	state1, _ := table.load(client1)
-	if released := table.delete(client1, state1); len(released) != 0 {
-		t.Fatalf("redirect released while another client still referenced it: %v", released)
-	}
-	state2, _ := table.load(client2)
-	released := table.delete(client2, state2)
-	if len(released) != 1 || released[0] != redirectAddress {
-		t.Fatalf("redirect was not released with the last client: %v", released)
-	}
-}
-
-func TestUDPClientTableSeparatesSharedRedirectsByClient(t *testing.T) {
-	var table udpClientTable
-	destination := netip.MustParseAddrPort("1.1.1.1:443")
-	redirectAddress := netip.MustParseAddr("127.128.0.3")
-	client1 := netip.MustParseAddrPort("192.168.43.10:1001")
-	client2 := netip.MustParseAddrPort("192.168.43.11:1001")
-
-	table.setSharedBinding(client1, ECommon.OriginalDestination{Destination: destination}, redirectAddress, nil)
-	table.setSharedBinding(client2, ECommon.OriginalDestination{Destination: destination}, redirectAddress, nil)
-	state1, _ := table.load(client1)
-	if released := table.deleteShared(client1, state1); len(released) != 1 {
-		t.Fatalf("first client flow was not released independently: %v", released)
-	}
-	state2, _ := table.load(client2)
-	if released := table.deleteShared(client2, state2); len(released) != 1 {
-		t.Fatalf("second client flow was not released independently: %v", released)
-	}
-}
-
-func TestUDPClientTableDoesNotReferenceConnectedRedirect(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:2001")
-	destination := netip.MustParseAddrPort("8.8.8.8:53")
-	redirectAddress := netip.MustParseAddr("127.128.0.4")
-
-	table.setBinding(client, destination, redirectAddress, true)
-	if references := redirectReferenceCount(&table, redirectAddress); references != 0 {
-		t.Fatalf("connected redirect entered userspace reference table: %d", references)
-	}
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
+	base := netip.MustParseAddrPort("1.1.1.1:53")
+	reply := netip.MustParseAddrPort("8.8.8.8:53")
+	table.setDirectBinding(client, base, nil, 0)
 	state, _ := table.load(client)
-	if released := table.delete(client, state); len(released) != 0 {
-		t.Fatalf("connected redirect was selected for userspace deletion: %v", released)
+	if !table.setDirectReplyBinding(client, state, reply) {
+		t.Fatal("reply binding was not installed")
 	}
-}
-
-func TestUDPClientTableReplacesRedirectReference(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:3001")
-	destination := netip.MustParseAddrPort("9.9.9.9:53")
-	oldRedirect := netip.MustParseAddr("127.128.0.5")
-	newRedirect := netip.MustParseAddr("127.128.0.6")
-
-	table.setBinding(client, destination, oldRedirect, false)
-	released := table.setBinding(client, destination, newRedirect, false)
-	if len(released) != 1 || released[0] != oldRedirect {
-		t.Fatalf("old redirect was not released: %v", released)
+	if binding, loaded := state.redirectBinding(reply); !loaded || !binding.replyAlias {
+		t.Fatalf("unexpected reply binding: %+v", binding)
 	}
-	if references := redirectReferenceCount(&table, oldRedirect); references != 0 {
-		t.Fatalf("old redirect still has references: %d", references)
-	}
-	if references := redirectReferenceCount(&table, newRedirect); references != 1 {
-		t.Fatalf("new redirect has unexpected references: %d", references)
-	}
-	if _, loaded := table.cachedOriginal(client, oldRedirect); loaded {
-		t.Fatal("old redirect original destination remained cached")
-	}
-}
-
-func TestUDPClientTableRetainsSharedRedirectOriginal(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:3002")
-	firstDestination := netip.MustParseAddrPort("9.9.9.9:53")
-	secondDestination := netip.MustParseAddrPort("149.112.112.112:53")
-	oldRedirect := netip.MustParseAddr("127.128.0.5")
-	newRedirect := netip.MustParseAddr("127.128.0.6")
-
-	table.setBinding(client, firstDestination, oldRedirect, false)
-	table.setBinding(client, secondDestination, oldRedirect, false)
-	table.setBinding(client, firstDestination, newRedirect, false)
-	if _, loaded := table.cachedOriginal(client, oldRedirect); !loaded {
-		t.Fatal("referenced redirect original destination was removed")
-	}
-}
-
-func TestUDPClientTableDuplicateBindingDoesNotRetainTwice(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("127.0.0.1:4001")
-	destination := netip.MustParseAddrPort("1.0.0.1:53")
-	redirectAddress := netip.MustParseAddr("127.128.0.7")
-
-	table.setBinding(client, destination, redirectAddress, false)
-	table.setBinding(client, destination, redirectAddress, false)
-	if references := redirectReferenceCount(&table, redirectAddress); references != 1 {
-		t.Fatalf("duplicate packet changed redirect references: %d", references)
-	}
-}
-
-func TestUDPClientTableCachesOriginalByClientAndToken(t *testing.T) {
-	var table udpClientTable
-	client := netip.MustParseAddrPort("192.168.43.10:4001")
-	otherClient := netip.MustParseAddrPort("192.168.43.11:4001")
-	destination := netip.MustParseAddrPort("1.0.0.1:53")
-	redirectAddress := netip.MustParseAddr("127.128.0.7")
-
-	if _, loaded := table.cachedOriginal(client, redirectAddress); loaded {
-		t.Fatal("original destination was cached before binding")
-	}
-	table.setBinding(client, destination, redirectAddress, false)
-	cached, loaded := table.cachedOriginal(client, redirectAddress)
-	if !loaded || cached.original.Destination != destination {
-		t.Fatalf("unexpected cached original destination: %+v, %v", cached, loaded)
-	}
-	if _, loaded = table.cachedOriginal(otherClient, redirectAddress); loaded {
-		t.Fatal("original destination cache leaked to another client")
-	}
-	state, _ := table.load(client)
 	table.delete(client, state)
-	if _, loaded = table.cachedOriginal(client, redirectAddress); loaded {
-		t.Fatal("original destination cache survived session deletion")
+	if table.setDirectReplyBinding(client, state, netip.MustParseAddrPort("9.9.9.9:53")) {
+		t.Fatal("closed session was resurrected")
 	}
 }
 
-func TestUDPClientTableConcurrentReleaseSelectsRedirectOnce(t *testing.T) {
-	var table udpClientTable
-	destination := netip.MustParseAddrPort("8.8.4.4:53")
-	redirectAddress := netip.MustParseAddr("127.128.0.8")
-	const clientCount = 64
-	clients := make([]netip.AddrPort, clientCount)
-	states := make([]*udpClientState, clientCount)
-	for index := range clients {
-		clients[index] = netip.AddrPortFrom(
-			netip.AddrFrom4([4]byte{127, 0, 0, 1}),
-			uint16(5000+index),
+// TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort proves the reply
+// socket pool's shard selection actually uses the destination address, not
+// only its port. udpReplySockets.get is keyed by the original destination
+// (see the caller in tc_connection.go), and real-world UDP destinations
+// overwhelmingly concentrate on a handful of well-known ports (443 for QUIC,
+// 53 for DNS, ...) while varying widely in address -- a shard key built from
+// the port alone would put every one of those distinct destinations in the
+// same shard regardless of how many there are, defeating the 16-way split
+// udpReplySocketShardCapacity depends on to bound the pool's total size.
+// This generates many distinct destination addresses that all share one
+// port and asserts they land across more than one shard.
+func TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort(t *testing.T) {
+	var pool udpReplySocketPool
+	counts := make(map[int]int)
+	for i := 0; i < 256; i++ {
+		destination := netip.AddrPortFrom(
+			netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)}),
+			443,
 		)
-		table.setBinding(clients[index], destination, redirectAddress, false)
-		states[index], _ = table.load(clients[index])
+		counts[pool.shardIndex(destination)]++
 	}
-
-	releases := make(chan netip.Addr, clientCount)
-	var waitGroup sync.WaitGroup
-	for index := range clients {
-		waitGroup.Add(1)
-		go func(index int) {
-			defer waitGroup.Done()
-			for _, released := range table.delete(clients[index], states[index]) {
-				releases <- released
-			}
-		}(index)
-	}
-	waitGroup.Wait()
-	close(releases)
-	var releaseCount int
-	for released := range releases {
-		if released != redirectAddress {
-			t.Fatalf("unexpected redirect released: %v", released)
-		}
-		releaseCount++
-	}
-	if releaseCount != 1 {
-		t.Fatalf("redirect selected for deletion %d times", releaseCount)
+	if len(counts) < 2 {
+		t.Fatalf(
+			"256 distinct destinations all on port 443 landed in %d shard(s) (%v); "+
+				"want them spread across multiple shards -- the shard key must not depend on the port alone",
+			len(counts), counts,
+		)
 	}
 }
 
-func redirectReferenceCount(table *udpClientTable, redirectAddress netip.Addr) uint32 {
-	table.redirectAccess.Lock()
-	defer table.redirectAccess.Unlock()
-	return table.redirectReferences[udpRedirectReference{address: redirectAddress}]
+// TestUDPClientTableShardsSpreadAcrossClientAddress is the client-table
+// counterpart: clientShard keys by the LAN client's own address, and two
+// different client machines can coincidentally pick the same ephemeral
+// source port for unrelated connections (OS ephemeral port ranges overlap
+// across independent hosts) -- a shard key that only ever looked at the
+// port would then always collide those two clients into the same shard no
+// matter how many client addresses are actually in play.
+func TestUDPClientTableShardsSpreadAcrossClientAddress(t *testing.T) {
+	var table udpClientTable
+	counts := make(map[*udpClientShard]int)
+	for i := 0; i < 256; i++ {
+		client := netip.AddrPortFrom(
+			netip.AddrFrom4([4]byte{192, 168, byte(i >> 8), byte(i)}),
+			51413,
+		)
+		counts[table.clientShard(client)]++
+	}
+	if len(counts) < 2 {
+		t.Fatalf(
+			"256 distinct clients all on the same ephemeral port landed in %d shard(s); "+
+				"want them spread across multiple shards -- the shard key must not depend on the port alone",
+			len(counts),
+		)
+	}
 }

@@ -135,7 +135,7 @@ func (p *windowsPlatformInterface) RequestPermissionForWIFIState() error {
 	return nil
 }
 
-func (p *windowsPlatformInterface) ReadWIFIState() adapter.WIFIState {
+func (p *windowsPlatformInterface) ReadWIFIState(ctx context.Context) adapter.WIFIState {
 	return adapter.WIFIState{}
 }
 
@@ -152,11 +152,15 @@ func (p *windowsPlatformInterface) UsePlatformWIFIMonitor() bool {
 }
 
 func (p *windowsPlatformInterface) UsePlatformNotification() bool {
-	return false
+	return true
 }
 
 func (p *windowsPlatformInterface) SendNotification(notification *adapter.Notification) error {
-	return nil
+	return p.daemon.startedService.SendNotification(notification)
+}
+
+func (p *windowsPlatformInterface) CancelNotification(identifier string, typeID int32) error {
+	return p.daemon.startedService.CancelNotification(identifier, typeID)
 }
 
 func (p *windowsPlatformInterface) MyInterfaceAddress() []netip.Addr {
@@ -234,6 +238,14 @@ func (p *windowsPlatformInterface) UsePlatformBridge() bool {
 }
 
 func (p *windowsPlatformInterface) CreateBridge(options adapter.BridgeOptions) (adapter.BridgeSession, error) {
+	return nil, os.ErrInvalid
+}
+
+func (p *windowsPlatformInterface) UsePlatformAutoRedirect() bool {
+	return false
+}
+
+func (p *windowsPlatformInterface) CreateAutoRedirect(options adapter.AutoRedirectOptions) (adapter.AutoRedirectSession, error) {
 	return nil, os.ErrInvalid
 }
 

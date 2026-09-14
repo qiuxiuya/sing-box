@@ -26,6 +26,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/iponly"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -47,6 +48,7 @@ import (
 	tailscaleroot "github.com/sagernet/tailscale"
 	_ "github.com/sagernet/tailscale/feature/relayserver"
 	"github.com/sagernet/tailscale/ipn"
+	"github.com/sagernet/tailscale/ipn/ipnlocal"
 	tsDNS "github.com/sagernet/tailscale/net/dns"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/netns"
@@ -67,6 +69,8 @@ var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.FlowOutboundDomainResolver  = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.Referrer                    = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 	_ tun.Port                            = (*Endpoint)(nil)
 )
@@ -88,6 +92,7 @@ type Endpoint struct {
 	dnsRouter         adapter.DNSRouter
 	network           adapter.NetworkManager
 	platformInterface adapter.PlatformInterface
+	detour            string
 	server            *tsnet.Server
 	stack             *stack.Stack
 	icmpForwarder     *tun.ICMPForwarder
@@ -118,6 +123,14 @@ type Endpoint struct {
 
 	sshServerInstance *tailssh.Server
 	sshServerOptions  *option.TailscaleSSHServerOptions
+	taildrop          *taildropManager
+	localBackend      atomic.Pointer[ipnlocal.LocalBackend]
+	onDemand          bool
+	suspendAccess     sync.Mutex
+	idleRequested     atomic.Bool
+	resumeDone        chan struct{}
+	resumePending     atomic.Bool
+	suspended         atomic.Bool
 
 	systemInterface     bool
 	systemInterfaceName string
@@ -189,6 +202,12 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	dialerQueryOptions := outboundDialer.(dialer.ResolveDialer).QueryOptions()
 	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
+	taildropDirectory := options.TaildropDirectory
+	if taildropDirectory == "" {
+		taildropDirectory = "Taildrop"
+	}
+	taildropDirectory = filemanager.BasePath(ctx, os.ExpandEnv(taildropDirectory))
+	taildropDirectory, _ = filepath.Abs(taildropDirectory)
 	ep := &Endpoint{
 		Adapter:           endpoint.NewAdapter(C.TypeTailscale, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, nil),
 		ctx:               ctx,
@@ -198,6 +217,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		queryOptions:      dialerQueryOptions,
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		platformInterface: platformInterface,
+		detour:            options.Detour,
 		server: &tsnet.Server{
 			Dir:      stateDirectory,
 			Hostname: hostname,
@@ -210,6 +230,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			Ephemeral:     options.Ephemeral,
 			AuthKey:       options.AuthKey,
 			ControlURL:    options.ControlURL,
+			Port:          options.ListenPort,
 			AdvertiseTags: options.AdvertiseTags,
 			Dialer:        &endpointDialer{Dialer: outboundDialer, logger: logger},
 			LookupHook: func(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -238,6 +259,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		relayServerPort:            options.RelayServerPort,
 		relayServerStaticEndpoints: options.RelayServerStaticEndpoints,
 		sshServerOptions:           options.SSHServer,
+		taildrop:                   newTaildropManager(ctx, logger, tag, taildropDirectory, platformInterface),
 		udpTimeout:                 udpTimeout,
 		icmpTimeout:                C.ICMPTimeout,
 		systemInterface:            options.SystemInterface,
@@ -245,6 +267,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		systemInterfaceName:        options.SystemInterfaceName,
 		systemInterfaceMTU:         options.SystemInterfaceMTU,
 		keyAuth:                    options.AuthKey != "",
+		onDemand:                   options.OnDemand,
 	}
 	if options.InnerDomainResolver != nil {
 		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
@@ -256,12 +279,25 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	return ep, nil
 }
 
+func (t *Endpoint) References() []string {
+	if t.detour == "" {
+		return nil
+	}
+	return []string{t.detour}
+}
+
 func (t *Endpoint) Start(stage adapter.StartStage) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		mkdirErr := filemanager.MkdirAll(t.ctx, t.server.Dir, 0o700)
 		if mkdirErr != nil {
 			return E.Cause(mkdirErr, "create state directory")
+		}
+		if !version.IsAppleTV() {
+			mkdirErr = filemanager.MkdirAll(t.ctx, t.taildrop.directory, 0o700)
+			if mkdirErr != nil {
+				return E.Cause(mkdirErr, "create taildrop directory")
+			}
 		}
 		t.server.PeerDNSQueryHandler = (*peerDNSQueryHandler)(t)
 	case adapter.StartStateStart:
@@ -345,27 +381,30 @@ func (t *Endpoint) start() error {
 		t.systemDialer = systemDialer
 		t.server.Tun = wgTunDevice
 	}
+	selfBypassControl := dialer.AppendEBPFSelfBypass(t.network, nil)
 	if t.network.AutoRedirectOutputMark() != 0 {
-		netns.SetControlFunc(control.Append(adapter.SocketProtectFunc(t.network), t.network.AutoRedirectOutputMarkFunc()))
+		netns.SetControlFunc(control.Append(t.network.AutoRedirectOutputMarkFunc(), selfBypassControl))
 	} else if t.platformInterface != nil && t.platformInterface.UsePlatformNetworkInterfaces() {
 		if t.platformInterface.UsePlatformAutoDetectInterfaceControl() {
-			netns.SetControlFunc(control.Append(adapter.SocketProtectFunc(t.network), func(network, address string, conn syscall.RawConn) error {
+			platformControl := func(network, address string, conn syscall.RawConn) error {
 				return control.Raw(conn, func(fileDescriptor uintptr) error {
 					return t.platformInterface.AutoDetectInterfaceControl(int(fileDescriptor))
 				})
-			}))
+			}
+			netns.SetControlFunc(control.Append(platformControl, selfBypassControl))
 		} else {
 			// NEPacketTunnelProvider sockets are excluded from tunnel routes by
 			// NECP; the empty override only suppresses tailscale's own
 			// default-interface bind, which would select the sing-box utun.
-			netns.SetControlFunc(control.Append(adapter.SocketProtectFunc(t.network), func(string, string, syscall.RawConn) error {
+			platformControl := func(string, string, syscall.RawConn) error {
 				return nil
-			}))
+			}
+			netns.SetControlFunc(control.Append(platformControl, selfBypassControl))
 		}
 	} else {
 		bindFunc := t.network.AutoDetectInterfaceFunc()
-		netns.SetControlFunc(control.Append(adapter.SocketProtectFunc(t.network), bindFunc))
-		if bindFunc != nil {
+		if bindFunc != nil || selfBypassControl != nil {
+			netns.SetControlFunc(control.Append(bindFunc, selfBypassControl))
 			netns.SetListenPacketFunc(t.listenPacket)
 		}
 	}
@@ -374,10 +413,7 @@ func (t *Endpoint) start() error {
 
 func (t *Endpoint) listenPacket(ctx context.Context, network string, address string) (nettype.PacketConn, error) {
 	listenConfig := net.ListenConfig{
-		Control: control.Append(
-			control.Append(adapter.SocketProtectFunc(t.network), t.network.AutoDetectInterfaceFunc()),
-			control.DisableUDPNetReset(),
-		),
+		Control: dialer.AppendEBPFSelfBypass(t.network, control.Append(t.network.AutoDetectInterfaceFunc(), control.DisableUDPNetReset())),
 	}
 	packetConn, err := listenConfig.ListenPacket(ctx, network, address)
 	if err != nil {
@@ -419,7 +455,13 @@ func (t *Endpoint) postStart() error {
 			}, true
 		})
 	}
-	wgEngine := t.server.ExportLocalBackend().ExportEngine().(wgengine.ExportedUserspaceEngine)
+	localBackend := t.server.ExportLocalBackend()
+	t.localBackend.Store(localBackend)
+	if !version.IsAppleTV() {
+		registerTaildropEndpoint(localBackend, t)
+		go t.taildrop.start()
+	}
+	wgEngine := localBackend.ExportEngine().(wgengine.ExportedUserspaceEngine)
 	wgEngine.SetOnReconfigListener(t.onReconfig)
 	t.wgEngine = wgEngine
 
@@ -561,6 +603,7 @@ func (t *Endpoint) watchState() {
 				if exitNodePending {
 					tryApplyExitNode()
 				}
+				t.suspendIfRequested()
 			}
 			return true
 		})
@@ -708,6 +751,11 @@ func (t *Endpoint) Logout(ctx context.Context) error {
 func (t *Endpoint) Close() error {
 	var err error
 	t.started.Store(false)
+	localBackend := t.localBackend.Swap(nil)
+	if localBackend != nil {
+		unregisterTaildropEndpoint(localBackend)
+	}
+	t.taildrop.close()
 	if t.icmpForwarder != nil {
 		t.icmpForwarder.Close()
 		t.icmpForwarder = nil
@@ -732,7 +780,7 @@ func (t *Endpoint) Close() error {
 	return err
 }
 
-func (t *Endpoint) InterfaceUpdated() {
+func (t *Endpoint) InterfaceUpdated(ctx context.Context) {
 	if !t.started.Load() {
 		return
 	}
@@ -740,6 +788,132 @@ func (t *Endpoint) InterfaceUpdated() {
 	if loaded && netMon != nil {
 		netMon.InjectEvent()
 	}
+}
+
+func (t *Endpoint) OnDemand() bool {
+	return t.onDemand
+}
+
+func (t *Endpoint) SetKeepIdleConnections(keep bool) {
+	t.idleRequested.Store(!keep)
+	if !keep {
+		t.suspendAccess.Lock()
+		t.suspendLocked()
+		t.suspendAccess.Unlock()
+		return
+	}
+	if t.systemInterface {
+		t.requestResume()
+	}
+}
+
+func (t *Endpoint) requestResume() {
+	if !t.suspended.Load() || !t.resumePending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer t.resumePending.Store(false)
+		err := t.resume(t.ctx)
+		if err != nil {
+			t.logger.Error(E.Cause(err, "resume"))
+		}
+	}()
+}
+
+func (t *Endpoint) suspendIfRequested() {
+	if !t.idleRequested.Load() {
+		return
+	}
+	t.suspendAccess.Lock()
+	if t.idleRequested.Load() {
+		t.suspendLocked()
+	}
+	t.suspendAccess.Unlock()
+}
+
+func (t *Endpoint) suspendLocked() {
+	if t.suspended.Load() || t.resumeDone != nil {
+		return
+	}
+	localBackend := t.localBackend.Load()
+	if localBackend == nil || localBackend.State() != ipn.Running {
+		return
+	}
+	_, err := localBackend.EditPrefs(&ipn.MaskedPrefs{
+		Prefs:          ipn.Prefs{WantRunning: false},
+		WantRunningSet: true,
+	})
+	if err != nil {
+		t.logger.Error(E.Cause(err, "suspend"))
+		return
+	}
+	t.suspended.Store(true)
+}
+
+func (t *Endpoint) resume(ctx context.Context) error {
+	t.idleRequested.Store(false)
+	if !t.suspended.Load() {
+		return nil
+	}
+	t.suspendAccess.Lock()
+	if !t.suspended.Load() {
+		t.suspendAccess.Unlock()
+		return nil
+	}
+	resumeDone := t.resumeDone
+	if resumeDone == nil {
+		localBackend := t.localBackend.Load()
+		if localBackend == nil {
+			t.suspendAccess.Unlock()
+			return E.New("Tailscale is not ready yet")
+		}
+		_, err := localBackend.EditPrefs(&ipn.MaskedPrefs{
+			Prefs:          ipn.Prefs{WantRunning: true},
+			WantRunningSet: true,
+		})
+		if err != nil {
+			t.suspendAccess.Unlock()
+			return err
+		}
+		resumeDone = make(chan struct{})
+		t.resumeDone = resumeDone
+		go t.awaitRunning(localBackend, resumeDone)
+	}
+	t.suspendAccess.Unlock()
+	select {
+	case <-resumeDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if t.suspended.Load() {
+		return E.New("Tailscale backend is not running")
+	}
+	return nil
+}
+
+func (t *Endpoint) awaitRunning(localBackend *ipnlocal.LocalBackend, resumeDone chan struct{}) {
+	running := localBackend.State() == ipn.Running
+	if !running {
+		watchCtx, cancel := context.WithTimeout(t.ctx, C.TCPTimeout)
+		localBackend.WatchNotifications(watchCtx, ipn.NotifyInitialState, nil, func(notify *ipn.Notify) bool {
+			if notify.State != nil && *notify.State == ipn.Running {
+				running = true
+				return false
+			}
+			return notify.ErrMessage == nil
+		})
+		cancel()
+	}
+	t.suspendAccess.Lock()
+	t.resumeDone = nil
+	if running {
+		t.suspended.Store(false)
+		if t.idleRequested.Load() {
+			t.suspendLocked()
+		}
+	}
+	t.suspendAccess.Unlock()
+	close(resumeDone)
 }
 
 func (t *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -751,6 +925,10 @@ func (t *Endpoint) DialContext(ctx context.Context, network string, destination 
 	}
 	if !t.started.Load() {
 		return nil, E.New("Tailscale is not ready yet")
+	}
+	resumeErr := t.resume(ctx)
+	if resumeErr != nil {
+		return nil, resumeErr
 	}
 	if destination.IsDomain() {
 		destinationAddresses, err := t.dnsRouter.Lookup(ctx, destination.Fqdn, t.innerDNSQueryOptions)
@@ -811,6 +989,10 @@ func (t *Endpoint) listenPacketWithAddress(ctx context.Context, destination M.So
 	if !t.started.Load() {
 		return nil, E.New("Tailscale is not ready yet")
 	}
+	resumeErr := t.resume(ctx)
+	if resumeErr != nil {
+		return nil, resumeErr
+	}
 	if t.systemDialer != nil {
 		return t.systemDialer.ListenPacket(ctx, destination)
 	}
@@ -850,7 +1032,7 @@ func (t *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		for _, address := range destinationAddresses {
 			packetConn, packetErr := t.listenPacketWithAddress(ctx, M.SocksaddrFrom(address, destination.Port))
 			if packetErr == nil {
-				return packetConn, address, nil
+				return iponly.NewPacketConn(t.logger, packetConn), address, nil
 			}
 			errors = append(errors, packetErr)
 		}
@@ -861,9 +1043,9 @@ func (t *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsIP() {
-		return packetConn, destination.Addr, nil
+		return iponly.NewPacketConn(t.logger, packetConn), destination.Addr, nil
 	}
-	return packetConn, netip.Addr{}, nil
+	return iponly.NewPacketConn(t.logger, packetConn), netip.Addr{}, nil
 }
 
 func (t *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -944,7 +1126,7 @@ func (t *Endpoint) PreferredDomain(metadata *adapter.InboundContext, domain stri
 		}
 	}
 	for _, suffix := range t.routeSuffixes.Load() {
-		if mDNS.IsSubDomain(suffix, domain) {
+		if matchDomainSuffix(domain, suffix) {
 			return true
 		}
 	}
@@ -991,7 +1173,7 @@ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCf
 	}
 	routeSuffixes := make([]string, 0, len(dnsCfg.Routes))
 	for fqdn := range dnsCfg.Routes {
-		routeSuffixes = append(routeSuffixes, fqdn.WithoutTrailingDot())
+		routeSuffixes = append(routeSuffixes, strings.ToLower(fqdn.WithoutTrailingDot()))
 	}
 	t.routeDomains.Store(routeDomains)
 	t.routeSuffixes.Store(routeSuffixes)

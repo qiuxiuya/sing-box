@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -21,7 +21,7 @@ type androidUIDOptions struct {
 	excludePackage     []string
 }
 
-func newAndroidUIDOptions(options option.EBPFInboundOptions) *androidUIDOptions {
+func newAndroidUIDOptions(options option.EBPFLocalOptions) *androidUIDOptions {
 	if !hasAndroidUIDOptions(options) {
 		return nil
 	}
@@ -41,20 +41,16 @@ func (i *Inbound) resolveAndroidUIDPolicy() error {
 	i.inspectAndroidPackages(packageManager, "include", i.androidUIDOptions.includePackage, warnSharedUID)
 	i.inspectAndroidPackages(packageManager, "exclude", i.androidUIDOptions.excludePackage, warnSharedUID)
 	tunOptions := tun.Options{
-		IncludeUID:         toTunUIDRanges(i.cgroupPolicy.IncludeUID),
-		ExcludeUID:         toTunUIDRanges(i.cgroupPolicy.ExcludeUID),
+		IncludeUID:         toTunUIDRanges(i.localPolicy.IncludeUID),
+		ExcludeUID:         toTunUIDRanges(i.localPolicy.ExcludeUID),
 		IncludeAndroidUser: slices.Clone(i.androidUIDOptions.includeAndroidUser),
 		IncludePackage:     slices.Clone(i.androidUIDOptions.includePackage),
 		ExcludePackage:     slices.Clone(i.androidUIDOptions.excludePackage),
 		Logger:             i.logger,
 	}
 	tunOptions.BuildAndroidRules(packageManager)
-	i.cgroupPolicy.IncludeUID = fromTunUIDRanges(tunOptions.IncludeUID)
-	i.cgroupPolicy.ExcludeUID = fromTunUIDRanges(tunOptions.ExcludeUID)
-	i.logger.Debug(
-		"resolved eBPF Android UID policy at startup: include_ranges=", len(i.cgroupPolicy.IncludeUID),
-		", exclude_ranges=", len(i.cgroupPolicy.ExcludeUID),
-	)
+	i.localPolicy.IncludeUID = fromTunUIDRanges(tunOptions.IncludeUID)
+	i.localPolicy.ExcludeUID = fromTunUIDRanges(tunOptions.ExcludeUID)
 	return nil
 }
 
@@ -86,7 +82,7 @@ func (i *Inbound) inspectAndroidPackages(packageManager tun.PackageManager, mode
 	}
 }
 
-func toTunUIDRanges(uidRanges []ECommon.UIDRange) []ranges.Range[uint32] {
+func toTunUIDRanges(uidRanges []commonEBPF.UIDRange) []ranges.Range[uint32] {
 	converted := make([]ranges.Range[uint32], 0, len(uidRanges))
 	for _, uidRange := range uidRanges {
 		converted = append(converted, ranges.New(uidRange.Start, uidRange.End))
@@ -94,10 +90,10 @@ func toTunUIDRanges(uidRanges []ECommon.UIDRange) []ranges.Range[uint32] {
 	return converted
 }
 
-func fromTunUIDRanges(uidRanges []ranges.Range[uint32]) []ECommon.UIDRange {
-	converted := make([]ECommon.UIDRange, 0, len(uidRanges))
+func fromTunUIDRanges(uidRanges []ranges.Range[uint32]) []commonEBPF.UIDRange {
+	converted := make([]commonEBPF.UIDRange, 0, len(uidRanges))
 	for _, uidRange := range uidRanges {
-		converted = append(converted, ECommon.UIDRange{Start: uidRange.Start, End: uidRange.End})
+		converted = append(converted, commonEBPF.UIDRange{Start: uidRange.Start, End: uidRange.End})
 	}
 	return converted
 }

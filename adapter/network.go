@@ -1,8 +1,10 @@
 package adapter
 
 import (
+	"context"
 	"encoding/hex"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ type NetworkManager interface {
 	UpdateInterfaces() error
 	DefaultNetworkInterface() *NetworkInterface
 	NetworkInterfaces() []NetworkInterface
+	NetworkEnvironment() uint64
 	AutoDetectInterface() bool
 	AutoDetectInterfaceFunc() control.Func
 	ProtectFunc() control.Func
@@ -30,22 +33,9 @@ type NetworkManager interface {
 	PackageManager() tun.PackageManager
 	NeedWIFIState() bool
 	WIFIState() WIFIState
-	UpdateWIFIState()
-	ResetNetwork()
-}
-
-type SocketProtectManager interface {
-	RegisterSocketProtectFunc(protectFunc control.Func) error
-	UnregisterSocketProtectFunc()
-	SocketProtectFunc() control.Func
-}
-
-func SocketProtectFunc(networkManager NetworkManager) control.Func {
-	protectManager, loaded := networkManager.(SocketProtectManager)
-	if !loaded {
-		return nil
-	}
-	return protectManager.SocketProtectFunc()
+	UpdateWIFIState(ctx context.Context)
+	ResetNetwork(ctx context.Context)
+	ReleaseMemory(ctx context.Context)
 }
 
 type NetworkOptions struct {
@@ -60,7 +50,7 @@ type NetworkOptions struct {
 }
 
 type InterfaceUpdateListener interface {
-	InterfaceUpdated()
+	InterfaceUpdated(ctx context.Context)
 }
 
 type WIFIState struct {
@@ -90,6 +80,7 @@ type NetworkInterface struct {
 	control.Interface
 	Type        C.InterfaceType
 	DNSServers  []string
+	Gateways    []netip.Addr
 	Expensive   bool
 	Constrained bool
 }
