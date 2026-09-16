@@ -11,7 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	"github.com/sagernet/sing/common/bufio"
+	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -34,12 +36,46 @@ const (
 var errUDPReplySocketCapacity = errors.New("UDP eBPF reply socket pool is at capacity")
 
 type udpClientTable struct {
-	clientShards [udpClientShardCount]udpClientShard
+	clientShards     [udpClientShardCount]udpClientShard
+	redirectAccess   sync.RWMutex
+	redirectSessions map[udpRedirectSessionKey]udpSessionKey
 }
 
 type udpClientShard struct {
 	access  sync.RWMutex
-	clients map[netip.AddrPort]*udpClientState
+	clients map[udpSessionKey]*udpClientState
+}
+
+type udpRedirectSessionKey struct {
+	client  netip.AddrPort
+	address netip.Addr
+}
+
+type udpSessionScope uint8
+
+const (
+	udpSessionScopeLocalCgroup udpSessionScope = iota + 1
+	udpSessionScopeLocalTC
+	udpSessionScopeSharedTC
+	udpSessionScopeSharedRewrite
+)
+
+// udpSessionKey keeps kernel identities which are stronger than the source
+// address in the userspace association key. Source alone is ambiguous for
+// SO_REUSEPORT sockets and when the same downstream address appears on more
+// than one ingress interface.
+type udpSessionKey struct {
+	Source         netip.AddrPort
+	Scope          udpSessionScope
+	SocketCookie   uint64
+	InterfaceIndex uint32
+}
+
+type udpNATContextKey struct{}
+
+func udpSessionKeyFromContext(ctx context.Context) (udpSessionKey, bool) {
+	key, loaded := ctx.Value(udpNATContextKey{}).(udpSessionKey)
+	return key, loaded
 }
 
 type udpClientState struct {
@@ -60,48 +96,55 @@ type udpRedirectBinding struct {
 	connected       bool
 }
 
-func (t *udpClientTable) load(client netip.AddrPort) (*udpClientState, bool) {
-	shard := t.clientShard(client)
+func (t *udpClientTable) load(key udpSessionKey) (*udpClientState, bool) {
+	shard := t.clientShard(key)
 	shard.access.RLock()
-	state, loaded := shard.clients[client]
+	state, loaded := shard.clients[key]
 	shard.access.RUnlock()
 	return state, loaded
 }
 
-func (t *udpClientTable) loadOrCreate(client netip.AddrPort) *udpClientState {
-	if state, loaded := t.load(client); loaded {
+func (t *udpClientTable) loadOrCreate(key udpSessionKey) *udpClientState {
+	if state, loaded := t.load(key); loaded {
 		return state
 	}
-	shard := t.clientShard(client)
+	shard := t.clientShard(key)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	if state, loaded := shard.clients[client]; loaded {
+	if state, loaded := shard.clients[key]; loaded {
 		return state
 	}
 	if shard.clients == nil {
-		shard.clients = make(map[netip.AddrPort]*udpClientState)
+		shard.clients = make(map[udpSessionKey]*udpClientState)
 	}
 	state := &udpClientState{
 		bindings:        make(map[netip.AddrPort]udpRedirectBinding),
 		cgroupOriginals: make(map[netip.Addr]commonEBPF.OriginalDestination),
 	}
-	shard.clients[client] = state
+	shard.clients[key] = state
 	return state
 }
 
-func (t *udpClientTable) cachedCgroupOriginal(client netip.AddrPort, redirectAddress netip.Addr) (commonEBPF.OriginalDestination, bool) {
-	state, loaded := t.load(client)
+func (t *udpClientTable) cachedCgroupOriginal(client netip.AddrPort, redirectAddress netip.Addr) (udpSessionKey, commonEBPF.OriginalDestination, bool) {
+	lookupKey := udpRedirectSessionKey{client: client, address: redirectAddress}
+	t.redirectAccess.RLock()
+	key, loaded := t.redirectSessions[lookupKey]
+	t.redirectAccess.RUnlock()
 	if !loaded {
-		return commonEBPF.OriginalDestination{}, false
+		return udpSessionKey{}, commonEBPF.OriginalDestination{}, false
+	}
+	state, loaded := t.load(key)
+	if !loaded {
+		return udpSessionKey{}, commonEBPF.OriginalDestination{}, false
 	}
 	state.access.RLock()
 	original, loaded := state.cgroupOriginals[redirectAddress]
 	state.access.RUnlock()
-	return original, loaded
+	return key, original, loaded
 }
 
-func (t *udpClientTable) setCgroupBinding(client netip.AddrPort, original commonEBPF.OriginalDestination, redirectAddress netip.Addr) {
-	state := t.loadOrCreate(client)
+func (t *udpClientTable) setCgroupBinding(key udpSessionKey, original commonEBPF.OriginalDestination, redirectAddress netip.Addr) {
+	state := t.loadOrCreate(key)
 	state.access.Lock()
 	state.cgroupOriginals[redirectAddress] = original
 	state.socketCookie = original.SocketCookie
@@ -112,13 +155,19 @@ func (t *udpClientTable) setCgroupBinding(client netip.AddrPort, original common
 		connected:       original.ConnectedUDP,
 	}
 	state.access.Unlock()
+	t.redirectAccess.Lock()
+	if t.redirectSessions == nil {
+		t.redirectSessions = make(map[udpRedirectSessionKey]udpSessionKey)
+	}
+	t.redirectSessions[udpRedirectSessionKey{client: key.Source, address: redirectAddress}] = key
+	t.redirectAccess.Unlock()
 }
 
-func (t *udpClientTable) setCgroupReplyBinding(client netip.AddrPort, expected *udpClientState, destination netip.AddrPort, redirectAddress netip.Addr) bool {
-	shard := t.clientShard(client)
+func (t *udpClientTable) setCgroupReplyBinding(key udpSessionKey, expected *udpClientState, destination netip.AddrPort, redirectAddress netip.Addr) bool {
+	shard := t.clientShard(key)
 	shard.access.RLock()
 	defer shard.access.RUnlock()
-	if shard.clients[client] != expected {
+	if shard.clients[key] != expected {
 		return false
 	}
 	expected.access.Lock()
@@ -134,11 +183,17 @@ func (t *udpClientTable) setCgroupReplyBinding(client netip.AddrPort, expected *
 		packetInfo:      sourcePacketInfo(redirectAddress),
 	}
 	expected.replyAliasCount++
+	t.redirectAccess.Lock()
+	if t.redirectSessions == nil {
+		t.redirectSessions = make(map[udpRedirectSessionKey]udpSessionKey)
+	}
+	t.redirectSessions[udpRedirectSessionKey{client: key.Source, address: redirectAddress}] = key
+	t.redirectAccess.Unlock()
 	return true
 }
 
-func (t *udpClientTable) clientShard(client netip.AddrPort) *udpClientShard {
-	return &t.clientShards[shardIndexForAddrPort(client, udpClientShardCount)]
+func (t *udpClientTable) clientShard(key udpSessionKey) *udpClientShard {
+	return &t.clientShards[shardIndexForAddrPort(key.Source, udpClientShardCount)]
 }
 
 // shardIndexForAddrPort distributes addr:port pairs across shardCount (a
@@ -201,12 +256,12 @@ func (t *udpClientTable) count() int {
 }
 
 func (t *udpClientTable) setDirectBinding(
-	client netip.AddrPort,
+	key udpSessionKey,
 	destination netip.AddrPort,
 	sourceMAC net.HardwareAddr,
 	socketCookie uint64,
 ) {
-	state := t.loadOrCreate(client)
+	state := t.loadOrCreate(key)
 	state.access.Lock()
 	defer state.access.Unlock()
 	if len(sourceMAC) > 0 {
@@ -217,14 +272,14 @@ func (t *udpClientTable) setDirectBinding(
 }
 
 func (t *udpClientTable) setDirectReplyBinding(
-	client netip.AddrPort,
+	key udpSessionKey,
 	expected *udpClientState,
 	destination netip.AddrPort,
 ) bool {
-	shard := t.clientShard(client)
+	shard := t.clientShard(key)
 	shard.access.RLock()
 	defer shard.access.RUnlock()
-	if shard.clients[client] != expected {
+	if shard.clients[key] != expected {
 		return false
 	}
 	expected.access.Lock()
@@ -243,14 +298,14 @@ func (t *udpClientTable) setDirectReplyBinding(
 	return true
 }
 
-func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState) []netip.Addr {
-	shard := t.clientShard(client)
+func (t *udpClientTable) delete(key udpSessionKey, expected *udpClientState) []netip.Addr {
+	shard := t.clientShard(key)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	if shard.clients[client] != expected {
+	if shard.clients[key] != expected {
 		return nil
 	}
-	delete(shard.clients, client)
+	delete(shard.clients, key)
 	expected.access.Lock()
 	redirects := make([]netip.Addr, 0, len(expected.cgroupOriginals))
 	for address := range expected.cgroupOriginals {
@@ -262,6 +317,14 @@ func (t *udpClientTable) delete(client netip.AddrPort, expected *udpClientState)
 	expected.cgroupDataPlane = false
 	expected.replyAliasCount = 0
 	expected.access.Unlock()
+	t.redirectAccess.Lock()
+	for _, address := range redirects {
+		lookupKey := udpRedirectSessionKey{client: key.Source, address: address}
+		if t.redirectSessions[lookupKey] == key {
+			delete(t.redirectSessions, lookupKey)
+		}
+	}
+	t.redirectAccess.Unlock()
 	return redirects
 }
 
@@ -312,6 +375,7 @@ type udpReplySocketShard struct {
 
 type udpReplySocketEntry struct {
 	conn     *net.UDPConn
+	writer   N.PacketBatchWriter
 	lastUsed atomic.Int64 // UnixNano, updated on every get()
 	inUse    atomic.Int32 // active senders; eviction skips entries > 0
 }
@@ -346,7 +410,7 @@ func (p *udpReplySocketPool) snapshot() udpReplySocketPoolSnapshot {
 func (p *udpReplySocketPool) get(
 	source netip.AddrPort,
 	create func(netip.AddrPort) (*net.UDPConn, error),
-) (*net.UDPConn, func(), error) {
+) (*udpReplySocketEntry, func(), error) {
 	if p.closed.Load() {
 		return nil, nil, net.ErrClosed
 	}
@@ -360,7 +424,7 @@ func (p *udpReplySocketPool) get(
 		entry.lastUsed.Store(time.Now().UnixNano())
 		entry.inUse.Add(1)
 		shard.access.Unlock()
-		return entry.conn, releaseUDPReplySocketEntry(entry), nil
+		return entry, releaseUDPReplySocketEntry(entry), nil
 	}
 	shard.access.Unlock()
 
@@ -377,7 +441,7 @@ func (p *udpReplySocketPool) get(
 		entry.lastUsed.Store(time.Now().UnixNano())
 		entry.inUse.Add(1)
 		shard.access.Unlock()
-		return entry.conn, releaseUDPReplySocketEntry(entry), nil
+		return entry, releaseUDPReplySocketEntry(entry), nil
 	}
 	shard.access.Unlock()
 	if p.stats.count.Load() >= p.socketCapacity() && !p.evictOldestIdle() {
@@ -388,7 +452,10 @@ func (p *udpReplySocketPool) get(
 	if err != nil {
 		return nil, nil, err
 	}
-	entry := &udpReplySocketEntry{conn: socket}
+	entry := &udpReplySocketEntry{
+		conn:   socket,
+		writer: bufio.NewPacketBatchWriter(bufio.NewPacketConn(socket)),
+	}
 	entry.lastUsed.Store(time.Now().UnixNano())
 	entry.inUse.Store(1)
 	if p.closed.Load() {
@@ -403,7 +470,7 @@ func (p *udpReplySocketPool) get(
 	shard.access.Unlock()
 	p.addCount(1)
 	p.requestSweep()
-	return socket, releaseUDPReplySocketEntry(entry), nil
+	return entry, releaseUDPReplySocketEntry(entry), nil
 }
 
 func (p *udpReplySocketPool) socketCapacity() int64 {

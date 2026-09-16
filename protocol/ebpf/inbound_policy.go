@@ -7,8 +7,8 @@ import (
 	"reflect"
 	"strings"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/x/list"
 )
@@ -246,7 +246,7 @@ func (i *Inbound) refreshBypassRuleSetsLocked(startup bool) error {
 //
 // This is a best-effort compensating rollback, not an atomic switch: each
 // backend's own UpdateCompiledBypassCIDR/SetBypassCIDRState call is already
-// crash-safe on its own (see common/ebpf's per-backend rollback-on-map-error
+// crash-safe on its own (see sing-ebpf's per-backend rollback-on-map-error
 // handling), so unwinding a partially-applied pass here just means calling
 // the same per-backend operation again with the previous policy, which each
 // backend computes its own diff against exactly as it would for any other
@@ -266,7 +266,7 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	// neither had yet succeeded -- confirmed state only advances on
 	// success, so it can lag behind an arbitrary number of distinct failed
 	// attempts, each of which still needs its own, distinguishable version.
-	// BypassCIDRPolicy's fields are unexported outside common/ebpf, but
+	// BypassCIDRPolicy's fields are unexported outside sing-ebpf, but
 	// reflect.DeepEqual compares them by value regardless of visibility
 	// (the same pattern the tests in inbound_policy_test.go already rely
 	// on).

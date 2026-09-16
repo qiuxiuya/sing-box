@@ -14,17 +14,11 @@ PREFIX ?= $(shell go env GOPATH)
 SING_FFI ?= sing-ffi
 LIBBOX_FFI_CONFIG ?= ./experimental/libbox/ffi.json
 
-.PHONY: test release docs build schema ebpf_generate ebpf_check
+.PHONY: test release docs build schema
 
 build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
-
-ebpf_generate:
-	$(MAKE) -C common/ebpf generate
-
-ebpf_check:
-	$(MAKE) -C common/ebpf check
 
 race:
 	export GOTOOLCHAIN=local && \

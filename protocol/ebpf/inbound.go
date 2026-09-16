@@ -9,16 +9,15 @@ import (
 	"sync"
 	"time"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
-	udpnat "github.com/sagernet/sing/common/udpnat2"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 )
@@ -47,6 +46,13 @@ type fakeIPRangeProvider interface {
 	FakeIPRanges() (netip.Prefix, netip.Prefix)
 }
 
+type processTrackerOwner interface {
+	LookupOwner(socketCookie uint64) (commonEBPF.ProcessSocketOwner, error)
+	ReleaseCleanup() bool
+	IsClosed() bool
+	Close() error
+}
+
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.EBPFInboundOptions](registry, C.TypeEBPF, NewInbound)
 }
@@ -61,17 +67,18 @@ type Inbound struct {
 	localDataPlane           string
 	cgroupPath               string
 	cgroupBackend            *commonEBPF.CgroupBackend
-	localRoutes              []*localRoute
+	localRoutes              *commonEBPF.LocalRouteSet
 	redirectIPv4Prefix       netip.Prefix
 	redirectIPv6Prefix       netip.Prefix
 	selfBypass               *commonEBPF.SelfBypass
 	selfBypassCgroup         bool
-	processTracker           *commonEBPF.ProcessTracker
+	processTracker           processTrackerOwner
+	processTrackerRollback   processTrackerOwner
 	processInfoCache         *processInfoCache
 	usePlatformProcessFinder bool
 	listeners                internalListenerSet
-	udpNat                   *udpnat.Service
-	tcDataPlane              *tcDataPlane
+	udpNat                   *udpNATService
+	tcDataPlane              tcRuntime
 	udpTimeout               time.Duration
 	enableTCP                bool
 	enableUDP                bool
@@ -342,7 +349,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
 	inbound.udpTimeout = udpTimeout
-	inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, false)
+	inbound.udpNat = newUDPNATService(inbound, inbound.preparePacketConnection, udpTimeout)
 	return inbound, nil
 }
 

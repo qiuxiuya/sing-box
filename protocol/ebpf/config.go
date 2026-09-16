@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -143,8 +143,9 @@ const (
 
 // normalizeFakeIPICMP parses the fakeip_icmp option. It does not know yet
 // whether a FakeIP prefix exists or which data planes are active — that
-// depends on state (the DNS transport manager's FakeIP store) normalizeFakeIPICMP
-// is not given, so those checks run later, in validateFakeIPICMP.
+// depends on state (the DNS transport manager's FakeIP store), which
+// normalizeFakeIPICMP is not given, so those checks run later in
+// validateFakeIPICMP.
 func normalizeFakeIPICMP(mode string) (bool, error) {
 	switch mode {
 	case "", fakeIPICMPOff:
@@ -164,11 +165,11 @@ func normalizeFakeIPICMP(mode string) (bool, error) {
 // 应在显式开启时返回配置或能力错误" asks for.
 //
 // Every path with a TC attachment can host the responder: local.data_plane=tc
-// and shared.data_plane=socket_assign both attach through commonEBPF.TCBackend
-// (see tc_fakeip_icmp.go and tc_dataplane.go), and shared.data_plane=packet_rewrite
-// attaches its own copy through commonEBPF.SharedNetworkBackend
-// (shared_rewrite_dataplane.go) -- both load the same underlying
-// FakeIPICMPBackend (fakeip_icmp_backend.go), just on their own interfaces.
+// and shared.data_plane=socket_assign both attach through commonEBPF.TCBackend,
+// while shared.data_plane=packet_rewrite attaches through
+// commonEBPF.SharedPacketRewriteBackend. Both library backends receive the
+// resolved FakeIP ranges only as generic force-intercept prefixes and attach
+// their own ICMP Echo Reply object to the corresponding interfaces.
 // Only local.data_plane=cgroup has no attachment at all to answer from: its
 // connect()/sendmsg() hooks rewrite a destination before a packet is ever
 // built, so there is nothing there that could see or answer an ICMP request.

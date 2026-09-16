@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/log"
 
 	"github.com/spf13/cobra"
@@ -67,7 +67,7 @@ func runEBPFStatus() error {
 		Network:             commandEBPFStatusNetwork,
 		InterfaceNames:      interfaceNames,
 		EnableIPv6:          commandEBPFStatusIPv6,
-		FakeIPICMPReply:     commandEBPFStatusFakeIPICMP,
+		ICMPEchoReply:       commandEBPFStatusFakeIPICMP,
 		NeedProcessTracking: commandEBPFStatusProcess,
 		VerifyObjectLoad:    true,
 	})

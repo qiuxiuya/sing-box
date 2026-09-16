@@ -9,11 +9,10 @@ import (
 	"sync"
 	"time"
 
-	ECommon "github.com/sagernet/sing-box/common/ebpf"
+	ECommon "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
-	udpnat "github.com/sagernet/sing/common/udpnat2"
 )
 
 const (
@@ -29,27 +28,25 @@ const (
 type sharedRewrite struct {
 	inbound              *Inbound
 	interfaces           []string
-	sharedBackend        *ECommon.SharedNetworkBackend
-	dataPlane            *sharedRewriteDataPlane
+	dataPlane            sharedKernelRuntime
 	listeners            internalListenerSet
-	udpNat               *udpnat.Service
+	udpNat               *udpNATService
 	sharedUDPClientTable sharedUDPClientTable
 	udpWarnings          udpWarningLimiters
 	tcpWarnings          warningLimiter
-	mapCapacity          ECommon.SharedNetworkMapCapacities
+	mapCapacity          ECommon.SharedPacketRewriteMapCapacity
 	janitorWarnings      warningLimiter
 	janitorAccess        sync.Mutex
 	janitorCancel        context.CancelFunc
 	janitorDone          chan struct{}
 	tcPriority           uint16
 	lifecycleAccess      sync.RWMutex
-	backendAccess        sync.RWMutex
 	dataPlaneAccess      sync.RWMutex
 }
 
 func newSharedRewrite(inbound *Inbound, options option.EBPFSharedOptions) *sharedRewrite {
-	mapCapacity := effectiveSharedNetworkMapCapacity(
-		ECommon.DefaultSharedNetworkMapCapacities(),
+	mapCapacity := effectiveSharedPacketRewriteMapCapacity(
+		ECommon.DefaultSharedPacketRewriteMapCapacity(),
 		len(inbound.bypassRuleSet) > 0 ||
 			len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 			len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0,
@@ -60,14 +57,14 @@ func newSharedRewrite(inbound *Inbound, options option.EBPFSharedOptions) *share
 		mapCapacity: mapCapacity,
 		tcPriority:  inbound.tcPriority,
 	}
-	shared.udpNat = udpnat.New(shared, shared.preparePacketConnection, inbound.udpTimeout, false)
+	shared.udpNat = newUDPNATService(shared, shared.preparePacketConnection, inbound.udpTimeout)
 	return shared
 }
 
-func effectiveSharedNetworkMapCapacity(
-	capacity ECommon.SharedNetworkMapCapacities,
+func effectiveSharedPacketRewriteMapCapacity(
+	capacity ECommon.SharedPacketRewriteMapCapacity,
 	bypassFlowCache bool,
-) ECommon.SharedNetworkMapCapacities {
+) ECommon.SharedPacketRewriteMapCapacity {
 	if !bypassFlowCache {
 		capacity.Bypass = 1
 	}
@@ -78,9 +75,9 @@ func (s *sharedRewrite) Start(interfaceNames []string, hostAddresses []netip.Add
 	if err := s.startListeners(); err != nil {
 		return E.Errors(err, s.closeListeners())
 	}
-	dataPlane := newSharedRewriteDataPlane(s, s.tcPriority)
+	dataPlane := newSharedKernelRuntime(s.kernelRuntimeHooks(), s.tcPriority)
 	s.setDataPlane(dataPlane)
-	if err := dataPlane.reconcile(interfaceNames, hostAddresses); err != nil {
+	if err := dataPlane.Reconcile(interfaceNames, hostAddresses); err != nil {
 		return E.Errors(err, s.Close())
 	}
 	if s.sharedBackendInstance() == nil {
@@ -92,22 +89,22 @@ func (s *sharedRewrite) Start(interfaceNames []string, hostAddresses []netip.Add
 	return nil
 }
 
-func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) {
+func (s *sharedRewrite) prepareBackend() (*ECommon.SharedPacketRewriteBackend, error) {
 	redirectIPv6 := netip.Prefix{}
 	if s.inbound.sharedRewriteIPv6Enabled() {
 		redirectIPv6 = s.inbound.redirectIPv6Prefix
 	}
 	cgroupBackend := s.inbound.cgroupBackendInstance()
-	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
-		ListenerPort:    s.listeners.selectedPort(),
-		EnableTCP:       s.inbound.enableTCP,
-		EnableUDP:       s.inbound.enableUDP,
-		RedirectIPv4:    s.inbound.redirectIPv4Prefix,
-		RedirectIPv6:    redirectIPv6,
-		Policy:          s.inbound.compiledPolicy,
-		MapCapacity:     s.mapCapacity,
-		UDPTimeout:      s.inbound.udpTimeout,
-		FakeIPICMPReply: s.inbound.fakeIPICMPReply,
+	backend, err := ECommon.PrepareSharedPacketRewrite(cgroupBackend, ECommon.SharedPacketRewriteConfig{
+		ListenerPort:  s.listeners.selectedPort(),
+		EnableTCP:     s.inbound.enableTCP,
+		EnableUDP:     s.inbound.enableUDP,
+		RedirectIPv4:  s.inbound.redirectIPv4Prefix,
+		RedirectIPv6:  redirectIPv6,
+		Policy:        s.inbound.compiledPolicy,
+		MapCapacity:   s.mapCapacity,
+		UDPTimeout:    s.inbound.udpTimeout,
+		ICMPEchoReply: s.inbound.fakeIPICMPReply,
 	})
 	if err != nil {
 		return nil, err
@@ -119,9 +116,6 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) 
 	} else {
 		_, err = backend.UpdateCompiledBypassCIDR(s.inbound.bypassRuleSetPolicy)
 	}
-	if err == nil {
-		s.setSharedBackend(backend)
-	}
 	s.inbound.bypassRuleSetAccess.Unlock()
 	if err != nil {
 		return nil, E.Errors(err, backend.Close())
@@ -129,7 +123,13 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedNetworkBackend, error) 
 	return backend, nil
 }
 
-func (s *sharedRewrite) sharedRewriteReadyLocked(attachments []string) {
+func (s *sharedRewrite) sharedRewriteReady(attachments []string) {
+	s.lifecycleAccess.RLock()
+	defer s.lifecycleAccess.RUnlock()
+	dataPlane := s.dataPlaneInstance()
+	if dataPlane == nil || !dataPlane.IsEnabled() {
+		return
+	}
 	s.startFlowJanitor()
 	s.inbound.logger.Debug(
 		"eBPF shared packet-rewrite active: attachments=[", strings.Join(attachments, ", "), "]",
@@ -164,25 +164,20 @@ func (s *sharedRewrite) Close() error {
 	}
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
+	s.stopFlowJanitor()
 	var closeErr error
 	if dataPlane := s.takeDataPlane(); dataPlane != nil {
 		closeErr = dataPlane.Close()
-	}
-	s.stopFlowJanitor()
-	backend := s.takeSharedBackend()
-	var backendErr error
-	if backend != nil {
-		backendErr = backend.Close()
-		if !backend.IsClosed() {
-			s.setSharedBackend(backend)
-			if backendErr == nil {
-				backendErr = E.New("shared-network eBPF backend remained open after close")
+		if !dataPlane.IsClosed() {
+			s.setDataPlane(dataPlane)
+			if closeErr == nil {
+				closeErr = E.New("shared packet-rewrite runtime remained open after close")
 			}
 		}
 	}
 	listenerErr := s.closeListeners()
 	s.udpNat.Purge()
-	return E.Errors(closeErr, backendErr, listenerErr)
+	return E.Errors(closeErr, listenerErr)
 }
 
 func (s *sharedRewrite) closeListeners() error {
@@ -195,30 +190,28 @@ func (s *sharedRewrite) IsClosed() bool {
 	}
 	s.lifecycleAccess.RLock()
 	defer s.lifecycleAccess.RUnlock()
-	return s.dataPlaneInstance() == nil && s.sharedBackendInstance() == nil && s.listeners.isClosed()
+	return s.dataPlaneInstance() == nil && s.listeners.isClosed()
 }
 
-// dataPlaneInstance, setDataPlane, and takeDataPlane guard s.dataPlane the
-// same way backendAccess guards s.sharedBackend above: Diagnostics, the
-// interface-monitor update loop, and the flow janitor goroutine all read
-// this field with no relationship to Close's own lifecycleAccess lock,
-// which only ever protected the write -- confirmed racing with go test
-// -race. dataPlaneInstance's returned *sharedRewriteDataPlane is itself
-// nil-receiver-safe on every method a caller would call on it, so callers
-// do not need their own nil check before using the result.
-func (s *sharedRewrite) dataPlaneInstance() *sharedRewriteDataPlane {
+// dataPlaneInstance, setDataPlane, and takeDataPlane guard s.dataPlane:
+// Diagnostics, the interface-monitor update loop, and the flow janitor
+// goroutine all read this field with no relationship to Close's own
+// lifecycleAccess lock. The returned interface must be checked for nil before
+// use; concrete implementations may not support nil receivers after this
+// runtime moves.
+func (s *sharedRewrite) dataPlaneInstance() sharedKernelRuntime {
 	s.dataPlaneAccess.RLock()
 	defer s.dataPlaneAccess.RUnlock()
 	return s.dataPlane
 }
 
-func (s *sharedRewrite) setDataPlane(dataPlane *sharedRewriteDataPlane) {
+func (s *sharedRewrite) setDataPlane(dataPlane sharedKernelRuntime) {
 	s.dataPlaneAccess.Lock()
 	s.dataPlane = dataPlane
 	s.dataPlaneAccess.Unlock()
 }
 
-func (s *sharedRewrite) takeDataPlane() *sharedRewriteDataPlane {
+func (s *sharedRewrite) takeDataPlane() sharedKernelRuntime {
 	s.dataPlaneAccess.Lock()
 	dataPlane := s.dataPlane
 	s.dataPlane = nil
@@ -226,24 +219,12 @@ func (s *sharedRewrite) takeDataPlane() *sharedRewriteDataPlane {
 	return dataPlane
 }
 
-func (s *sharedRewrite) sharedBackendInstance() *ECommon.SharedNetworkBackend {
-	s.backendAccess.RLock()
-	defer s.backendAccess.RUnlock()
-	return s.sharedBackend
-}
-
-func (s *sharedRewrite) takeSharedBackend() *ECommon.SharedNetworkBackend {
-	s.backendAccess.Lock()
-	backend := s.sharedBackend
-	s.sharedBackend = nil
-	s.backendAccess.Unlock()
-	return backend
-}
-
-func (s *sharedRewrite) setSharedBackend(backend *ECommon.SharedNetworkBackend) {
-	s.backendAccess.Lock()
-	s.sharedBackend = backend
-	s.backendAccess.Unlock()
+func (s *sharedRewrite) sharedBackendInstance() *ECommon.SharedPacketRewriteBackend {
+	dataPlane := s.dataPlaneInstance()
+	if dataPlane == nil {
+		return nil
+	}
+	return dataPlane.Backend()
 }
 
 func (s *sharedRewrite) startFlowJanitor() {
@@ -278,7 +259,7 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	defer close(done)
 	var releaseTimer *time.Timer
 	var releaseTimerChannel <-chan time.Time
-	resetReleaseTimer := func(backend *ECommon.SharedNetworkBackend) {
+	resetReleaseTimer := func(backend *ECommon.SharedPacketRewriteBackend) {
 		delay, available := backend.NextTCPFlowReleaseDelay(time.Now())
 		if !available {
 			if releaseTimer != nil {
@@ -341,7 +322,8 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			resetReleaseTimer(backend)
 			continue
 		}
-		if !s.dataPlaneInstance().isEnabled() {
+		dataPlane := s.dataPlaneInstance()
+		if dataPlane == nil || !dataPlane.IsEnabled() {
 			pressure = false
 			knownPressure = false
 			belowExitRounds = 0

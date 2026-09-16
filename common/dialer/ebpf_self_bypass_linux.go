@@ -5,8 +5,8 @@ package dialer
 import (
 	"syscall"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/control"

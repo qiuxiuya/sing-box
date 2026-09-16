@@ -110,6 +110,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	})
 
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	usePlatformInterface := platformInterface != nil && platformInterface.UsePlatformInterface()
 	if options.NetNs != "" && !C.IsLinux {
 		return nil, E.New("`netns` is only supported on Linux")
 	}
@@ -129,14 +130,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 	}
 	var enableGSO bool
-	if C.IsLinux && platformInterface == nil {
+	if C.IsLinux && !usePlatformInterface {
 		switch options.Stack {
 		case "", "go", "gvisor":
 			enableGSO = tunMTU < 49152
 		}
 	}
 	if options.MultiQueue {
-		if !C.IsLinux || platformInterface != nil {
+		if !C.IsLinux || usePlatformInterface {
 			return nil, E.New("`multi_queue` is only supported on Linux")
 		}
 		switch options.Stack {
@@ -278,6 +279,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.tunOptions.AutoRedirectMarkMode = !disableMarkMode
 		usePlatformAutoRedirect := platformInterface != nil && platformInterface.UsePlatformAutoRedirect()
+		inbound.platformOptions.AndroidVPNRouteBypass = C.IsAndroid && usePlatformAutoRedirect &&
+			(len(inbound.routeRuleSet) > 0 || len(inbound.routeExcludeRuleSet) > 0)
 		if usePlatformAutoRedirect {
 			inbound.autoRedirect, err = newPlatformAutoRedirect(inbound)
 		} else {

@@ -5,7 +5,7 @@ package route
 import (
 	"sync/atomic"
 
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 

@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	commonEBPF "github.com/sagernet/sing-box/common/ebpf"
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
