@@ -34,13 +34,15 @@ var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
 
 type Outbound struct {
 	outbound.Adapter
-	dialer       tls.Dialer
-	server       M.Socksaddr
-	tlsConfig    tls.Config
-	client       *anytls.Client
-	uotClient    *uot.Client
-	disableReuse bool
-	logger       log.ContextLogger
+	ctx           context.Context
+	dialer        tls.Dialer
+	server        M.Socksaddr
+	tlsConfig     tls.Config
+	clientOptions anytls.ClientConfig
+	client        *anytls.Client
+	uotClient     *uot.Client
+	disableReuse  bool
+	logger        log.ContextLogger
 }
 
 var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
@@ -48,6 +50,7 @@ var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSOutboundOptions) (adapter.Outbound, error) {
 	outbound := &Outbound{
 		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeAnyTLS, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		ctx:          ctx,
 		server:       options.ServerOptions.Build(),
 		disableReuse: options.DisableReuse,
 		logger:       logger,
@@ -73,7 +76,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	outbound.dialer = tls.NewDialer(outboundDialer, tlsConfig)
 
-	client, err := anytls.NewClient(ctx, anytls.ClientConfig{
+	outbound.clientOptions = anytls.ClientConfig{
 		Password:                 options.Password,
 		ClientMetadata:           clientMetadataOrDefault(options.ClientMetadata),
 		IdleSessionCheckInterval: options.IdleSessionCheckInterval.Build(),
@@ -82,17 +85,24 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		DisableReuse:             options.DisableReuse,
 		DialOut:                  outbound.dialOut,
 		Logger:                   logger,
-	})
-	if err != nil {
-		return nil, err
-	}
-	outbound.client = client
-
-	outbound.uotClient = &uot.Client{
-		Dialer:  (anytlsDialer)(client.CreateProxy),
-		Version: uot.Version,
 	}
 	return outbound, nil
+}
+
+func (h *Outbound) Start(stage adapter.StartStage) error {
+	if stage != adapter.StartStateInitialize {
+		return nil
+	}
+	client, err := anytls.NewClient(h.ctx, h.clientOptions)
+	if err != nil {
+		return err
+	}
+	h.client = client
+	h.uotClient = &uot.Client{
+		Dialer:  anytlsDialer(client.CreateProxy),
+		Version: uot.Version,
+	}
+	return nil
 }
 
 func clientMetadataOrDefault(clientMetadata *string) string {
@@ -143,12 +153,12 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return h.uotClient.ListenPacket(ctx, destination)
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) InterfaceUpdated(context.Context) {
 	if h.client != nil {
 		h.client.Reset()
 	}
 }
 
 func (h *Outbound) Close() error {
-	return common.Close(h.client)
+	return common.Close(common.PtrOrNil(h.client))
 }

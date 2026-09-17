@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -17,6 +18,7 @@ import (
 type DNSRouter interface {
 	Lifecycle
 	Exchange(ctx context.Context, message *dns.Msg, options DNSQueryOptions) (*dns.Msg, error)
+	ExchangeAsync(ctx context.Context, message *dns.Msg, options DNSQueryOptions, callback func(response *dns.Msg, err error))
 	Lookup(ctx context.Context, domain string, options DNSQueryOptions) ([]netip.Addr, error)
 	ClearCache()
 	LookupReverseMapping(ip netip.Addr) (string, bool)
@@ -27,38 +29,41 @@ type DNSRouter interface {
 
 type DNSClient interface {
 	Start()
-	Exchange(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) (*dns.Msg, error, bool)
-	Lookup(ctx context.Context, transport DNSTransport, domain string, options DNSQueryOptions, responseChecker func(responseAddrs []netip.Addr) bool) ([]netip.Addr, error, bool)
+	Exchange(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error)
+	ExchangeAsync(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error))
+	Lookup(ctx context.Context, transport DNSTransport, domain string, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool) ([]netip.Addr, error)
 	ClearCache()
-	UpdateDnsCacheFromContext(ctx context.Context) bool
-	UpdateDnsCacheToContext(ctx context.Context) context.Context
 }
 
 type DNSQueryOptions struct {
-	Transport      DNSTransport
-	Strategy       C.DomainStrategy
-	LookupStrategy C.DomainStrategy
-	DisableCache   bool
-	RewriteTTL     *uint32
-	ClientSubnet   netip.Prefix
-	LazyCacheTTL   *uint32
+	Transport              DNSTransport
+	Strategy               C.DomainStrategy
+	LookupStrategy         C.DomainStrategy
+	DisableCache           bool
+	DisableOptimisticCache bool
+	RewriteTTL             *uint32
+	Timeout                time.Duration
+	ClientSubnet           netip.Prefix
+	RemoveClientSubnet     bool
 }
 
-func DNSQueryOptionsFrom(ctx context.Context, options *option.DomainResolveOptions) (*DNSQueryOptions, error) {
-	if options == nil {
-		return &DNSQueryOptions{}, nil
+func DNSQueryOptionsFrom(ctx context.Context, options *option.DomainResolveOptions) (DNSQueryOptions, error) {
+	if options == nil || options.Server == "" {
+		return DNSQueryOptions{}, nil
 	}
 	transportManager := service.FromContext[DNSTransportManager](ctx)
 	transport, loaded := transportManager.Transport(options.Server)
 	if !loaded {
-		return nil, E.New("domain resolver not found: " + options.Server)
+		return DNSQueryOptions{}, E.New("domain resolver not found: " + options.Server)
 	}
-	return &DNSQueryOptions{
-		Transport:    transport,
-		Strategy:     C.DomainStrategy(options.Strategy),
-		DisableCache: options.DisableCache,
-		RewriteTTL:   options.RewriteTTL,
-		ClientSubnet: options.ClientSubnet.Build(netip.Prefix{}),
+	return DNSQueryOptions{
+		Transport:              transport,
+		Strategy:               C.DomainStrategy(options.Strategy),
+		DisableCache:           options.DisableCache,
+		DisableOptimisticCache: options.DisableOptimisticCache,
+		RewriteTTL:             options.RewriteTTL,
+		Timeout:                time.Duration(options.Timeout),
+		ClientSubnet:           options.ClientSubnet.Build(netip.Prefix{}),
 	}, nil
 }
 
@@ -68,17 +73,12 @@ type RDRCStore interface {
 	SaveRDRCAsync(transportName string, qName string, qType uint16, logger logger.Logger)
 }
 
-type DNSCacheKey struct {
-	TransportName string
-	QuestionName  string
-	QType         uint16
-	ClientSubnet  netip.Prefix
-}
-
-type RDRCStoreWithKey interface {
-	LoadRDRCWithKey(key DNSCacheKey) (rejected bool)
-	SaveRDRCWithKey(key DNSCacheKey) error
-	SaveRDRCAsyncWithKey(key DNSCacheKey, logger logger.Logger)
+type DNSCacheStore interface {
+	LoadDNSCache(transportName string, qName string, qType uint16) (rawMessage []byte, expireAt time.Time, loaded bool)
+	SaveDNSCache(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time) error
+	SaveDNSCacheAsync(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time, logger logger.Logger)
+	DeleteDNSCache(transportName string, qName string, qType uint16, rawMessage []byte)
+	ClearDNSCache() error
 }
 
 type DNSTransport interface {
@@ -90,11 +90,17 @@ type DNSTransport interface {
 	// Exchanges that are currently using those connections may fail.
 	Reset()
 	Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg, error)
+	ExchangeAsync(ctx context.Context, message *dns.Msg, callback func(response *dns.Msg, err error))
 }
 
-type LegacyDNSTransport interface {
-	LegacyStrategy() C.DomainStrategy
-	LegacyClientSubnet() netip.Prefix
+type DNSTransportWithPreferredDomain interface {
+	DNSTransport
+	PreferredDomain(domain string) bool
+}
+
+type DNSTransportWithEnvironment interface {
+	DNSTransport
+	Environment() []string
 }
 
 type DNSTransportRegistry interface {

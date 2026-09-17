@@ -2,59 +2,61 @@ package dns
 
 import (
 	"net/netip"
+	"slices"
+
+	"github.com/sagernet/sing/common"
 
 	"github.com/miekg/dns"
 )
 
-func extractClientSubnet(message *dns.Msg) (netip.Prefix, bool) {
+func SetClientSubnet(message *dns.Msg, clientSubnet netip.Prefix) *dns.Msg {
+	return setClientSubnet(message, clientSubnet, true)
+}
+
+func clientSubnetFromMessage(message *dns.Msg) netip.Prefix {
 	for _, record := range message.Extra {
-		optRecord, isOPT := record.(*dns.OPT)
-		if !isOPT {
+		optRecord, isOPTRecord := record.(*dns.OPT)
+		if !isOPTRecord {
 			continue
 		}
 		for _, option := range optRecord.Option {
-			subnetOption, isSubnet := option.(*dns.EDNS0_SUBNET)
-			if !isSubnet {
+			subnetOption, isEDNS0Subnet := option.(*dns.EDNS0_SUBNET)
+			if !isEDNS0Subnet {
 				continue
 			}
-			return clientSubnetFromOption(subnetOption)
+			address, addressLoaded := netip.AddrFromSlice(subnetOption.Address)
+			if !addressLoaded {
+				return netip.Prefix{}
+			}
+			return netip.PrefixFrom(address.Unmap(), int(subnetOption.SourceNetmask))
 		}
 	}
-	return netip.Prefix{}, false
+	return netip.Prefix{}
 }
 
-func clientSubnetFromOption(option *dns.EDNS0_SUBNET) (netip.Prefix, bool) {
-	if option.SourceScope != 0 {
-		return netip.Prefix{}, false
+func removeClientSubnet(message *dns.Msg) *dns.Msg {
+	if !slices.ContainsFunc(message.Extra, func(record dns.RR) bool {
+		optRecord, isOPTRecord := record.(*dns.OPT)
+		if !isOPTRecord {
+			return false
+		}
+		return slices.ContainsFunc(optRecord.Option, func(option dns.EDNS0) bool {
+			return option.Option() == dns.EDNS0SUBNET
+		})
+	}) {
+		return message
 	}
-	var address netip.Addr
-	switch option.Family {
-	case 1:
-		if option.SourceNetmask > 32 {
-			return netip.Prefix{}, false
+	message = message.Copy()
+	for _, record := range message.Extra {
+		optRecord, isOPTRecord := record.(*dns.OPT)
+		if !isOPTRecord {
+			continue
 		}
-		addressBytes := option.Address.To4()
-		if len(addressBytes) != 4 {
-			return netip.Prefix{}, false
-		}
-		address = netip.AddrFrom4([4]byte(addressBytes))
-	case 2:
-		if option.SourceNetmask > 128 {
-			return netip.Prefix{}, false
-		}
-		var addressValid bool
-		address, addressValid = netip.AddrFromSlice(option.Address)
-		if !addressValid || address.Is4() {
-			return netip.Prefix{}, false
-		}
-	default:
-		return netip.Prefix{}, false
+		optRecord.Option = common.Filter(optRecord.Option, func(option dns.EDNS0) bool {
+			return option.Option() != dns.EDNS0SUBNET
+		})
 	}
-	return netip.PrefixFrom(address, int(option.SourceNetmask)).Masked(), true
-}
-
-func SetClientSubnet(message *dns.Msg, clientSubnet netip.Prefix) *dns.Msg {
-	return setClientSubnet(message, clientSubnet, true)
+	return message
 }
 
 func setClientSubnet(message *dns.Msg, clientSubnet netip.Prefix, clone bool) *dns.Msg {

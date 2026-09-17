@@ -1,36 +1,12 @@
 package group
 
 import (
-	"context"
 	"regexp"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
-	U "github.com/sagernet/sing-box/common/urltest"
-	C "github.com/sagernet/sing-box/constant"
 	E "github.com/sagernet/sing/common/exceptions"
 )
-
-type outboundURLTestResult struct {
-	delay uint16
-	err   error
-}
-
-func urlTestOutbound(ctx context.Context, link string, outbound adapter.Outbound) (uint16, error) {
-	testCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
-	defer cancel()
-	result := make(chan outboundURLTestResult, 1)
-	go func() {
-		delay, err := U.URLTest(testCtx, link, outbound)
-		result <- outboundURLTestResult{delay, err}
-	}()
-	select {
-	case testResult := <-result:
-		return testResult.delay, testResult.err
-	case <-testCtx.Done():
-		return 0, testCtx.Err()
-	}
-}
 
 type providerUpdateCheckScheduler struct {
 	access  sync.Mutex

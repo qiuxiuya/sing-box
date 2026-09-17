@@ -27,6 +27,7 @@ var _ ServerConfigCompat = (*RealityServerConfig)(nil)
 
 type RealityServerConfig struct {
 	config           *utls.RealityConfig
+	handshakeTimeout time.Duration
 	rejectUnknownSNI bool
 }
 
@@ -36,6 +37,10 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 	if options.ServerName != "" && len(options.ServerNames) > 0 {
 		return nil, E.New("server_name and server_names cannot be configured at the same time")
 	}
+	if options.CertificateProvider != nil {
+		return nil, E.New("certificate_provider is unavailable in reality")
+	}
+	//nolint:staticcheck
 	if options.ACME != nil && len(options.ACME.Domain) > 0 {
 		return nil, E.New("acme is unavailable in reality")
 	}
@@ -138,7 +143,17 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 	if options.ECH != nil && options.ECH.Enabled {
 		return nil, E.New("Reality is conflict with ECH")
 	}
-	var config ServerConfig = &RealityServerConfig{&tlsConfig, options.RejectUnknownSNI}
+	var handshakeTimeout time.Duration
+	if options.HandshakeTimeout > 0 {
+		handshakeTimeout = options.HandshakeTimeout.Build()
+	} else {
+		handshakeTimeout = C.TCPTimeout
+	}
+	var config ServerConfig = &RealityServerConfig{
+		config:           &tlsConfig,
+		handshakeTimeout: handshakeTimeout,
+		rejectUnknownSNI: options.RejectUnknownSNI,
+	}
 	if options.KernelTx || options.KernelRx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -167,6 +182,14 @@ func (c *RealityServerConfig) NextProtos() []string {
 
 func (c *RealityServerConfig) SetNextProtos(nextProto []string) {
 	c.config.NextProtos = nextProto
+}
+
+func (c *RealityServerConfig) HandshakeTimeout() time.Duration {
+	return c.handshakeTimeout
+}
+
+func (c *RealityServerConfig) SetHandshakeTimeout(timeout time.Duration) {
+	c.handshakeTimeout = timeout
 }
 
 func (c *RealityServerConfig) STDConfig() (*tls.Config, error) {
@@ -211,7 +234,8 @@ func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn
 
 func (c *RealityServerConfig) Clone() Config {
 	return &RealityServerConfig{
-		config: c.config.Clone(),
+		config:           c.config.Clone(),
+		handshakeTimeout: c.handshakeTimeout,
 	}
 }
 

@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"io"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -133,7 +132,7 @@ func (s *ProviderLocal) UpdatedAt() time.Time {
 func (s *ProviderLocal) reloadFile(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	file, err := filemanager.OpenFile(s.ctx, path, os.O_RDONLY, 0)
+	file, err := filemanager.Open(s.ctx, path)
 	if err != nil {
 		return err
 	}

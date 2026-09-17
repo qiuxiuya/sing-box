@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"context"
 	"testing"
 
 	"github.com/anytls/sing-anytls/util"
@@ -8,7 +9,7 @@ import (
 )
 
 func TestInterfaceUpdated(t *testing.T) {
-	require.NotPanics(t, (&Outbound{}).InterfaceUpdated)
+	require.NotPanics(t, func() { (&Outbound{}).InterfaceUpdated(context.Background()) })
 }
 
 func TestClientMetadataOrDefault(t *testing.T) {

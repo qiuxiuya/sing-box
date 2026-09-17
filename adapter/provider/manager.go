@@ -50,7 +50,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	providers := m.providers
 	m.access.Unlock()
 	if stage == adapter.StartStateStart && len(providers) > 0 {
-		startContext := adapter.NewHTTPStartContext(m.ctx)
+		startContext := adapter.NewHTTPStartContext()
 		defer startContext.Close()
 		for _, provider := range providers {
 			if contextStarter, ok := provider.(interface {
@@ -143,7 +143,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 			if contextStarter, ok := provider.(interface {
 				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
 			}); ok {
-				err = contextStarter.StartContext(m.ctx, nil)
+				startContext := adapter.NewHTTPStartContext()
+				err = contextStarter.StartContext(m.ctx, startContext)
+				startContext.Close()
 				if err != nil {
 					return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
 				}

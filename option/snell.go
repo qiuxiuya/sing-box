@@ -1,6 +1,9 @@
 package option
 
 import (
+	"reflect"
+
+	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -104,7 +107,16 @@ func (o SnellInboundOptions) MarshalJSON() ([]byte, error) {
 	default:
 		return nil, E.New("snell: unsupported version: ", o.Version)
 	}
-	return badjson.MarshallObjects((_SnellInboundOptions)(o), versionOptions)
+	return badjson.MarshallObjects(_SnellInboundOptions(o), versionOptions)
+}
+
+func (o SnellInboundOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return schema.DiscriminatedUnion(builder, "version", true, []schema.UnionVariant{
+		{Value: 5, StructType: reflect.TypeFor[SnellObfsServerOptions]()},
+		{Value: 6, StructType: reflect.TypeFor[SnellV6Options]()},
+	}, func(variant *schema.Node) error {
+		return builder.FlattenStruct(variant, reflect.TypeFor[AbstractSnellInboundOptions]())
+	})
 }
 
 type _SnellOutboundOptions struct {
@@ -156,7 +168,25 @@ func (o SnellOutboundOptions) MarshalJSON() ([]byte, error) {
 	default:
 		return nil, E.New("snell: unsupported version: ", o.Version)
 	}
-	return badjson.MarshallObjects((_SnellOutboundOptions)(o), versionOptions)
+	return badjson.MarshallObjects(_SnellOutboundOptions(o), versionOptions)
+}
+
+func (o SnellOutboundOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	buildBase := func(variant *schema.Node) error {
+		return builder.FlattenStruct(variant, reflect.TypeFor[AbstractSnellOutboundOptions]())
+	}
+	union, err := schema.DiscriminatedUnion(builder, "version", true, []schema.UnionVariant{
+		{Value: 1, StructType: reflect.TypeFor[SnellObfsClientOptions]()},
+		{Value: 2, StructType: reflect.TypeFor[SnellObfsClientOptions]()},
+		{Value: 3, StructType: reflect.TypeFor[SnellObfsClientOptions]()},
+		{Value: 4, StructType: reflect.TypeFor[SnellObfsClientModernOptions]()},
+		{Value: 5, StructType: reflect.TypeFor[SnellObfsClientModernOptions]()},
+		{Value: 6, StructType: reflect.TypeFor[SnellV6OutboundOptions]()},
+	}, buildBase)
+	if err != nil {
+		return nil, err
+	}
+	return union, nil
 }
 
 type SnellObfsServerOptions struct {
@@ -170,6 +200,23 @@ type SnellUser struct {
 
 	userKeyConfigured bool
 	pskConfigured     bool
+}
+
+type snellUserSchema struct {
+	Name    string `json:"name,omitempty"`
+	UserKey string `json:"userkey,omitempty"`
+	PSK     string `json:"psk,omitempty"`
+}
+
+func (u SnellUser) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("SnellUser", func() (*schema.Node, error) {
+		node := schema.StrictObject()
+		err := builder.FlattenStruct(node, reflect.TypeFor[snellUserSchema]())
+		if err != nil {
+			return nil, err
+		}
+		return node, nil
+	})
 }
 
 func (u *SnellUser) UnmarshalJSON(content []byte) error {

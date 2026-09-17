@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"regexp"
@@ -17,9 +18,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -36,7 +35,10 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 	outbound.Register[option.LoadBalanceOutboundOptions](registry, C.TypeLoadBalance, NewLoadBalance)
 }
 
-var _ adapter.OutboundGroup = (*LoadBalance)(nil)
+var (
+	_ adapter.PreMatchOutboundGroup   = (*LoadBalance)(nil)
+	_ adapter.InterfaceUpdateListener = (*LoadBalance)(nil)
+)
 
 const (
 	StrategyRoundRobin        = "round-robin"
@@ -147,6 +149,7 @@ func (s *LoadBalance) Start() error {
 	if err != nil {
 		return err
 	}
+	group.tag = s.Tag()
 	s.group = group
 	for _, providerTag := range s.providerTags {
 		s.providers[providerTag].RegisterCallback(s.onProviderUpdated)
@@ -177,12 +180,40 @@ func (s *LoadBalance) All() []string {
 	return all
 }
 
+func (s *LoadBalance) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
+	s.group.Touch()
+	var (
+		preMatchOutbound adapter.Outbound
+		preMatchAction   adapter.PreMatchAction
+	)
+	s.group.UnwrapPreMatch(metadata, func(outbound adapter.Outbound) bool {
+		preMatchOutbound, preMatchAction = selectOutbound(outbound)
+		return preMatchOutbound != nil
+	})
+	return preMatchOutbound, preMatchAction
+}
+
 func (s *LoadBalance) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
 }
 
+func (s *LoadBalance) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+	return s.group.urlTest(ctx, force)
+}
+
 func (s *LoadBalance) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
+}
+
+func (s *LoadBalance) InterfaceUpdated(context.Context) {
+	group := s.group
+	if group == nil {
+		return
+	}
+	if group.pause.IsDevicePaused() || group.pause.IsNetworkPaused() {
+		return
+	}
+	go group.CheckOutbounds(true)
 }
 
 func (s *LoadBalance) isGroupActive() bool {
@@ -204,7 +235,7 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	go s.group.CheckOutbounds(true)
@@ -223,33 +254,21 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	go s.group.CheckOutbounds(true)
 	return nil, err
 }
 
-func (s *LoadBalance) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *LoadBalance) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
 }
 
-func (s *LoadBalance) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *LoadBalance) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
-}
-
-func (s *LoadBalance) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
-	s.group.Touch()
-	selected := s.group.Unwrap(&metadata, true)
-	if selected == nil {
-		return nil, E.New("missing supported outbound")
-	}
-	if !common.Contains(selected.Network(), metadata.Network) {
-		return nil, E.New(metadata.Network, " is not supported by outbound: ", selected.Tag())
-	}
-	return selected.(adapter.DirectRouteOutbound).NewDirectRouteConnection(metadata, routeContext, timeout)
 }
 
 func (s *LoadBalance) onProviderUpdated(tag string) error {
@@ -284,11 +303,14 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 	return nil
 }
 
-type strategyFn = func(metadata *adapter.InboundContext, touch bool) adapter.Outbound
+type outboundMatcher = func(outbound adapter.Outbound) bool
+
+type strategyFn = func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound
 
 type LoadBalanceGroup struct {
 	ctx context.Context
 	// router                       adapter.Router
+	tag             string
 	outbound        adapter.OutboundManager
 	pause           pause.Manager
 	pauseCallback   *list.Element[pause.Callback]
@@ -299,9 +321,10 @@ type LoadBalanceGroup struct {
 	interval        time.Duration
 	idleTimeout     time.Duration
 	ttl             time.Duration
-	history         adapter.URLTestHistoryStorage
+	history         *urltest.HistoryStorage
 	checking        sync.Mutex
 	fallbackIdx     atomic.Uint32
+	fallbackAccess  sync.Mutex
 	interruptGroup  *interrupt.Group
 	access          sync.Mutex
 	ticker          *time.Ticker
@@ -324,13 +347,9 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	if ttl == 0 {
 		ttl = time.Minute * 10
 	}
-	var history adapter.URLTestHistoryStorage
-	if historyFromCtx := service.PtrFromContext[urltest.HistoryStorage](ctx); historyFromCtx != nil {
-		history = historyFromCtx
-	} else if clashServer := service.FromContext[adapter.ClashServer](ctx); clashServer != nil {
-		history = clashServer.HistoryStorage()
-	} else {
-		history = urltest.NewHistoryStorage()
+	history := service.PtrFromContext[urltest.HistoryStorage](ctx)
+	if history == nil {
+		return nil, E.New("missing URL test history storage")
 	}
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
@@ -424,7 +443,7 @@ func (g *LoadBalanceGroup) CheckOutbounds(force bool) {
 }
 
 func (g *LoadBalanceGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return g.urlTest(ctx, false)
+	return g.urlTest(ctx, true)
 }
 
 func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
@@ -442,64 +461,131 @@ func (g *LoadBalanceGroup) urlTestWait(ctx context.Context, force bool) (map[str
 }
 
 func (g *LoadBalanceGroup) urlTestLocked(ctx context.Context, force bool) (map[string]uint16, error) {
-	result := make(map[string]uint16)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-	checked := make(map[string]bool)
-	var resultAccess sync.Mutex
-	for _, detour := range g.loadOutbounds() {
-		tag := detour.Tag()
-		realTag := RealTag(detour)
-		if checked[realTag] {
-			continue
-		}
-		history := g.history.LoadURLTestHistory(realTag)
-		if !force && history != nil && time.Since(history.Time) < g.interval {
-			continue
-		}
-		checked[realTag] = true
-		p, loaded := g.outbound.Outbound(realTag)
-		if !loaded {
-			continue
-		}
-		b.Go(realTag, func() (any, error) {
-			t, err := urlTestOutbound(ctx, g.link, p)
-			if err != nil {
-				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				g.history.DeleteURLTestHistory(realTag)
-			} else {
-				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: t,
-				})
-				resultAccess.Lock()
-				result[tag] = t
-				resultAccess.Unlock()
-			}
-			return nil, nil
-		})
+	outbounds := g.loadOutbounds()
+	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, outbounds, g.link, g.interval, force)
+	if g.tag != "" {
+		updateLoadBalanceURLTestHistory(g.outbound, g.history, g.tag, outbounds)
 	}
-	b.Wait()
 	return result, nil
 }
 
+func updateLoadBalanceURLTestHistory(outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, tag string, outbounds []adapter.Outbound) *adapter.URLTestHistory {
+	leaves := collectLoadBalanceURLTestLeafHistory(outboundManager, history, outbounds, make(map[string]bool))
+	return updateLoadBalanceURLTestHistoryFromLeaves(history, tag, leaves)
+}
+
+// collectLoadBalanceURLTestLeafHistory follows the selected member of selector-like groups,
+// but includes every member of load-balance groups, which have no global selection.
+func collectLoadBalanceURLTestLeafHistory(outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, outbounds []adapter.Outbound, visiting map[string]bool) map[string]*adapter.URLTestHistory {
+	leaves := make(map[string]*adapter.URLTestHistory)
+	for _, detour := range outbounds {
+		if detour == nil {
+			continue
+		}
+		if outboundGroup, isGroup := detour.(adapter.OutboundGroup); isGroup {
+			tag := outboundGroup.Tag()
+			if visiting[tag] {
+				continue
+			}
+			visiting[tag] = true
+			var memberTags []string
+			if now := outboundGroup.Now(); now != "" {
+				memberTags = []string{now}
+			} else {
+				memberTags = outboundGroup.All()
+			}
+			groupLeaves := collectLoadBalanceURLTestLeafHistory(outboundManager, history, common.FilterNotNil(common.Map(memberTags, func(it string) adapter.Outbound {
+				member, _ := outboundManager.Outbound(it)
+				return member
+			})), visiting)
+			delete(visiting, tag)
+			maps.Copy(leaves, groupLeaves)
+			if _, isLoadBalance := outboundGroup.(adapter.LoadBalanceGroup); isLoadBalance {
+				updateLoadBalanceURLTestHistoryFromLeaves(history, tag, groupLeaves)
+			}
+			continue
+		}
+		if leafHistory := history.LoadURLTestHistory(detour.Tag()); leafHistory != nil {
+			leaves[detour.Tag()] = leafHistory
+		}
+	}
+	return leaves
+}
+
+func updateLoadBalanceURLTestHistoryFromLeaves(history *urltest.HistoryStorage, tag string, leaves map[string]*adapter.URLTestHistory) *adapter.URLTestHistory {
+	if len(leaves) == 0 {
+		if history.LoadURLTestHistory(tag) != nil {
+			history.DeleteURLTestHistory(tag)
+		}
+		return nil
+	}
+	var (
+		totalDelay uint64
+		oldestTime time.Time
+		first      = true
+	)
+	for _, leafHistory := range leaves {
+		totalDelay += uint64(leafHistory.Delay)
+		if first || leafHistory.Time.Before(oldestTime) {
+			oldestTime = leafHistory.Time
+			first = false
+		}
+	}
+	// A load-balance group can route through any available leaf, so its delay is
+	// represented by the arithmetic mean instead of a fabricated selected leaf.
+	groupHistory := &adapter.URLTestHistory{
+		Time:  oldestTime,
+		Delay: uint16(totalDelay / uint64(len(leaves))),
+	}
+	history.StoreURLTestHistory(tag, groupHistory)
+	return groupHistory
+}
+
 func (g *LoadBalanceGroup) Unwrap(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-	return g.strategyFn(metadata, touch)
+	return g.strategyFn(metadata, touch, nil)
+}
+
+func (g *LoadBalanceGroup) UnwrapPreMatch(metadata *adapter.InboundContext, matcher outboundMatcher) adapter.Outbound {
+	return g.strategyFn(metadata, true, matcher)
 }
 
 func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
-	if history := g.history.LoadURLTestHistory(RealTag(proxy)); history != nil {
-		return true
-	}
-	return false
+	return g.aliveForTestURL(proxy, make(map[string]bool))
 }
 
-func (g *LoadBalanceGroup) nextFallback(outbounds []adapter.Outbound) adapter.Outbound {
+func (g *LoadBalanceGroup) aliveForTestURL(proxy adapter.Outbound, checked map[string]bool) bool {
+	if proxy == nil || checked[proxy.Tag()] {
+		return false
+	}
+	checked[proxy.Tag()] = true
+	if nested, isLoadBalance := proxy.(adapter.LoadBalanceGroup); isLoadBalance {
+		for _, memberTag := range nested.All() {
+			member, loaded := g.outbound.Outbound(memberTag)
+			if loaded && g.aliveForTestURL(member, checked) {
+				return true
+			}
+		}
+		return false
+	}
+	return g.history.LoadURLTestHistory(RealTag(g.outbound, proxy)) != nil
+}
+
+func (g *LoadBalanceGroup) nextFallback(outbounds []adapter.Outbound, touch bool, matcher outboundMatcher) adapter.Outbound {
+	g.fallbackAccess.Lock()
+	defer g.fallbackAccess.Unlock()
 	length := len(outbounds)
 	if length == 0 {
 		return nil
 	}
-	return outbounds[int(g.fallbackIdx.Add(1))%length]
+	nextIndex := g.fallbackIdx.Load() + 1
+	outbound := outbounds[int(nextIndex)%length]
+	if matcher != nil && !matcher(outbound) {
+		return nil
+	}
+	if matcher == nil || touch {
+		g.fallbackIdx.Store(nextIndex)
+	}
+	return outbound
 }
 
 func (g *LoadBalanceGroup) loadOutbounds() []adapter.Outbound {
@@ -578,7 +664,7 @@ func jumpHash(key uint64, buckets int32) int32 {
 func strategyRoundRobin(g *LoadBalanceGroup, url string) strategyFn {
 	idx := 0
 	idxMutex := sync.Mutex{}
-	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
+	return func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound {
 		idxMutex.Lock()
 		defer idxMutex.Unlock()
 
@@ -586,29 +672,29 @@ func strategyRoundRobin(g *LoadBalanceGroup, url string) strategyFn {
 		i := 0
 		length := len(outbounds)
 
-		if touch {
-			defer func() {
-				idx = (idx + i) % length
-			}()
-		}
-
 		for ; i < length; i++ {
 			id := (idx + i) % length
 			proxy := outbounds[id]
 			if g.AliveForTestUrl(proxy) {
 				i++
+				if matcher != nil && !matcher(proxy) {
+					return nil
+				}
+				if touch {
+					idx = (idx + i) % length
+				}
 				return proxy
 			}
 		}
 
-		return g.nextFallback(outbounds)
+		return g.nextFallback(outbounds, touch, matcher)
 	}
 }
 
 func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
 	maxRetry := 5
 	hash := maphash.NewHasher[string]()
-	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
+	return func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound {
 		outbounds := g.loadOutbounds()
 		key := hash.Hash(getKey(metadata))
 		buckets := int32(len(outbounds))
@@ -616,6 +702,9 @@ func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
 			idx := jumpHash(key, buckets)
 			proxy := outbounds[idx]
 			if g.AliveForTestUrl(proxy) {
+				if matcher != nil && !matcher(proxy) {
+					return nil
+				}
 				return proxy
 			}
 		}
@@ -623,43 +712,70 @@ func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
 		// when availability is poor, traverse the entire list to get the available nodes
 		for _, proxy := range outbounds {
 			if g.AliveForTestUrl(proxy) {
+				if matcher != nil && !matcher(proxy) {
+					return nil
+				}
 				return proxy
 			}
 		}
 
-		return g.nextFallback(outbounds)
+		return g.nextFallback(outbounds, touch, matcher)
 	}
 }
 
 func strategyStickySessions(g *LoadBalanceGroup, url string) strategyFn {
+	return strategyStickySessionsWithIndex(g, func(key uint64, length int) int {
+		return int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+	})
+}
+
+func strategyStickySessionsWithIndex(g *LoadBalanceGroup, selectIndex func(key uint64, length int) int) strategyFn {
 	maxRetry := 5
-	lruCache := common.Must1(freelru.NewSharded[uint64, int](1000, maphash.NewHasher[uint64]().Hash32))
+	lruCache := common.Must1(freelru.New[uint64, int](1000, maphash.NewHasher[uint64]().Hash32, true))
 	lruCache.SetLifetime(g.ttl)
 	hash := maphash.NewHasher[string]()
-	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
+	return func(metadata *adapter.InboundContext, touch bool, matcher outboundMatcher) adapter.Outbound {
 		outbounds := g.loadOutbounds()
 		key := hash.Hash(getKeyWithSrcAndDst(metadata))
 		length := len(outbounds)
-		idx, has := lruCache.Get(key)
-		if !has || idx >= length {
-			idx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+		var (
+			idx int
+			has bool
+		)
+		if matcher == nil {
+			idx, has = lruCache.Get(key)
+		} else {
+			idx, has = lruCache.Peek(key)
+		}
+		validMapping := has && idx < length
+		if !validMapping {
+			idx = selectIndex(key, length)
 		}
 
 		nowIdx := idx
 		for i := 1; i < maxRetry; i++ {
 			proxy := outbounds[nowIdx]
 			if g.AliveForTestUrl(proxy) {
-				if !has || nowIdx != idx {
+				matched := matcher == nil || matcher(proxy)
+				if !validMapping || nowIdx != idx {
 					lruCache.Add(key, nowIdx)
+				} else if matcher != nil {
+					lruCache.Get(key)
 				}
-
+				if !matched {
+					return nil
+				}
 				return proxy
 			} else {
-				nowIdx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+				nowIdx = selectIndex(key, length)
 			}
 		}
 		fbIdx := int(jumpHash(key, int32(length)))
+		matched := matcher == nil || matcher(outbounds[fbIdx])
 		lruCache.Add(key, fbIdx)
+		if !matched {
+			return nil
+		}
 		return outbounds[fbIdx]
 	}
 }

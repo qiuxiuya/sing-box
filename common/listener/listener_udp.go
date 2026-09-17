@@ -10,7 +10,9 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/redir"
+	"github.com/sagernet/sing-box/common/udpio"
 	"github.com/sagernet/sing/common/buf"
+	sBufio "github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -18,9 +20,19 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+const udpOutputBatchSize = 128
+
+type oobPacketBatchHandler interface {
+	NewOOBPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr)
+}
+
 func (l *Listener) ListenUDP() (net.PacketConn, error) {
+	return l.ListenUDPWithConfig(net.ListenConfig{})
+}
+
+func (l *Listener) ListenUDPWithConfig(listenConfig net.ListenConfig) (net.PacketConn, error) {
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
-	var listenConfig net.ListenConfig
+	listenConfig.Control = control.Append(listenConfig.Control, l.socketControl)
 	if l.listenOptions.BindInterface != "" {
 		listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
 	}
@@ -46,7 +58,7 @@ func (l *Listener) ListenUDP() (net.PacketConn, error) {
 			})
 		})
 	}
-	udpConn, err := ListenNetworkNamespace[net.PacketConn](l.listenOptions.NetNs, func() (net.PacketConn, error) {
+	udpConn, err := ListenNetworkNamespace[net.PacketConn](l.ctx, l.listenOptions.NetNs, func() (net.PacketConn, error) {
 		return listenConfig.ListenPacket(l.ctx, M.NetworkFromNetAddr(N.NetworkUDP, bindAddr.Addr), bindAddr.String())
 	})
 	if err != nil {
@@ -54,12 +66,14 @@ func (l *Listener) ListenUDP() (net.PacketConn, error) {
 	}
 	l.udpConn = udpConn.(*net.UDPConn)
 	l.udpAddr = bindAddr
-	l.logger.Info("udp server started at ", udpConn.LocalAddr())
+	if !l.disableLog {
+		l.logger.Info("udp server started at ", udpConn.LocalAddr())
+	}
 	return udpConn, err
 }
 
 func (l *Listener) DialContext(dialer net.Dialer, ctx context.Context, network string, address string) (net.Conn, error) {
-	return ListenNetworkNamespace[net.Conn](l.listenOptions.NetNs, func() (net.Conn, error) {
+	return ListenNetworkNamespace[net.Conn](l.ctx, l.listenOptions.NetNs, func() (net.Conn, error) {
 		if l.listenOptions.BindInterface != "" {
 			dialer.Control = control.Append(dialer.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
 		}
@@ -74,7 +88,7 @@ func (l *Listener) DialContext(dialer net.Dialer, ctx context.Context, network s
 }
 
 func (l *Listener) ListenPacket(listenConfig net.ListenConfig, ctx context.Context, network string, address string) (net.PacketConn, error) {
-	return ListenNetworkNamespace[net.PacketConn](l.listenOptions.NetNs, func() (net.PacketConn, error) {
+	return ListenNetworkNamespace[net.PacketConn](l.ctx, l.listenOptions.NetNs, func() (net.PacketConn, error) {
 		if l.listenOptions.BindInterface != "" {
 			listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
 		}
@@ -98,6 +112,23 @@ func (l *Listener) PacketWriter() N.PacketWriter {
 
 func (l *Listener) loopUDPIn() {
 	defer close(l.packetOutboundClosed)
+	if l.oobPacketHandler != nil {
+		if batchHandler, isBatchHandler := l.oobPacketHandler.(oobPacketBatchHandler); isBatchHandler {
+			if readWaiter, created := udpio.NewOOBPacketBatchReadWaiter(l.udpConn, 1024); created {
+				readWaiter.InitializeReadWaiter(N.ReadWaitOptions{BatchSize: sBufio.DefaultPacketReadBatchSize})
+				l.loopUDPInOOBBatch(batchHandler, readWaiter)
+				return
+			}
+		}
+	} else {
+		if batchHandler, isBatchHandler := l.packetHandler.(adapter.PacketBatchHandler); isBatchHandler {
+			packetConn := sBufio.NewPacketConn(l.udpConn)
+			if readWaiter, created := sBufio.CreatePacketBatchReadWaiter(packetConn); created {
+				l.loopUDPInBatch(batchHandler, readWaiter)
+				return
+			}
+		}
+	}
 	var buffer *buf.Buffer
 	if !l.threadUnsafePacketWriter {
 		buffer = buf.NewPacket()
@@ -126,7 +157,7 @@ func (l *Listener) loopUDPIn() {
 				return
 			}
 			buffer.Truncate(n)
-			l.oobPacketHandler.NewPacketEx(buffer, oob[:oobN], M.SocksaddrFromNetIP(addr).Unwrap())
+			l.oobPacketHandler.NewPacket(buffer, oob[:oobN], M.SocksaddrFromNetIP(addr).Unwrap())
 		}
 	} else {
 		for {
@@ -148,37 +179,98 @@ func (l *Listener) loopUDPIn() {
 				return
 			}
 			buffer.Truncate(n)
-			l.packetHandler.NewPacketEx(buffer, M.SocksaddrFromNetIP(addr).Unwrap())
+			l.packetHandler.NewPacket(buffer, M.SocksaddrFromNetIP(addr).Unwrap())
 		}
 	}
 }
 
+func (l *Listener) loopUDPInOOBBatch(handler oobPacketBatchHandler, reader udpio.OOBPacketBatchReadWaiter) {
+	for {
+		buffers, oobs, sources, err := reader.WaitReadOOBPackets()
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			if l.shutdown.Load() && E.IsClosed(err) {
+				return
+			}
+			l.udpConn.Close()
+			l.logger.Error("UDP listener closed: ", err)
+			return
+		}
+		handler.NewOOBPacketBatch(buffers, oobs, sources)
+	}
+}
+
+func (l *Listener) loopUDPInBatch(handler adapter.PacketBatchHandler, readWaiter N.PacketBatchReadWaiter) {
+	readWaitOptions := N.ReadWaitOptions{
+		BatchSize: sBufio.DefaultPacketReadBatchSize,
+	}
+	readWaiter.InitializeReadWaiter(readWaitOptions)
+	for {
+		buffers, sources, err := readWaiter.WaitReadPackets()
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			if l.shutdown.Load() && E.IsClosed(err) {
+				return
+			}
+			l.udpConn.Close()
+			l.logger.Error("udp listener closed: ", err)
+			return
+		}
+		handler.NewPacketBatch(buffers, sources)
+	}
+}
+
 func (l *Listener) loopUDPOut() {
+	packetConn := sBufio.NewPacketConn(l.udpConn)
+	batchWriter := sBufio.NewPacketBatchWriter(packetConn)
+	packets := make([]*N.PacketBuffer, 0, udpOutputBatchSize)
+	buffers := make([]*buf.Buffer, 0, udpOutputBatchSize)
+	destinations := make([]M.Socksaddr, 0, udpOutputBatchSize)
 	for {
 		select {
 		case packet := <-l.packetOutbound:
-			destination := packet.Destination.AddrPort()
-			_, err := l.udpConn.WriteToUDPAddrPort(packet.Buffer.Bytes(), destination)
-			packet.Buffer.Release()
-			N.PutPacketBuffer(packet)
-			if err != nil {
-				if l.shutdown.Load() && E.IsClosed(err) {
-					return
-				}
-				l.logger.Error("udp listener write back: ", destination, ": ", err)
-				continue
-			}
-			continue
+			packets = append(packets, packet)
 		case <-l.packetOutboundClosed:
+			l.releasePacketOutbound()
+			return
 		}
-		for {
+	drain:
+		for len(packets) < udpOutputBatchSize {
 			select {
 			case packet := <-l.packetOutbound:
-				packet.Buffer.Release()
-				N.PutPacketBuffer(packet)
+				packets = append(packets, packet)
 			default:
+				break drain
+			}
+		}
+		for _, packet := range packets {
+			buffers = append(buffers, packet.Buffer)
+			destinations = append(destinations, packet.Destination)
+		}
+		err := batchWriter.WritePacketBatch(buffers, destinations)
+		for _, packet := range packets {
+			N.PutPacketBuffer(packet)
+		}
+		packets = packets[:0]
+		buffers = buffers[:0]
+		destinations = destinations[:0]
+		if err != nil {
+			if l.shutdown.Load() && E.IsClosed(err) {
 				return
 			}
+			l.logger.Error("udp listener write back: ", err)
+		}
+	}
+}
+
+func (l *Listener) releasePacketOutbound() {
+	for {
+		select {
+		case packet := <-l.packetOutbound:
+			packet.Buffer.Release()
+			N.PutPacketBuffer(packet)
+		default:
+			return
 		}
 	}
 }
@@ -201,6 +293,31 @@ func (w *packetWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) 
 		w.logger.Trace("dropped packet to ", destination)
 		return nil
 	}
+}
+
+func (w *packetWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	if len(buffers) == 0 || len(buffers) != len(destinations) {
+		buf.ReleaseMulti(buffers)
+		return os.ErrInvalid
+	}
+	for index, buffer := range buffers {
+		packet := N.NewPacketBuffer()
+		packet.Buffer = buffer
+		packet.Destination = destinations[index]
+		select {
+		case w.packetOutbound <- packet:
+		default:
+			buffer.Release()
+			N.PutPacketBuffer(packet)
+			buf.ReleaseMulti(buffers[index+1:])
+			if w.shutdown.Load() {
+				return os.ErrClosed
+			}
+			w.logger.Trace("dropped packet batch to ", destinations[index])
+			return nil
+		}
+	}
+	return nil
 }
 
 func (w *packetWriter) WriteIsThreadUnsafe() {

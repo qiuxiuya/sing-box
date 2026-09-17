@@ -8,6 +8,7 @@ import (
 	"github.com/sagernet/sing-box/common/expiringmap"
 	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
+
 	"github.com/stretchr/testify/require"
 )
 

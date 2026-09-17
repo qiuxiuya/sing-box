@@ -1,38 +1,50 @@
 package constant
 
 const (
-	TypeTun          = "tun"
-	TypeRedirect     = "redirect"
-	TypeTProxy       = "tproxy"
-	TypeDirect       = "direct"
-	TypeBlock        = "block"
-	TypePass         = "pass"
-	TypeDNS          = "dns"
-	TypeSOCKS        = "socks"
-	TypeHTTP         = "http"
-	TypeMixed        = "mixed"
-	TypeShadowsocks  = "shadowsocks"
-	TypeSnell        = "snell"
-	TypeVMess        = "vmess"
-	TypeTrojan       = "trojan"
-	TypeNaive        = "naive"
-	TypeWireGuard    = "wireguard"
-	TypeHysteria     = "hysteria"
-	TypeTor          = "tor"
-	TypeSSH          = "ssh"
-	TypeShadowTLS    = "shadowtls"
-	TypeAnyTLS       = "anytls"
-	TypeShadowsocksR = "shadowsocksr"
-	TypeVLESS        = "vless"
-	TypeTUIC         = "tuic"
-	TypeHysteria2    = "hysteria2"
-	TypeTailscale    = "tailscale"
-	TypeDERP         = "derp"
-	TypeResolved     = "resolved"
-	TypeSSMAPI       = "ssm-api"
-	TypeCCM          = "ccm"
-	TypeOCM          = "ocm"
-	TypeOOMKiller    = "oom-killer"
+	TypeTun                = "tun"
+	TypeEBPF               = "ebpf"
+	TypeRedirect           = "redirect"
+	TypeTProxy             = "tproxy"
+	TypeDirect             = "direct"
+	TypeBridge             = "bridge"
+	TypeBlock              = "block"
+	TypePass               = "pass"
+	TypeDNS                = "dns"
+	TypeSOCKS              = "socks"
+	TypeHTTP               = "http"
+	TypeMixed              = "mixed"
+	TypeShadowsocks        = "shadowsocks"
+	TypeSnell              = "snell"
+	TypeVMess              = "vmess"
+	TypeTrojan             = "trojan"
+	TypeNaive              = "naive"
+	TypeWireGuard          = "wireguard"
+	TypeHysteria           = "hysteria"
+	TypeTor                = "tor"
+	TypeSSH                = "ssh"
+	TypeShadowTLS          = "shadowtls"
+	TypeAnyTLS             = "anytls"
+	TypeShadowsocksR       = "shadowsocksr"
+	TypeVLESS              = "vless"
+	TypeTUIC               = "tuic"
+	TypeHysteria2          = "hysteria2"
+	TypeOpenConnect        = "openconnect"
+	TypeOpenVPNClient      = "openvpn-client"
+	TypeOpenVPNServer      = "openvpn-server"
+	TypeTailscale          = "tailscale"
+	TypeCloudflared        = "cloudflared"
+	TypeDERP               = "derp"
+	TypeResolved           = "resolved"
+	TypeSSMAPI             = "ssm-api"
+	TypeAPI                = "api"
+	TypeCCM                = "ccm"
+	TypeOCM                = "ocm"
+	TypeOOMKiller          = "oom-killer"
+	TypeUSBIPServer        = "usbip-server"
+	TypeUSBIPClient        = "usbip-client"
+	TypeHysteriaRealm      = "hysteria-realm"
+	TypeACME               = "acme"
+	TypeCloudflareOriginCA = "cloudflare-origin-ca"
 )
 
 const (
@@ -45,12 +57,16 @@ func ProxyDisplayName(proxyType string) string {
 	switch proxyType {
 	case TypeTun:
 		return "TUN"
+	case TypeEBPF:
+		return "eBPF"
 	case TypeRedirect:
 		return "Redirect"
 	case TypeTProxy:
 		return "TProxy"
 	case TypeDirect:
 		return "Direct"
+	case TypeBridge:
+		return "Bridge"
 	case TypeBlock:
 		return "Block"
 	case TypePass:
@@ -93,8 +109,16 @@ func ProxyDisplayName(proxyType string) string {
 		return "Hysteria2"
 	case TypeAnyTLS:
 		return "AnyTLS"
+	case TypeOpenConnect:
+		return "OpenConnect"
+	case TypeOpenVPNClient:
+		return "OpenVPN Client"
+	case TypeOpenVPNServer:
+		return "OpenVPN Server"
 	case TypeTailscale:
 		return "Tailscale"
+	case TypeCloudflared:
+		return "Cloudflared"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:

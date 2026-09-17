@@ -81,7 +81,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	case 5:
 		serviceOptions := snellv5.ServiceOptions{
 			PSK:                     []byte(options.PSK),
-			Handler:                 (*inboundHandler)(inbound),
+			Handler:                 inbound,
 			MultiUserAuthentication: authentication,
 		}
 		inbound.service, err = newSnellV5Service(serviceOptions, userList, keyList)
@@ -94,7 +94,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		serviceOptions := snellv6.ServerOptions{
 			PSK:                     []byte(options.PSK),
 			Mode:                    mode,
-			Handler:                 (*inboundHandler)(inbound),
+			Handler:                 inbound,
 			MultiUserAuthentication: authentication,
 		}
 		if len(options.Users) > 0 {
@@ -126,7 +126,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		quicService, createErr := newSnellV5Service(snellv5.ServiceOptions{
 			PSK:                     []byte(options.PSK),
-			Handler:                 (*inboundHandler)(inbound),
+			Handler:                 inbound,
 			MultiUserAuthentication: authentication,
 		}, userList, keyList)
 		if createErr != nil {
@@ -184,7 +184,7 @@ func (h *Inbound) Close() error {
 	return listenerErr
 }
 
-func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	if h.obfsMode == "http" {
 		conn = obfs.NewHTTPObfsServer(conn)
 	}
@@ -199,9 +199,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata a
 	}
 }
 
-type inboundHandler Inbound
-
-func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	_, metadata := adapter.ExtendContext(ctx)
 	if source.IsValid() {
 		metadata.Source = source
@@ -209,11 +207,7 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
 	if destination.IsValid() {
 		metadata.Destination = destination
 	}
-	(*Inbound)(h).newConnection(ctx, conn, *metadata, onClose)
-}
-
-func (h *inboundHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	(*Inbound)(h).NewPacketConnectionEx(ctx, conn, source, destination, onClose)
+	h.newConnection(ctx, conn, *metadata, onClose)
 }
 
 func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -311,7 +305,7 @@ type quicProxyInitParser interface {
 	ParseQUICProxyInit(data []byte) (*snellprotocol.QUICProxySession, []byte, error)
 }
 
-func (h *inboundPacketHandler) NewPacketEx(buffer *buf.Buffer, source M.Socksaddr) {
+func (h *inboundPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
 	defer buffer.Release()
 	data := buffer.Bytes()
 	if len(data) == 0 || h.udpNat == nil {
@@ -337,10 +331,6 @@ func (h *inboundPacketHandler) NewPacketEx(buffer *buf.Buffer, source M.Socksadd
 		return
 	}
 	h.logger.Debug("quic proxy: discard init while authentication queue is full from ", source)
-}
-
-func (h *inboundPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
-	h.NewPacketEx(buffer, source)
 }
 
 func (h *inboundPacketHandler) processSessionPacket(source M.Socksaddr, data []byte) bool {

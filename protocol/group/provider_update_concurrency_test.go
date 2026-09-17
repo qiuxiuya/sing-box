@@ -2,8 +2,6 @@ package group
 
 import (
 	"context"
-	"errors"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,16 +10,13 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/interrupt"
 	U "github.com/sagernet/sing-box/common/urltest"
-	"github.com/sagernet/sing-box/log"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestSelectorAndURLTestProviderConcurrentUpdates(t *testing.T) {
-	firstOutbound := &providerUpdateTestOutbound{tag: "first/outbound"}
-	secondOutbound := &providerUpdateTestOutbound{tag: "second/outbound"}
+func TestProviderGroupConcurrentUpdates(t *testing.T) {
+	firstOutbound := &preMatchTestOutbound{tag: "first/outbound"}
+	secondOutbound := &preMatchTestOutbound{tag: "second/outbound"}
 	providers := map[string]adapter.Provider{
 		"first": &providerUpdateTestProvider{
 			tag:       "first",
@@ -80,11 +75,26 @@ func TestSelectorAndURLTestProviderConcurrentUpdates(t *testing.T) {
 		require.Equal(t, expectedTags, urlTest.All())
 	})
 
+	t.Run("LoadBalance", func(t *testing.T) {
+		group := new(LoadBalanceGroup)
+		group.storeOutbounds([]adapter.Outbound{firstOutbound, secondOutbound})
+		loadBalance := &LoadBalance{
+			outbound:       outboundManager,
+			group:          group,
+			providers:      providers,
+			providerTags:   providerTags,
+			outboundsCache: make(map[string][]adapter.Outbound),
+		}
+		runConcurrentProviderUpdates(t, loadBalance.onProviderUpdated, func() {
+			_ = loadBalance.All()
+		})
+		require.Equal(t, expectedTags, loadBalance.All())
+	})
 }
 
 func TestURLTestProviderUpdateReplacesSelectedOutboundInstance(t *testing.T) {
-	previous := &providerUpdateTestOutbound{tag: "provider/outbound"}
-	replacement := &providerUpdateTestOutbound{tag: previous.Tag()}
+	previous := &preMatchTestOutbound{tag: "provider/outbound"}
+	replacement := &preMatchTestOutbound{tag: previous.Tag()}
 	group := &URLTestGroup{
 		history:        U.NewHistoryStorage(),
 		interruptGroup: interrupt.NewGroup(),
@@ -129,41 +139,6 @@ func TestProviderUpdateCheckCoalescesPendingChecks(t *testing.T) {
 	require.Equal(t, int32(2), calls.Load())
 }
 
-func TestURLTestOutboundReturnsWhenDialIgnoresContext(t *testing.T) {
-	release := make(chan struct{})
-	outbound := &providerUpdateBlockingOutbound{release: release}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	_, err := urlTestOutbound(ctx, "http://example.com", outbound)
-	close(release)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-}
-
-func TestURLTestGroupReturnsWhenDialIgnoresContext(t *testing.T) {
-	release := make(chan struct{})
-	outbound := &providerUpdateBlockingOutbound{tag: "blocking", release: release}
-	outboundManager := &providerUpdateTestOutboundManager{
-		outbounds: map[string]adapter.Outbound{outbound.Tag(): outbound},
-	}
-	group := &URLTestGroup{
-		ctx:            context.Background(),
-		outbound:       outboundManager,
-		logger:         log.NewNOPFactory().NewLogger("urltest"),
-		history:        U.NewHistoryStorage(),
-		interruptGroup: interrupt.NewGroup(),
-	}
-	group.storeOutbounds([]adapter.Outbound{outbound})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	_, err := group.urlTestWait(ctx, true)
-	close(release)
-	require.NoError(t, err)
-	require.True(t, group.checking.TryLock(), "URLTest checking lock was not released")
-	group.checking.Unlock()
-}
-
 func runConcurrentProviderUpdates(t *testing.T, update func(string) error, read func()) {
 	t.Helper()
 	start := make(chan struct{})
@@ -203,38 +178,6 @@ type providerUpdateTestProvider struct {
 	adapter.Provider
 	tag       string
 	outbounds []adapter.Outbound
-}
-
-type providerUpdateTestOutbound struct {
-	adapter.Outbound
-	tag string
-}
-
-type providerUpdateBlockingOutbound struct {
-	adapter.Outbound
-	tag     string
-	release <-chan struct{}
-}
-
-func (o *providerUpdateBlockingOutbound) Tag() string {
-	return o.tag
-}
-
-func (o *providerUpdateBlockingOutbound) Network() []string {
-	return []string{N.NetworkTCP, N.NetworkUDP}
-}
-
-func (o *providerUpdateBlockingOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
-	<-o.release
-	return nil, errors.New("released")
-}
-
-func (o *providerUpdateTestOutbound) Tag() string {
-	return o.tag
-}
-
-func (o *providerUpdateTestOutbound) Network() []string {
-	return []string{N.NetworkTCP, N.NetworkUDP}
 }
 
 func (p *providerUpdateTestProvider) Tag() string {

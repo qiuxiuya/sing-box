@@ -11,18 +11,19 @@ import (
 	"encoding/hex"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	tf "github.com/sagernet/sing-box/common/tlsfragment"
+	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/service/filemanager"
 
 	utls "github.com/metacubex/utls"
 	"golang.org/x/net/http2"
@@ -35,10 +36,13 @@ type UTLSClientConfig struct {
 	certificateServerName string
 	disableSNI            bool
 	verifyServerName      bool
+	handshakeTimeout      time.Duration
 	id                    utls.ClientHelloID
 	fragment              bool
 	fragmentFallbackDelay time.Duration
 	recordFragment        bool
+	spoof                 string
+	spoofMethod           tlsspoof.Method
 }
 
 func (c *UTLSClientConfig) ServerName() string {
@@ -75,13 +79,25 @@ func (c *UTLSClientConfig) SetNextProtos(nextProto []string) {
 	c.config.NextProtos = nextProto
 }
 
+func (c *UTLSClientConfig) HandshakeTimeout() time.Duration {
+	return c.handshakeTimeout
+}
+
+func (c *UTLSClientConfig) SetHandshakeTimeout(timeout time.Duration) {
+	c.handshakeTimeout = timeout
+}
+
 func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 	return nil, E.New("unsupported usage for uTLS")
 }
 
 func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
-	if c.recordFragment {
+	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
+	}
+	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
+	if err != nil {
+		return nil, err
 	}
 	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
 }
@@ -98,10 +114,13 @@ func (c *UTLSClientConfig) Clone() Config {
 		certificateServerName: c.certificateServerName,
 		disableSNI:            c.disableSNI,
 		verifyServerName:      c.verifyServerName,
+		handshakeTimeout:      c.handshakeTimeout,
 		id:                    c.id,
 		fragment:              c.fragment,
 		fragmentFallbackDelay: c.fragmentFallbackDelay,
 		recordFragment:        c.recordFragment,
+		spoof:                 c.spoof,
+		spoofMethod:           c.spoofMethod,
 	}
 	cloned.SetServerName(cloned.serverName)
 	return cloned
@@ -176,6 +195,10 @@ func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
 }
 
 func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+	return newUTLSClient(ctx, logger, serverAddress, options, false)
+}
+
+func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions, allowEmptyServerName bool) (Config, error) {
 	var serverName string
 	if options.ServerName != "" {
 		serverName = options.ServerName
@@ -186,8 +209,8 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if verificationServerName == "" {
 		verificationServerName = serverName
 	}
-	if verificationServerName == "" && !options.Insecure {
-		return nil, E.New("missing server_name/certificate_server_name or insecure=true")
+	if verificationServerName == "" && !options.Insecure && !allowEmptyServerName {
+		return nil, errMissingServerName
 	}
 
 	var tlsConfig utls.Config
@@ -240,7 +263,7 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		}
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return verifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts, tlsConfig.Time)
+			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
 		}
 	} else if options.DisableSNI || options.CertificateServerName != "" {
 		if options.Reality != nil && options.Reality.Enabled {
@@ -283,7 +306,7 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.Certificate) > 0 {
 		certificate = []byte(strings.Join(options.Certificate, "\n"))
 	} else if options.CertificatePath != "" {
-		content, err := os.ReadFile(options.CertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.CertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read certificate")
 		}
@@ -300,7 +323,7 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.ClientCertificate) > 0 {
 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
 	} else if options.ClientCertificatePath != "" {
-		content, err := os.ReadFile(options.ClientCertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.ClientCertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read client certificate")
 		}
@@ -310,7 +333,7 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.ClientKey) > 0 {
 		clientKey = []byte(strings.Join(options.ClientKey, "\n"))
 	} else if options.ClientKeyPath != "" {
-		content, err := os.ReadFile(options.ClientKeyPath)
+		content, err := filemanager.ReadFile(ctx, options.ClientKeyPath)
 		if err != nil {
 			return nil, E.Cause(err, "read client key")
 		}
@@ -325,6 +348,16 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	} else if len(clientCertificate) > 0 || len(clientKey) > 0 {
 		return nil, E.New("client certificate and client key must be provided together")
 	}
+	var handshakeTimeout time.Duration
+	if options.HandshakeTimeout > 0 {
+		handshakeTimeout = options.HandshakeTimeout.Build()
+	} else {
+		handshakeTimeout = C.TCPTimeout
+	}
+	spoof, spoofMethod, err := parseTLSSpoofOptions(serverName, options)
+	if err != nil {
+		return nil, err
+	}
 	id, err := uTLSClientHelloID(options.UTLS.Fingerprint)
 	if err != nil {
 		return nil, err
@@ -336,10 +369,13 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		certificateServerName: options.CertificateServerName,
 		disableSNI:            options.DisableSNI,
 		verifyServerName:      (options.DisableSNI || options.CertificateServerName != "") && !options.Insecure && len(options.CertificatePinSHA256) == 0 && len(options.CertificatePublicKeySHA256) == 0,
+		handshakeTimeout:      handshakeTimeout,
 		id:                    id,
 		fragment:              options.Fragment,
 		fragmentFallbackDelay: time.Duration(options.FragmentFallbackDelay),
 		recordFragment:        options.RecordFragment,
+		spoof:                 spoof,
+		spoofMethod:           spoofMethod,
 	}
 	config.SetServerName(serverName)
 	if options.ECH != nil && options.ECH.Enabled {

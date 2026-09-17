@@ -105,11 +105,9 @@ func TestMapConcurrentClose(t *testing.T) {
 	group.Wait()
 	var closeGroup sync.WaitGroup
 	for range 8 {
-		closeGroup.Add(1)
-		go func() {
-			defer closeGroup.Done()
+		closeGroup.Go(func() {
 			cache.Close()
-		}()
+		})
 	}
 	closeGroup.Wait()
 	require.Zero(t, cache.Len())

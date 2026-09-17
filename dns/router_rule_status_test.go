@@ -10,10 +10,11 @@ import (
 	"github.com/sagernet/sing-box/option"
 	R "github.com/sagernet/sing-box/route/rule"
 
+	mDNS "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
 
-func TestMatchDNSSkipsDisabledRule(t *testing.T) {
+func TestExchangeWithRulesSkipsDisabledRule(t *testing.T) {
 	t.Parallel()
 
 	logger := log.NewNOPFactory().NewLogger("dns")
@@ -30,7 +31,7 @@ func TestMatchDNSSkipsDisabledRule(t *testing.T) {
 				},
 			},
 		},
-	}, true)
+	}, true, false)
 	require.NoError(t, err)
 	disabledRule.ChangeStatus()
 	require.True(t, disabledRule.Disabled())
@@ -45,16 +46,17 @@ func TestMatchDNSSkipsDisabledRule(t *testing.T) {
 				Action: C.RuleActionTypePredefined,
 			},
 		},
-	}, true)
+	}, true, false)
 	require.NoError(t, err)
 
 	ctx, metadata := adapter.ExtendContext(context.Background())
 	metadata.Domain = "example.com"
+	message := new(mDNS.Msg)
+	message.SetQuestion("example.com.", mDNS.TypeA)
 
-	router := &Router{
-		logger: logger,
-		rules:  []adapter.DNSRule{disabledRule, fallbackRule},
-	}
-	_, matchedRule, _ := router.matchDNS(ctx, true, -1, true, &adapter.DNSQueryOptions{})
-	require.Same(t, fallbackRule, matchedRule)
+	router := &Router{logger: logger}
+	result := router.exchangeWithRules(ctx, []adapter.DNSRule{disabledRule, fallbackRule}, message, adapter.DNSQueryOptions{}, true)
+	require.NoError(t, result.err)
+	require.NotNil(t, result.response)
+	require.Equal(t, mDNS.RcodeSuccess, result.response.Rcode)
 }
