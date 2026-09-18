@@ -46,23 +46,33 @@ func TestEndpointWakeRestoresBind(t *testing.T) {
 	}
 }
 
-func TestEndpointWakePreservesIdleSuspension(t *testing.T) {
+func TestEndpointDeviceSleepKeepsBindOpen(t *testing.T) {
 	endpoint, pauseManager, bind := newTestEndpoint(t)
-	endpoint.SetIdle(true)
+	closes := bind.closes.Load()
 	pauseManager.DevicePause()
-	pauseManager.NetworkPause()
-	pauseManager.NetworkWake()
-	pauseManager.DeviceWake()
-	if got := bind.opens.Load(); got != 1 || !endpoint.suspended.Load() {
-		t.Fatalf("wake resumed an idle endpoint: opens=%d, suspended=%v", got, endpoint.suspended.Load())
+	if got := bind.closes.Load(); got != closes {
+		t.Fatalf("device sleep closed the bind: closes=%d, want %d", got, closes)
 	}
-	packet := make([]byte, 20)
-	packet[0] = 0x45
-	if err := endpoint.WritePackets([][]byte{packet}); err != nil {
+	if err := endpoint.BindUpdate(); err != nil {
 		t.Fatal(err)
 	}
-	if got := bind.opens.Load(); got != 2 || endpoint.suspended.Load() {
-		t.Fatalf("outbound traffic did not resume the endpoint: opens=%d, suspended=%v", got, endpoint.suspended.Load())
+	pauseManager.DeviceWake()
+	if got := bind.opens.Load(); got != 1 {
+		t.Fatalf("device wake unnecessarily reopened the bind: opens=%d", got)
+	}
+}
+
+func TestEndpointBindUpdateWithoutDevice(t *testing.T) {
+	endpoint := &Endpoint{}
+	if err := endpoint.BindUpdate(); err != nil {
+		t.Fatalf("bind update before start: %v", err)
+	}
+	endpoint, _, _ = newTestEndpoint(t)
+	if err := endpoint.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := endpoint.BindUpdate(); err != nil {
+		t.Fatalf("bind update after close: %v", err)
 	}
 }
 
@@ -149,7 +159,7 @@ func newTestEndpoint(t *testing.T) (*Endpoint, pause.Manager, *testEndpointBind)
 		done:         make(chan struct{}),
 		returnDevice: &returnDeviceWrapper{},
 	}
-	endpoint.device.Store(wgDevice)
+	endpoint.device = wgDevice
 	endpoint.pauseCallback = pauseManager.RegisterCallback(endpoint.onPauseUpdated)
 	t.Cleanup(func() { _ = endpoint.Close() })
 	if err := wgDevice.Up(); err != nil {
@@ -186,7 +196,8 @@ func (d *testEndpointDevice) Close() error {
 
 type testEndpointBind struct {
 	conn.Bind
-	opens atomic.Int32
+	opens  atomic.Int32
+	closes atomic.Int32
 }
 
 func (b *testEndpointBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
@@ -194,6 +205,9 @@ func (b *testEndpointBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
 	return nil, 12345, nil
 }
 
-func (b *testEndpointBind) Close() error { return nil }
+func (b *testEndpointBind) Close() error {
+	b.closes.Add(1)
+	return nil
+}
 
 func (b *testEndpointBind) BatchSize() int { return 1 }

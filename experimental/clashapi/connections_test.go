@@ -13,9 +13,9 @@ func TestConnectionObjectPreferAndroidPackageName(t *testing.T) {
 	connection := connectionObject(trafficcontrol.TrackerMetadata{
 		Metadata: adapter.InboundContext{
 			ProcessInfo: &adapter.ConnectionOwner{
-				UserId:       -1,
-				ProcessPaths: []string{"/system/bin/app_process64"},
-				PackageNames: []string{"io.nekohasekai.sfa"},
+				UserId:              -1,
+				ProcessPath:         "/system/bin/app_process64",
+				AndroidPackageNames: []string{"io.nekohasekai.sfa"},
 			},
 		},
 		Upload:   new(atomic.Int64),

@@ -149,11 +149,6 @@ type ProviderHealthCheckOptions struct {
 	Timeout  badoption.Duration `json:"timeout,omitempty"`
 }
 
-type OverrideAnyTLSOptions struct {
-	ClientMetadata *string `json:"client_metadata,omitempty"`
-	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
-}
-
 type OverrideDialerOptions struct {
 	Detour               *string                            `json:"detour,omitempty" reference:"outbound"`
 	BindInterface        *string                            `json:"bind_interface,omitempty"`
@@ -179,6 +174,11 @@ type OverrideDialerOptions struct {
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
+}
+
+type OverrideAnyTLSOptions struct {
+	ClientMetadata *string `json:"client_metadata,omitempty"`
+	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
 }
 
 type OverrideTLSOptions struct {

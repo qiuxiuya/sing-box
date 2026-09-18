@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,14 +34,15 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
-	ctx                      context.Context
-	logger                   logger.ContextLogger
-	router                   adapter.Router
-	interfaceFinder          *control.DefaultInterfaceFinder
-	networkInterfaces        common.TypedValue[[]adapter.NetworkInterface]
-	autoDetectInterface      bool
-	defaultOptions           adapter.NetworkOptions
-	autoRedirectOutputMark   uint32
+	ctx                    context.Context
+	logger                 logger.ContextLogger
+	router                 adapter.Router
+	interfaceFinder        *control.DefaultInterfaceFinder
+	networkInterfaces      common.TypedValue[[]adapter.NetworkInterface]
+	autoDetectInterface    bool
+	defaultOptions         adapter.NetworkOptions
+	autoRedirectOutputMark uint32
+	//nolint:unused // accessed by the with_ebpf Linux and Android implementation
 	ebpfSelfBypass           ebpfSelfBypassState
 	networkMonitor           tun.NetworkUpdateMonitor
 	interfaceMonitor         tun.DefaultInterfaceMonitor
@@ -66,7 +66,7 @@ type NetworkManager struct {
 	interfaceUpdateRunAccess sync.Mutex
 	powerUpdateAccess        sync.Mutex
 	powerUpdateCancel        context.CancelFunc
-	started                  atomic.Bool
+	started                  bool
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -219,7 +219,7 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 				}
 			}
 		}
-		r.started.Store(true)
+		r.started = true
 	}
 	return nil
 }
@@ -511,20 +511,7 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 	r.router.ResetNetwork()
 }
 
-func (r *NetworkManager) ReleaseMemory(ctx context.Context) {
-	r.ResetNetwork(ctx)
-	for _, outbound := range r.outbound.Outbounds() {
-		keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
-		if isKeeper {
-			keeper.CloseIdleConnections()
-		}
-	}
-}
-
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
-	// Initialization notifications must not reset connections even if processing
-	// is delayed until after startup completes.
-	resetNetwork := r.started.Load()
 	if defaultInterface == nil {
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
@@ -541,11 +528,11 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	}
 	go func() {
 		defer updateCancel()
-		r.updateInterface(updateContext, defaultInterface, resetNetwork)
+		r.updateInterface(updateContext, defaultInterface)
 	}()
 }
 
-func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface, resetNetwork bool) {
+func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface) {
 	r.interfaceUpdateRunAccess.Lock()
 	defer r.interfaceUpdateRunAccess.Unlock()
 	if ctx.Err() != nil {
@@ -586,7 +573,7 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	if ctx.Err() != nil {
 		return
 	}
-	if !resetNetwork {
+	if !r.started {
 		return
 	}
 	r.ResetNetwork(ctx)

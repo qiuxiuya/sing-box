@@ -56,7 +56,6 @@
           "update_interval": "",
           "override_dialer": {},
           "override_tls": {},
-
           "override_anytls": {},
 
           // Deprecated
@@ -105,10 +104,6 @@
 
 健康检查的超时时间。默认为 `3s`。
 
-##### override_anytls
-
-覆写订阅内容的 AnyTLS 字段，参阅 [AnyTLS 字段覆写](/zh/configuration/provider/override_anytls/)。
-
 ##### override_dialer
 
 覆写订阅内容的拨号字段, 参阅 [拨号字段覆写](/zh/configuration/provider/override_dialer/)。
@@ -116,6 +111,10 @@
 ##### override_tls
 
 覆写订阅内容的 TLS 字段, 参阅 [TLS 字段覆写](/zh/configuration/provider/override_tls/)。
+
+##### override_anytls
+
+覆写订阅内容的 AnyTLS 字段，参阅 [AnyTLS 字段覆写](/zh/configuration/provider/override_anytls/)。
 
 ### 本地字段
 

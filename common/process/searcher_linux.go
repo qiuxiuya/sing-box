@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,7 +39,7 @@ type linuxSearcher struct {
 }
 
 type uidProcessPaths struct {
-	entries map[uint32][]string
+	entries map[uint32]string
 }
 
 func NewSearcher(config Config) (Searcher, error) {
@@ -86,11 +85,11 @@ func (s *linuxSearcher) FindProcessInfo(ctx context.Context, network string, sou
 	processInfo := &adapter.ConnectionOwner{
 		UserId: int32(uid),
 	}
-	processPaths, err := s.findProcessPaths(inode, uid)
+	processPath, err := s.findProcessPath(inode, uid)
 	if err != nil {
 		s.logger.DebugContext(ctx, "find process path: ", err)
 	} else {
-		processInfo.ProcessPaths = processPaths
+		processInfo.ProcessPath = processPath
 	}
 	completeProcessInfo(processInfo, s.packageManager)
 	return processInfo, nil
@@ -105,7 +104,7 @@ func FindProcessInfoByPID(processID uint32, userID uint32, packageManager tun.Pa
 	}
 	processPath, err := os.Readlink(filepath.Join(pathProc, strconv.FormatUint(uint64(processID), 10), "exe"))
 	if err == nil {
-		processInfo.ProcessPaths = []string{processPath}
+		processInfo.ProcessPath = processPath
 	}
 	completeProcessInfo(processInfo, packageManager)
 	return processInfo, err
@@ -137,33 +136,33 @@ func (s *linuxSearcher) resolveSocketByNetlink(network string, source netip.Addr
 // The socket keeps the uid it was created with, while /proc reflects the
 // current uid of the process, so a socket created before a privilege drop
 // only appears under a scan of all users.
-func (s *linuxSearcher) findProcessPaths(targetInode, uid uint32) ([]string, error) {
+func (s *linuxSearcher) findProcessPath(targetInode, uid uint32) (string, error) {
 	for _, scanUID := range []uint32{uid, processPathsAllUsers} {
 		if cached, ok := s.processPathCache.Get(scanUID); ok {
-			if processPaths, found := cached.entries[targetInode]; found {
-				return processPaths, nil
+			if processPath, found := cached.entries[targetInode]; found {
+				return processPath, nil
 			}
 		}
 		processPaths, err := buildProcessPaths(scanUID)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		s.processPathCache.Add(scanUID, &uidProcessPaths{entries: processPaths})
-		inodePaths, found := processPaths[targetInode]
+		processPath, found := processPaths[targetInode]
 		if found {
-			return inodePaths, nil
+			return processPath, nil
 		}
 	}
-	return nil, E.New("process of uid(", uid, "), inode(", targetInode, ") not found")
+	return "", E.New("process of uid(", uid, "), inode(", targetInode, ") not found")
 }
 
-func buildProcessPaths(uid uint32) (map[uint32][]string, error) {
+func buildProcessPaths(uid uint32) (map[uint32]string, error) {
 	files, err := os.ReadDir(pathProc)
 	if err != nil {
 		return nil, err
 	}
 	buffer := make([]byte, syscall.PathMax)
-	processPaths := make(map[uint32][]string)
+	processPaths := make(map[uint32]string)
 	for _, file := range files {
 		if !file.IsDir() || !isPid(file.Name()) {
 			continue
@@ -200,8 +199,8 @@ func buildProcessPaths(uid uint32) (map[uint32][]string, error) {
 			if !ok {
 				continue
 			}
-			if !slices.Contains(processPaths[inode], exePath) {
-				processPaths[inode] = append(processPaths[inode], exePath)
+			if _, loaded := processPaths[inode]; !loaded {
+				processPaths[inode] = exePath
 			}
 		}
 	}

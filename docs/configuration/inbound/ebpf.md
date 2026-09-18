@@ -4,10 +4,11 @@ icon: material/lan-connect
 
 # eBPF
 
-!!! quote "Changes in sing-box 1.15.0"
+!!! quote "Experimental backport for sing-box 1.14.1"
 
-    eBPF inbound is experimental and only available in Linux and Android builds
-    with the `with_ebpf` build tag.
+    This fork backports the experimental eBPF inbound to the sing-box 1.14.1
+    stable baseline. It is not part of the upstream 1.14.1 release and is only
+    available in Linux and Android builds with the `with_ebpf` build tag.
 
 The eBPF inbound transparently intercepts selected local or downstream TCP and
 UDP traffic. Intercepted connections enter the normal sing-box routing pipeline.

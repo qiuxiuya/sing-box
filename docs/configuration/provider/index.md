@@ -56,7 +56,6 @@ List of subscription providers.
           "update_interval": "",
           "override_dialer": {},
           "override_tls": {},
-
           "override_anytls": {},
 
           // Deprecated
@@ -105,10 +104,6 @@ Health check interval. The minimum value is `1m`, the default value is `10m`.
 
 Health check timeout. the default value is `3s`.
 
-##### override_anytls
-
-Override AnyTLS fields of outbounds in provider, see [AnyTLS Fields Override](/configuration/provider/override_anytls/) for details.
-
 ##### override_dialer
 
 Override dialer fields of outbounds in provider, see [Dialer Fields Override](/configuration/provider/override_dialer/) for details.
@@ -116,6 +111,10 @@ Override dialer fields of outbounds in provider, see [Dialer Fields Override](/c
 ##### override_tls
 
 Override TLS fields of outbounds in provider, see [TLS Fields Override](/configuration/provider/override_tls/) for details.
+
+##### override_anytls
+
+Override AnyTLS fields of outbounds in provider, see [AnyTLS Fields Override](/configuration/provider/override_anytls/) for details.
 
 ### Local Fields
 

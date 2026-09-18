@@ -1,7 +1,3 @@
-When this group is referenced, all candidate outbounds, including provider members,
-are treated as referenced for idle connection management, regardless of health-check
-results. This keeps their on-demand dependencies available for selection.
-
 ### Structure
 
 ```json

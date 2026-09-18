@@ -28,7 +28,6 @@ func RegisterSelector(registry *outbound.Registry) {
 }
 
 var (
-	_ adapter.Referrer                = (*Selector)(nil)
 	_ adapter.PreMatchOutboundGroup   = (*Selector)(nil)
 	_ adapter.ConnectionHandler       = (*Selector)(nil)
 	_ adapter.PacketConnectionHandler = (*Selector)(nil)
@@ -163,10 +162,6 @@ func (s *Selector) All() []string {
 	return slices.Clone(s.tags)
 }
 
-func (s *Selector) References() []string {
-	return []string{s.Now()}
-}
-
 func (s *Selector) Selected() adapter.Outbound {
 	return s.selected.Load()
 }
@@ -298,9 +293,6 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	s.providerAccess.Unlock()
 	if previous != detour {
 		s.interruptGroup.Interrupt(s.interruptExternalConnections)
-		if s.history != nil {
-			s.history.NotifyUpdated()
-		}
 	}
 	return nil
 }

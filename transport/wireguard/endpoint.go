@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/dialer"
@@ -40,14 +39,12 @@ type Endpoint struct {
 	allowedAddress []netip.Prefix
 	tunDevice      Device
 	returnDevice   *returnDeviceWrapper
-	device         atomic.Pointer[device.Device]
+	device         *device.Device
 	allowedIPs     *device.AllowedIPs
 	egressPool     *tun.UDPEgressPool
 	pause          pause.Manager
 	pauseCallback  *list.Element[pause.Callback]
-	stateAccess    sync.Mutex
-	suspended      atomic.Bool
-	networkPaused  bool
+	deviceAccess   sync.Mutex
 	pauseAccess    sync.Mutex
 	pauseUpdated   chan struct{}
 	done           chan struct{}
@@ -176,12 +173,9 @@ func (e *Endpoint) Start(postStart bool) error {
 			recorder := powerManager.Recorder()
 			if recorder != nil {
 				attribution := &powerreport.Attribution{Endpoint: e.options.Tag}
-				counter := recorder.TrafficCounter(powerreport.TrafficEndpoint, e.options.Tag)
 				standardBind.SetIOActivityFuncs(func(size int) {
-					counter.CountIn(int64(size))
 					recorder.Touch(powerreport.DirectionInbound, size, attribution)
 				}, func(size int) {
-					counter.CountOut(int64(size))
 					recorder.Touch(powerreport.DirectionOutbound, size, attribution)
 				})
 			}
@@ -264,7 +258,9 @@ func (e *Endpoint) Start(postStart bool) error {
 			return endpoints, nil
 		})
 	}
-	e.device.Store(wgDevice)
+	e.deviceAccess.Lock()
+	e.device = wgDevice
+	e.deviceAccess.Unlock()
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
@@ -293,34 +289,6 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return e.tunDevice.ListenPacket(ctx, destination)
 }
 
-func (e *Endpoint) SetIdle(idle bool) {
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
-		return
-	}
-	if idle {
-		if e.suspended.Load() {
-			return
-		}
-		e.suspended.Store(true)
-		wgDevice.Down()
-	} else if e.options.System {
-		e.resumeLocked(wgDevice)
-	}
-}
-
-func (e *Endpoint) resumeLocked(wgDevice *device.Device) {
-	if !e.suspended.Load() {
-		return
-	}
-	e.suspended.Store(false)
-	if !e.networkPaused {
-		wgDevice.Up()
-	}
-}
-
 func (e *Endpoint) ensureDeviceStarted(ctx context.Context) error {
 	if err := e.waitNetworkActive(ctx); err != nil {
 		return err
@@ -335,22 +303,20 @@ func (e *Endpoint) startDevice() error {
 	if e.isPaused() {
 		return errNetworkPaused
 	}
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
+	e.deviceAccess.Lock()
+	defer e.deviceAccess.Unlock()
 	select {
 	case <-e.done:
 		return net.ErrClosed
 	default:
 	}
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
+	if e.device == nil {
 		return net.ErrClosed
 	}
 	if e.isPaused() {
 		return errNetworkPaused
 	}
-	e.suspended.Store(false)
-	return wgDevice.Up()
+	return e.device.Up()
 }
 
 func (e *Endpoint) waitNetworkActive(ctx context.Context) error {
@@ -406,12 +372,12 @@ func (e *Endpoint) Close() error {
 			e.egressPool.Close()
 			e.egressPool = nil
 		}
-		e.stateAccess.Lock()
-		defer e.stateAccess.Unlock()
-		wgDevice := e.device.Swap(nil)
-		if wgDevice != nil {
-			wgDevice.Down()
-			wgDevice.Close()
+		e.deviceAccess.Lock()
+		defer e.deviceAccess.Unlock()
+		if e.device != nil {
+			e.device.Down()
+			e.device.Close()
+			e.device = nil
 		} else if e.tunDevice != nil {
 			e.closeErr = e.tunDevice.Close()
 		}
@@ -430,39 +396,33 @@ func (e *Endpoint) BindUpdate() error {
 	if e.isPaused() {
 		return nil
 	}
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
+	e.deviceAccess.Lock()
+	defer e.deviceAccess.Unlock()
+	if e.device == nil {
+		return nil
+	}
 	if e.isPaused() {
 		return nil
 	}
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
-		return nil
-	}
-	return wgDevice.BindUpdate()
+	return e.device.BindUpdate()
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
 	defer e.notifyPauseUpdated()
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
+	e.deviceAccess.Lock()
+	defer e.deviceAccess.Unlock()
+	if e.device == nil {
 		return
 	}
 	var err error
 	switch event {
 	case pause.EventNetworkPause:
-		e.networkPaused = true
-		err = wgDevice.Down()
-	case pause.EventNetworkWake, pause.EventDeviceWake:
-		if event == pause.EventNetworkWake {
-			e.networkPaused = false
-		}
-		if e.isPaused() || e.suspended.Load() {
+		err = e.device.Down()
+	case pause.EventDeviceWake, pause.EventNetworkWake:
+		if e.isPaused() {
 			return
 		}
-		err = wgDevice.Up()
+		err = e.device.Up()
 	}
 	if err != nil {
 		e.options.Logger.Warn(E.Cause(err, "update WireGuard device state"))

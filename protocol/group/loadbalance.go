@@ -38,7 +38,6 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 var (
 	_ adapter.PreMatchOutboundGroup   = (*LoadBalance)(nil)
 	_ adapter.InterfaceUpdateListener = (*LoadBalance)(nil)
-	_ adapter.Referrer                = (*LoadBalance)(nil)
 )
 
 const (
@@ -181,14 +180,6 @@ func (s *LoadBalance) All() []string {
 	return all
 }
 
-func (s *LoadBalance) References() []string {
-	if s.group == nil {
-		return s.Dependencies()
-	}
-	// Any candidate may be selected, including members supplied by providers.
-	return s.All()
-}
-
 func (s *LoadBalance) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
 	s.group.Touch()
 	var (
@@ -299,9 +290,6 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 	s.outboundsCache = outboundsCache
 	s.group.storeOutbounds(outbounds)
 	s.providerAccess.Unlock()
-	if s.group.history != nil {
-		s.group.history.NotifyUpdated()
-	}
 	if s.isGroupActive() {
 		s.group.access.Lock()
 		if s.group.ticker != nil {

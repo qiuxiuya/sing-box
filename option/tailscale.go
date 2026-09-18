@@ -36,11 +36,6 @@ type TailscaleEndpointOptions struct {
 	UDPTimeout                 UDPTimeoutCompat           `json:"udp_timeout,omitempty"`
 	SSHServer                  *TailscaleSSHServerOptions `json:"ssh_server,omitempty"`
 	TaildropDirectory          string                     `json:"taildrop_directory,omitempty"`
-	OnDemand                   bool                       `json:"on_demand,omitempty"`
-}
-
-func (o *TailscaleEndpointOptions) TakeInnerDomainResolverOptions() *DomainResolveOptions {
-	return o.InnerDomainResolver
 }
 
 type _TailscaleSSHServerOptions struct {

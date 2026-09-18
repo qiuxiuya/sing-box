@@ -75,36 +75,6 @@ func (s *udpNATService) NewPacket(
 	destination M.Socksaddr,
 	userData any,
 ) {
-	conn, loaded := s.connection(key, source, destination, userData)
-	if !loaded {
-		return
-	}
-	conn.newPacket(bufferSlices, destination)
-}
-
-// NewPacketBuffer takes ownership of buffer, including when preparing the
-// connection fails or its receive queue is full.
-func (s *udpNATService) NewPacketBuffer(
-	key udpSessionKey,
-	buffer *buf.Buffer,
-	source M.Socksaddr,
-	destination M.Socksaddr,
-	userData any,
-) {
-	conn, loaded := s.connection(key, source, destination, userData)
-	if !loaded {
-		buffer.Release()
-		return
-	}
-	conn.newPacketBuffer(buffer, destination)
-}
-
-func (s *udpNATService) connection(
-	key udpSessionKey,
-	source M.Socksaddr,
-	destination M.Socksaddr,
-	userData any,
-) (*udpNATConn, bool) {
 	conn, _, loaded := s.cache.GetAndRefreshOrAdd(key, func() (*udpNATConn, bool) {
 		ok, ctx, writer, onClose := s.prepare(key, source, destination, userData)
 		if !ok {
@@ -122,13 +92,13 @@ func (s *udpNATService) connection(
 		go s.handler.NewPacketConnectionEx(ctx, newConn, source, destination, onClose)
 		return newConn, true
 	})
-	return conn, loaded
-}
-
-func (c *udpNATConn) newPacket(bufferSlices [][]byte, destination M.Socksaddr) {
-	c.handlerAccess.RLock()
-	readWaitOptions := c.readWaitOptions
-	handler := c.handler
+	if !loaded {
+		return
+	}
+	conn.handlerAccess.RLock()
+	readWaitOptions := conn.readWaitOptions
+	handler := conn.handler
+	conn.handlerAccess.RUnlock()
 	dataLen := 0
 	for _, bufferSlice := range bufferSlices {
 		dataLen += len(bufferSlice)
@@ -139,37 +109,16 @@ func (c *udpNATConn) newPacket(bufferSlices [][]byte, destination M.Socksaddr) {
 	}
 	readWaitOptions.PostReturn(buffer)
 	if handler != nil {
-		c.handlerAccess.RUnlock()
 		handler.NewPacketEx(buffer, destination)
 		return
 	}
-	c.enqueuePacketLocked(buffer, destination)
-	c.handlerAccess.RUnlock()
-}
-
-func (c *udpNATConn) newPacketBuffer(buffer *buf.Buffer, destination M.Socksaddr) {
-	c.handlerAccess.RLock()
-	handler := c.handler
-	if handler != nil {
-		buffer = c.readWaitOptions.Copy(buffer)
-		c.handlerAccess.RUnlock()
-		handler.NewPacketEx(buffer, destination)
-		return
-	}
-	c.enqueuePacketLocked(buffer, destination)
-	c.handlerAccess.RUnlock()
-}
-
-// enqueuePacketLocked requires handlerAccess to remain read-locked so
-// SetHandler cannot finish draining the queue before this packet is visible.
-func (c *udpNATConn) enqueuePacketLocked(buffer *buf.Buffer, destination M.Socksaddr) {
 	packet := N.NewPacketBuffer()
 	*packet = N.PacketBuffer{
 		Buffer:      buffer,
 		Destination: destination,
 	}
 	select {
-	case c.packetChan <- packet:
+	case conn.packetChan <- packet:
 	default:
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
@@ -283,13 +232,11 @@ func (c *udpNATConn) SetHandler(handler N.UDPHandlerEx) {
 	c.handlerAccess.Lock()
 	c.handler = handler
 	c.readWaitOptions = N.NewReadWaitOptions(nil, handler)
-	readWaitOptions := c.readWaitOptions
 	c.handlerAccess.Unlock()
 	for {
 		select {
 		case packet := <-c.packetChan:
-			buffer := readWaitOptions.Copy(packet.Buffer)
-			handler.NewPacketEx(buffer, packet.Destination)
+			handler.NewPacketEx(packet.Buffer, packet.Destination)
 			N.PutPacketBuffer(packet)
 		default:
 			return

@@ -139,7 +139,10 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 		s.inet6Current = nextAddress
 		address = nextAddress
 	}
-	s.storage.FakeIPStoreAsync(address, domain, s.logger)
+	err := s.storage.FakeIPStore(address, domain)
+	if err != nil {
+		s.logger.Warn("save FakeIP cache: ", err)
+	}
 	s.storage.FakeIPSaveMetadataAsync(&adapter.FakeIPMetadata{
 		Inet4Range:   s.inet4Range,
 		Inet6Range:   s.inet6Range,

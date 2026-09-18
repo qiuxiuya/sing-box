@@ -4,10 +4,11 @@ icon: material/lan-connect
 
 # eBPF
 
-!!! quote "sing-box 1.15.0 中的更改"
+!!! quote "面向 sing-box 1.14.1 的实验性移植"
 
-    eBPF 入站仍为实验功能，仅在带有 `with_ebpf` 编译标签的 Linux 和 Android
-    构建中可用。
+    本分支将实验性 eBPF 入站移植到 sing-box 1.14.1 稳定基线；它并非上游
+    1.14.1 正式版本的一部分，仅在带有 `with_ebpf` 编译标签的 Linux 和
+    Android 构建中可用。
 
 eBPF 入站透明接管选中的本机或下游 TCP/UDP 流量，被接管的连接仍进入 sing-box
 常规路由流程。所需的系统网络状态由 sing-box 自动创建并清理。

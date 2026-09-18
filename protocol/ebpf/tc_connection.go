@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
+	sBufio "github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -55,16 +56,15 @@ func (i *Inbound) newTCPacket(
 	buffer *buf.Buffer,
 	oob []byte,
 	source M.Socksaddr,
-	takeOwnership bool,
-) bool {
+) {
 	_, destination, interfaceIndex, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		i.udpWarnings.packetInfo.warn(i.logger, "read TC eBPF UDP destination: ", err)
-		return false
+		return
 	}
 	if !destination.IsValid() {
 		i.udpWarnings.packetInfo.warn(i.logger, "TC eBPF UDP original destination is missing")
-		return false
+		return
 	}
 	client := source.AddrPort()
 	assignment, err := backend.LookupAssignment(commonEBPF.ProtocolUDP, client, destination, interfaceIndex, false)
@@ -74,7 +74,7 @@ func (i *Inbound) newTCPacket(
 	if err != nil {
 		i.counters.assignmentLookupFailures.Add(1)
 		i.udpWarnings.originalDestination.warn(i.logger, "lookup TC eBPF UDP assignment: ", err)
-		return false
+		return
 	}
 	var sourceMAC net.HardwareAddr
 	if assignment.Path == commonEBPF.TCPathShared && assignment.SourceMACValid != 0 {
@@ -91,12 +91,7 @@ func (i *Inbound) newTCPacket(
 		InterfaceIndex: assignment.InterfaceIndex,
 	}
 	i.udpClientTable.setDirectBinding(key, destination, sourceMAC, assignment.SocketCookie)
-	if takeOwnership {
-		i.udpNat.NewPacketBuffer(key, buffer, source, M.SocksaddrFromNetIP(destination), nil)
-		return true
-	}
 	i.udpNat.NewPacket(key, [][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(destination), nil)
-	return false
 }
 
 func (i *Inbound) lookupProcessInfo(socketCookie uint64) *adapter.ConnectionOwner {
@@ -152,13 +147,13 @@ func (w *tcPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr
 	if w.clientState.isCgroupDataPlane() {
 		return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.key.Source, binding.redirectAddress)
 	}
-	entry, release, err := w.inbound.udpReplySockets.get(destinationAddress, w.replySocketFactory())
+	socket, release, err := w.inbound.udpReplySockets.get(destinationAddress, w.replySocketFactory())
 	if err != nil {
 		w.logReplySocketError(err)
 		return err
 	}
 	defer release()
-	_, err = entry.conn.WriteToUDPAddrPort(buffer.Bytes(), w.key.Source)
+	_, err = socket.WriteToUDPAddrPort(buffer.Bytes(), w.key.Source)
 	return err
 }
 
@@ -248,14 +243,15 @@ func (w *tcPacketWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []
 	}
 	var batchErr error
 	for source, group := range groups {
-		entry, release, err := w.inbound.udpReplySockets.get(source, w.replySocketFactory())
+		socket, release, err := w.inbound.udpReplySockets.get(source, w.replySocketFactory())
 		if err != nil {
 			w.logReplySocketError(err)
 			buf.ReleaseMulti(group.buffers)
 			batchErr = errors.Join(batchErr, err)
 			continue
 		}
-		err = entry.writer.WritePacketBatch(group.buffers, group.destinations)
+		writer := sBufio.NewPacketBatchWriter(sBufio.NewPacketConn(socket))
+		err = writer.WritePacketBatch(group.buffers, group.destinations)
 		release()
 		batchErr = errors.Join(batchErr, err)
 	}

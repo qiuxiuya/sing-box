@@ -23,7 +23,9 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 	if err := e.startDevice(); err != nil {
 		return err
 	}
-	wgDevice := e.device.Load()
+	e.deviceAccess.Lock()
+	wgDevice := e.device
+	e.deviceAccess.Unlock()
 	if wgDevice == nil {
 		return E.New("WireGuard device is not ready")
 	}

@@ -33,7 +33,6 @@ func RegisterURLTest(registry *outbound.Registry) {
 var (
 	_ adapter.PreMatchOutboundGroup   = (*URLTest)(nil)
 	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
-	_ adapter.Referrer                = (*URLTest)(nil)
 )
 
 type URLTest struct {
@@ -178,23 +177,6 @@ func (s *URLTest) All() []string {
 		tags = append(tags, detour.Tag())
 	}
 	return tags
-}
-
-func (s *URLTest) References() []string {
-	group := s.group
-	if group == nil {
-		return nil
-	}
-	var references []string
-	selectedOutboundTCP := group.selectedOutboundTCP.Load()
-	selectedOutboundUDP := group.selectedOutboundUDP.Load()
-	if selectedOutboundTCP != nil {
-		references = append(references, selectedOutboundTCP.Tag())
-	}
-	if selectedOutboundUDP != nil && selectedOutboundUDP != selectedOutboundTCP {
-		references = append(references, selectedOutboundUDP.Tag())
-	}
-	return references
 }
 
 func (s *URLTest) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectOutbound func(adapter.Outbound) (adapter.Outbound, adapter.PreMatchAction)) (adapter.Outbound, adapter.PreMatchAction) {
@@ -734,17 +716,13 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 func (g *URLTestGroup) performUpdateCheck() {
 	g.updateAccess.Lock()
 	defer g.updateAccess.Unlock()
-	var (
-		updated  bool
-		selected bool
-	)
+	var updated bool
 	selectedOutboundTCP := g.selectedOutboundTCP.Load()
 	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (selectedOutboundTCP == nil || (exists && outbound != selectedOutboundTCP)) {
 		if selectedOutboundTCP != nil {
 			updated = true
 		}
 		g.selectedOutboundTCP.Store(outbound)
-		selected = true
 	}
 	selectedOutboundUDP := g.selectedOutboundUDP.Load()
 	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (selectedOutboundUDP == nil || (exists && outbound != selectedOutboundUDP)) {
@@ -752,13 +730,9 @@ func (g *URLTestGroup) performUpdateCheck() {
 			updated = true
 		}
 		g.selectedOutboundUDP.Store(outbound)
-		selected = true
 	}
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
-	}
-	if selected {
-		g.history.NotifyUpdated()
 	}
 }
 
@@ -797,13 +771,9 @@ func (g *URLTestGroup) replaceOutbounds(outbounds []adapter.Outbound) {
 	}
 	updated := (selectedOutboundTCP != nil && g.selectedOutboundTCP.Load() != selectedOutboundTCP) ||
 		(selectedOutboundUDP != nil && g.selectedOutboundUDP.Load() != selectedOutboundUDP)
-	selected := g.selectedOutboundTCP.Load() != selectedOutboundTCP || g.selectedOutboundUDP.Load() != selectedOutboundUDP
 	g.updateAccess.Unlock()
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
-	}
-	if selected && g.history != nil {
-		g.history.NotifyUpdated()
 	}
 }
 

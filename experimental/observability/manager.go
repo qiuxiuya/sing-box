@@ -381,11 +381,9 @@ func (m *Manager) connectionFromMetadata(metadata trafficcontrol.TrackerMetadata
 	}
 	var process string
 	if processInfo := metadata.Metadata.ProcessInfo; processInfo != nil {
-		if len(processInfo.ProcessPaths) > 0 {
-			process = processInfo.ProcessPaths[0]
-		}
-		if process == "" && len(processInfo.PackageNames) > 0 {
-			process = processInfo.PackageNames[0]
+		process = processInfo.ProcessPath
+		if process == "" && len(processInfo.AndroidPackageNames) > 0 {
+			process = processInfo.AndroidPackageNames[0]
 		}
 	}
 	connection := Connection{
@@ -495,11 +493,11 @@ func dimensionValue(metadata trafficcontrol.TrackerMetadata, name string) string
 		}
 	case "process":
 		if metadata.Metadata.ProcessInfo != nil {
-			if len(metadata.Metadata.ProcessInfo.ProcessPaths) > 0 && metadata.Metadata.ProcessInfo.ProcessPaths[0] != "" {
-				return metadata.Metadata.ProcessInfo.ProcessPaths[0]
+			if metadata.Metadata.ProcessInfo.ProcessPath != "" {
+				return metadata.Metadata.ProcessInfo.ProcessPath
 			}
-			if len(metadata.Metadata.ProcessInfo.PackageNames) > 0 {
-				return metadata.Metadata.ProcessInfo.PackageNames[0]
+			if len(metadata.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
+				return metadata.Metadata.ProcessInfo.AndroidPackageNames[0]
 			}
 		}
 	case "user":

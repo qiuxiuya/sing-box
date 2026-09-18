@@ -129,11 +129,10 @@ func (c *HTTPConn) Upstream() any {
 }
 
 type HTTP2Conn struct {
-	reader  io.Reader
-	writer  io.Writer
-	create  chan struct{}
-	err     error
-	onClose func()
+	reader io.Reader
+	writer io.Writer
+	create chan struct{}
+	err    error
 }
 
 func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
@@ -173,11 +172,7 @@ func (c *HTTP2Conn) Write(b []byte) (n int, err error) {
 }
 
 func (c *HTTP2Conn) Close() error {
-	err := common.Close(c.reader, c.writer)
-	if c.onClose != nil {
-		c.onClose()
-	}
-	return err
+	return common.Close(c.reader, c.writer)
 }
 
 func (c *HTTP2Conn) LocalAddr() net.Addr {
