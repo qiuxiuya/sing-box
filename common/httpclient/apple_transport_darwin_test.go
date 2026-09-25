@@ -5,11 +5,18 @@ package httpclient
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -53,12 +60,13 @@ type appleHTTPObservedRequest struct {
 }
 
 type appleHTTPTestServer struct {
-	server         *httptest.Server
-	baseURL        string
-	dialHost       string
-	certificate    stdtls.Certificate
-	certificatePEM string
-	publicKeyHash  []byte
+	server          *httptest.Server
+	baseURL         string
+	dialHost        string
+	certificate     stdtls.Certificate
+	certificatePEM  string
+	publicKeyHash   []byte
+	certificateHash []byte
 }
 
 type appleTestAnchors struct {
@@ -396,30 +404,36 @@ func TestNewAppleSessionConfig(t *testing.T) {
 	}
 }
 
-func TestAppleTransportVerifyPublicKeySHA256(t *testing.T) {
+func TestAppleTransportVerifyPinnedCertificate(t *testing.T) {
 	serverCertificate, _ := newAppleHTTPTestCertificate(t, "localhost")
-	goodHash := certificatePublicKeySHA256(t, serverCertificate.Certificate[0])
-	badHash := append([]byte(nil), goodHash...)
+	goodPublicKeyHash := certificatePublicKeySHA256(t, serverCertificate.Certificate[0])
+	goodCertificateHash := certificateSHA256(serverCertificate.Certificate[0])
+	badHash := append([]byte(nil), goodPublicKeyHash...)
 	badHash[0] ^= 0xff
 
-	err := verifyApplePinnedPublicKeySHA256(goodHash, serverCertificate.Certificate[0])
+	err := verifyApplePinnedCertificate(nil, goodPublicKeyHash, serverCertificate.Certificate[0])
 	if err != nil {
-		t.Fatalf("expected correct pin to succeed: %v", err)
+		t.Fatalf("expected correct public key pin to succeed: %v", err)
 	}
 
-	err = verifyApplePinnedPublicKeySHA256(badHash, serverCertificate.Certificate[0])
+	err = verifyApplePinnedCertificate(goodCertificateHash, nil, serverCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("expected correct certificate pin to succeed: %v", err)
+	}
+
+	err = verifyApplePinnedCertificate(badHash, badHash, serverCertificate.Certificate[0])
 	if err == nil {
 		t.Fatal("expected incorrect pin to fail")
 	}
-	if !strings.Contains(err.Error(), "unrecognized remote public key") {
+	if !strings.Contains(err.Error(), "unrecognized peer certificate") {
 		t.Fatalf("unexpected pin mismatch error: %v", err)
 	}
 
-	err = verifyApplePinnedPublicKeySHA256(goodHash[:applePinnedHashSize-1], serverCertificate.Certificate[0])
+	err = verifyApplePinnedCertificate(nil, goodPublicKeyHash[:applePinnedHashSize-1], serverCertificate.Certificate[0])
 	if err == nil {
 		t.Fatal("expected malformed pin list to fail")
 	}
-	if !strings.Contains(err.Error(), "invalid pinned public key list") {
+	if !strings.Contains(err.Error(), "invalid pinned hash list") {
 		t.Fatalf("unexpected malformed pin error: %v", err)
 	}
 }
@@ -623,6 +637,49 @@ func TestAppleTransportPinnedPublicKey(t *testing.T) {
 	}
 }
 
+func TestAppleTransportPinnedCertificate(t *testing.T) {
+	server := startAppleHTTPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("pinned"))
+	})
+
+	goodTransport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
+		Version: 2,
+		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+			TLS: &option.OutboundTLSOptions{
+				Enabled:           true,
+				ServerName:        "localhost",
+				CertificateSHA256: badoption.Listable[[]byte]{server.certificateHash},
+			},
+		},
+	})
+
+	response, err := goodTransport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/good"), nil))
+	if err != nil {
+		t.Fatalf("expected pinned request to succeed: %v", err)
+	}
+	response.Body.Close()
+
+	badHash := append([]byte(nil), server.certificateHash...)
+	badHash[0] ^= 0xff
+	badTransport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
+		Version: 2,
+		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+			TLS: &option.OutboundTLSOptions{
+				Enabled:           true,
+				ServerName:        "localhost",
+				CertificateSHA256: badoption.Listable[[]byte]{badHash},
+			},
+		},
+	})
+
+	response, err = badTransport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/bad"), nil))
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("expected incorrect pinned certificate to fail")
+	}
+}
+
 func TestAppleTransportGuardrails(t *testing.T) {
 	testCases := []struct {
 		name          string
@@ -790,6 +847,11 @@ func startAppleHTTPTestServerWithCertificateName(t *testing.T, certificateServer
 	t.Helper()
 
 	serverCertificate, serverCertificatePEM := newAppleHTTPTestCertificate(t, certificateServerName)
+	return startAppleHTTPTestServerWithCertificate(t, handler, serverCertificate, serverCertificatePEM)
+}
+
+func startAppleHTTPTestServerWithCertificate(t *testing.T, handler http.HandlerFunc, serverCertificate stdtls.Certificate, serverCertificatePEM string) *appleHTTPTestServer {
+	t.Helper()
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
 	server.TLS = &stdtls.Config{
@@ -807,12 +869,13 @@ func startAppleHTTPTestServerWithCertificateName(t *testing.T, certificateServer
 	baseURL.Host = net.JoinHostPort("localhost", parsedURL.Port())
 
 	return &appleHTTPTestServer{
-		server:         server,
-		baseURL:        baseURL.String(),
-		dialHost:       parsedURL.Hostname(),
-		certificate:    serverCertificate,
-		certificatePEM: serverCertificatePEM,
-		publicKeyHash:  certificatePublicKeySHA256(t, serverCertificate.Certificate[0]),
+		server:          server,
+		baseURL:         baseURL.String(),
+		dialHost:        parsedURL.Hostname(),
+		certificate:     serverCertificate,
+		certificatePEM:  serverCertificatePEM,
+		publicKeyHash:   certificatePublicKeySHA256(t, serverCertificate.Certificate[0]),
+		certificateHash: certificateSHA256(serverCertificate.Certificate[0]),
 	}
 }
 
@@ -919,6 +982,11 @@ func newAppleHTTPTestCertificate(t *testing.T, serverName string) (stdtls.Certif
 	return certificate, string(certificatePEM)
 }
 
+func certificateSHA256(certificateDER []byte) []byte {
+	hashValue := sha256.Sum256(certificateDER)
+	return append([]byte(nil), hashValue[:]...)
+}
+
 func certificatePublicKeySHA256(t *testing.T, certificateDER []byte) []byte {
 	t.Helper()
 
@@ -988,5 +1056,110 @@ func assertAppleHTTPSucceeds(t *testing.T, transport http.RoundTripper, rawURL s
 	defer response.Body.Close()
 	if body := readResponseBody(t, response); body != "ok" {
 		t.Fatalf("unexpected response body: %q", body)
+	}
+}
+
+func TestAppleTransportCertificatePin(t *testing.T) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "pin test CA"},
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"localhost", "wrong-host"} {
+		for _, expired := range []bool{false, true} {
+			expiry := time.Now().Add(time.Hour)
+			if expired {
+				expiry = time.Now().Add(-time.Minute)
+			}
+			keyPEM, certPEM, err := boxTLS.GenerateCertificate(ca, caKey, time.Now, host, expiry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert, err := stdtls.X509KeyPair(certPEM, keyPEM)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert.Certificate = append(cert.Certificate, caDER)
+			server := startAppleHTTPTestServerWithCertificate(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }, cert, string(certPEM))
+			for _, pinKind := range []string{"leaf", "ca", "wrong"} {
+				pin := certificateSHA256(cert.Certificate[0])
+				if pinKind == "ca" {
+					pin = certificateSHA256(caDER)
+				}
+				if pinKind == "wrong" {
+					pin = bytes.Repeat([]byte{0xff}, 32)
+				}
+				for _, insecure := range []bool{false, true} {
+					transport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
+						Version: 2, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{
+							Enabled: true, Insecure: insecure, CertificatePinSHA256: hex.EncodeToString(pin),
+						}},
+					})
+					response, requestErr := transport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/"), nil))
+					if response != nil {
+						response.Body.Close()
+					}
+					wantOK := pinKind == "leaf" || (pinKind == "ca" && host == "localhost" && !expired)
+					if (requestErr == nil) != wantOK {
+						t.Fatalf("host=%s expired=%v pin=%s insecure=%v: %v", host, expired, pinKind, insecure, requestErr)
+					}
+				}
+			}
+			if host == "wrong-host" && !expired {
+				transport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
+					Version: 2, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{
+						Enabled: true, CertificateServerName: host, CertificatePinSHA256: hex.EncodeToString(certificateSHA256(caDER)),
+					}},
+				})
+				response, err := transport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/ca-name-override"), nil))
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+			}
+			if host == "localhost" {
+				transport := newAppleHTTPTestTransport(t, server, option.HTTPClientOptions{
+					Version: 2, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{
+						Enabled: true, CertificatePinSHA256: hex.EncodeToString(certificateSHA256(caDER)),
+					}},
+				})
+				// The Go verifier must receive the request's custom verification time.
+				transport.(*appleTransport).shared.timeFunc = func() time.Time {
+					if expired {
+						return time.Now().Add(-30 * time.Minute)
+					}
+					return time.Now().Add(2 * time.Hour)
+				}
+				response, requestErr := transport.RoundTrip(newAppleHTTPRequest(t, http.MethodGet, server.URL("/clock"), nil))
+				if response != nil {
+					response.Body.Close()
+				}
+				if (requestErr == nil) != expired {
+					t.Fatalf("custom time expired=%v: %v", expired, requestErr)
+				}
+			}
+		}
+	}
+	// Reject incompatible verification modes before opening a session.
+	_, err = newAppleSessionConfig(context.Background(), option.HTTPClientOptions{
+		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &option.OutboundTLSOptions{
+			CertificatePinSHA256: hex.EncodeToString(certificateSHA256(caDER)),
+			Certificate:          []string{string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("expected pin conflict, got %v", err)
 	}
 }

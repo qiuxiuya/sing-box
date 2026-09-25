@@ -206,22 +206,26 @@ func (v *HostsDNSPredefinedValue) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err == nil {
 		addr, parseErr := netip.ParseAddr(s)
 		if parseErr == nil {
-			v.Addresses = []netip.Addr{addr}
+			*v = HostsDNSPredefinedValue{Addresses: []netip.Addr{addr}}
 		} else {
-			v.Domain = s
+			*v = HostsDNSPredefinedValue{Domain: s}
 		}
 		return nil
 	}
 	var addrs []netip.Addr
 	if err := json.Unmarshal(data, &addrs); err == nil {
-		v.Addresses = addrs
+		*v = HostsDNSPredefinedValue{Addresses: addrs}
 		return nil
 	}
 	return E.New("invalid predefined value: expected IP address(es) or domain name")
 }
 
-func (v HostsDNSPredefinedValue) DescribeSchema(_ schema.Builder) (*schema.Node, error) {
-	return schema.ListableOf(schema.StringNode()), nil
+func (v HostsDNSPredefinedValue) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	addresses, err := builder.Describe(reflect.TypeFor[[]netip.Addr]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.StringNode(), addresses), nil
 }
 
 type HostsDNSServerOptions struct {
@@ -262,12 +266,12 @@ type GroupDNSServerOptions struct {
 
 type RemoteHTTPSDNSServerOptions _RemoteHTTPSDNSServerOptions
 
-func (o *RemoteHTTPSDNSServerOptions) MarshalJSONContext(ctx context.Context) ([]byte, error) {
+func (o RemoteHTTPSDNSServerOptions) MarshalJSONContext(ctx context.Context) ([]byte, error) {
 	switch o.Method {
 	case http.MethodPost:
 		o.Method = ""
 	}
-	return badjson.MarshallObjectsContext(ctx, (*_RemoteHTTPSDNSServerOptions)(o))
+	return badjson.MarshallObjectsContext(ctx, (*_RemoteHTTPSDNSServerOptions)(&o))
 }
 
 func (o *RemoteHTTPSDNSServerOptions) UnmarshalJSONContext(ctx context.Context, content []byte) error {

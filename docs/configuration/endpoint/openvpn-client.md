@@ -2,6 +2,10 @@
 
 !!! question "Since sing-box 1.14.0"
 
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [on_demand](#on_demand)
+
 ## Structure
 
 ```json
@@ -98,8 +102,11 @@
   "handshake_window": "",
   "explicit_exit_notify": 0,
   "system": false,
+  "gso": false,
+  "inner_domain_resolver": "", // or {}
   "name": "",
   "mtu": 1500,
+  "on_demand": false,
 
   ... // UDP NAT Fields
 
@@ -712,6 +719,30 @@ operating-system routes or DNS settings.
 
 If disabled, sing-box uses the internal network stack.
 
+### gso
+
+!!! quote ""
+
+    Only supported on Linux.
+
+Attempt to enable generic segmentation offload for the system interface.
+
+Enabled by default when `system` is `true`. Set to `false` to disable.
+
+This option has no effect when `system` is `false`.
+
+### inner_domain_resolver
+
+Set the DNS resolver used for destination domain names when this endpoint is selected as an outbound. Applies to TCP and UDP.
+
+It is also used to resolve unresolved domain destinations when this endpoint is selected for L3 forwarding.
+
+This option uses the same format as [domain_resolver](/configuration/shared/dial/#domain_resolver).
+
+When unset, existing DNS routing rules and the default DNS apply. IP destinations do not require domain resolution.
+
+This option does not affect VPN server address resolution, which continues to use `domain_resolver` from the dial fields.
+
 ### name
 
 Custom interface name for the system interface.
@@ -723,6 +754,12 @@ An automatically generated `ovpn` interface name is used by default.
 OpenVPN interface MTU.
 
 When empty, `1500` is used until a server-pushed MTU is received.
+
+### on_demand
+
+!!! question "Since sing-box 1.15.0"
+
+Allow the endpoint to be disconnected when necessary.
 
 ## UDP NAT Fields
 

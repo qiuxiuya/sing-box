@@ -38,6 +38,7 @@ type CacheFile interface {
 
 	SetDisableExpire(disableExpire bool)
 	SetOptimisticTimeout(timeout time.Duration)
+	Flush()
 
 	LoadMode() string
 	StoreMode(mode string) error
@@ -54,6 +55,7 @@ type CacheFile interface {
 }
 
 type SavedBinary struct {
+	// Hash is stored only by the branch-private cache envelope.
 	Hash        hash.HashType
 	Content     []byte
 	LastUpdated time.Time
@@ -64,18 +66,6 @@ type SavedBinary struct {
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 	var buffer bytes.Buffer
 	err := binary.Write(&buffer, binary.BigEndian, uint8(2))
-	if err != nil {
-		return nil, err
-	}
-	hash, err := s.Hash.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	_, err = varbin.WriteUvarint(&buffer, uint64(len(hash)))
-	if err != nil {
-		return nil, err
-	}
-	_, err = buffer.Write(hash)
 	if err != nil {
 		return nil, err
 	}
@@ -111,22 +101,10 @@ func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 }
 
 func (s *SavedBinary) UnmarshalBinary(data []byte) error {
+	*s = SavedBinary{}
 	reader := bytes.NewReader(data)
 	var version uint8
 	err := binary.Read(reader, binary.BigEndian, &version)
-	if err != nil {
-		return err
-	}
-	hashLength, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return err
-	}
-	hash := make([]byte, hashLength)
-	_, err = io.ReadFull(reader, hash)
-	if err != nil {
-		return err
-	}
-	err = s.Hash.UnmarshalBinary(hash)
 	if err != nil {
 		return err
 	}
@@ -181,8 +159,21 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 
 type OutboundGroup interface {
 	Outbound
-	Now() string
 	All() []string
+	Selected(network string) Outbound
+	AttachConnection(closer io.Closer) (detach func())
+}
+
+// ConnectionOutboundGroup selects a member for a particular connection rather
+// than exposing a single globally selected member.
+type ConnectionOutboundGroup interface {
+	OutboundGroup
+	SelectConnection(metadata *InboundContext) Outbound
+}
+
+// ConnectionFailureListener is notified when dialing a resolved outbound chain fails.
+type ConnectionFailureListener interface {
+	OnConnectionFailure(ctx context.Context)
 }
 
 type PreMatchOutboundGroup interface {
@@ -200,10 +191,6 @@ type URLTestGroup interface {
 }
 
 type LoadBalanceGroup interface {
-	OutboundGroup
+	ConnectionOutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
-}
-
-type SelectorGroup interface {
-	Selected() Outbound
 }

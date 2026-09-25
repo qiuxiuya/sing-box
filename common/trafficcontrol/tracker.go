@@ -3,11 +3,11 @@ package trafficcontrol
 import (
 	"context"
 	"net"
+	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
@@ -17,17 +17,16 @@ import (
 )
 
 type TrackerMetadata struct {
-	ID              uuid.UUID
-	Metadata        adapter.InboundContext
-	CreatedAt       time.Time
-	ClosedAt        time.Time
-	Upload          *atomic.Int64
-	Download        *atomic.Int64
-	Chain           []string
-	Rule            adapter.Rule
-	Outbound        string
-	OutboundType    string
-	outboundManager adapter.OutboundManager
+	ID           uuid.UUID
+	Metadata     adapter.InboundContext
+	CreatedAt    time.Time
+	ClosedAt     time.Time
+	Upload       *atomic.Int64
+	Download     *atomic.Int64
+	Chain        []string
+	Rule         adapter.Rule
+	Outbound     string
+	OutboundType string
 }
 
 type Tracker interface {
@@ -42,38 +41,6 @@ func (t TrackerMetadata) ConnectionDomain() string {
 		return t.Metadata.SniffHost
 	}
 	return t.Metadata.Domain
-}
-
-func (t TrackerMetadata) Chains() []string {
-	chains := t.Chain
-	if t.OutboundType == C.TypeLoadBalance {
-		realOutboundChain := t.Metadata.GetRealOutboundChain()
-		if len(realOutboundChain) > 0 && t.outboundManager != nil {
-			var subChain []string
-			for _, realOutbound := range realOutboundChain {
-				next := realOutbound
-				for {
-					detour, loaded := t.outboundManager.Outbound(next)
-					if !loaded {
-						break
-					}
-					subChain = append(subChain, next)
-					outboundGroup, isGroup := detour.(adapter.OutboundGroup)
-					if !isGroup {
-						break
-					}
-					next = outboundGroup.Now()
-					if next == "" {
-						break
-					}
-				}
-			}
-			chains = make([]string, len(subChain)+len(t.Chain))
-			copy(chains, common.Reverse(subChain))
-			copy(chains[len(subChain):], t.Chain)
-		}
-	}
-	return chains
 }
 
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
@@ -127,42 +94,19 @@ func (m *Manager) RoutedFlow(ctx context.Context, metadata adapter.InboundContex
 
 func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound, upload *atomic.Int64, download *atomic.Int64) TrackerMetadata {
 	id, _ := uuid.NewV4()
-	var (
-		chain        []string
-		next         string
-		outbound     string
-		outboundType string
-	)
-	if matchOutbound != nil {
-		next = matchOutbound.Tag()
-	} else {
-		next = m.outbound.Default().Tag()
-	}
-	for {
-		detour, loaded := m.outbound.Outbound(next)
-		if !loaded {
-			break
-		}
-		chain = append(chain, next)
-		outbound = detour.Tag()
-		outboundType = detour.Type()
-		outboundGroup, isGroup := detour.(adapter.OutboundGroup)
-		if !isGroup {
-			break
-		}
-		next = outboundGroup.Now()
-	}
+	chain := common.Map(metadata.OutboundChain, adapter.Outbound.Tag)
+	slices.Reverse(chain)
+	outbound := metadata.OutboundChain[len(metadata.OutboundChain)-1]
 	return TrackerMetadata{
-		ID:              id,
-		Metadata:        metadata,
-		CreatedAt:       time.Now(),
-		Upload:          upload,
-		Download:        download,
-		Chain:           common.Reverse(chain),
-		Rule:            matchedRule,
-		Outbound:        outbound,
-		OutboundType:    outboundType,
-		outboundManager: m.outbound,
+		ID:           id,
+		Metadata:     metadata,
+		CreatedAt:    time.Now(),
+		Upload:       upload,
+		Download:     download,
+		Chain:        chain,
+		Rule:         matchedRule,
+		Outbound:     outbound.Tag(),
+		OutboundType: outbound.Type(),
 	}
 }
 

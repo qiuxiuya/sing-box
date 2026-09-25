@@ -16,7 +16,7 @@ func TestProcessInfoCacheLifetime(t *testing.T) {
 	cache := newProcessInfoCache()
 	now := time.Unix(100, 0)
 	key := processInfoCacheKey{processID: 42, userID: 1000}
-	info := &adapter.ConnectionOwner{ProcessID: 42, UserId: 1000, ProcessPath: "/bin/client", AndroidPackageNames: []string{"client"}}
+	info := &adapter.ConnectionOwner{ProcessID: 42, UserId: 1000, ProcessPaths: []string{"/bin/client"}, PackageNames: []string{"client"}}
 	cache.store(key, info, nil, now)
 
 	loaded, err, ok := cache.load(key, now.Add(processInfoCacheLifetime/2))
@@ -72,7 +72,7 @@ func TestProcessInfoNegativeCacheLifetime(t *testing.T) {
 func TestProcessInfoCacheIsBounded(t *testing.T) {
 	cache := newProcessInfoCache()
 	now := time.Unix(100, 0)
-	info := &adapter.ConnectionOwner{ProcessPath: "/bin/client"}
+	info := &adapter.ConnectionOwner{ProcessPaths: []string{"/bin/client"}}
 	for processID := uint32(0); processID < processInfoCacheCapacity+32; processID++ {
 		cache.store(processInfoCacheKey{processID: processID}, info, nil, now)
 	}
@@ -88,7 +88,7 @@ func TestProcessInfoCacheCombinesConcurrentMisses(t *testing.T) {
 	const callers = 32
 	cache := newProcessInfoCache()
 	key := processInfoCacheKey{processID: 42, userID: 1000}
-	info := &adapter.ConnectionOwner{ProcessID: 42, UserId: 1000, ProcessPath: "/bin/client"}
+	info := &adapter.ConnectionOwner{ProcessID: 42, UserId: 1000, ProcessPaths: []string{"/bin/client"}}
 	lookupStarted := make(chan struct{})
 	releaseLookup := make(chan struct{})
 	var lookupCount atomic.Int32

@@ -2,14 +2,16 @@ package clashapi
 
 import (
 	"context"
+	"net/http"
+	"testing"
+	"time"
+
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/service"
+
 	"github.com/stretchr/testify/require"
-	"net/http"
-	"testing"
-	"time"
 )
 
 type resourceDownloadTransport struct {

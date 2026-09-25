@@ -12,10 +12,10 @@ import (
 
 	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
-	sBufio "github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -56,15 +56,16 @@ func (i *Inbound) newTCPacket(
 	buffer *buf.Buffer,
 	oob []byte,
 	source M.Socksaddr,
-) {
+	takeOwnership bool,
+) bool {
 	_, destination, interfaceIndex, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		i.udpWarnings.packetInfo.warn(i.logger, "read TC eBPF UDP destination: ", err)
-		return
+		return false
 	}
 	if !destination.IsValid() {
 		i.udpWarnings.packetInfo.warn(i.logger, "TC eBPF UDP original destination is missing")
-		return
+		return false
 	}
 	client := source.AddrPort()
 	assignment, err := backend.LookupAssignment(commonEBPF.ProtocolUDP, client, destination, interfaceIndex, false)
@@ -74,7 +75,7 @@ func (i *Inbound) newTCPacket(
 	if err != nil {
 		i.counters.assignmentLookupFailures.Add(1)
 		i.udpWarnings.originalDestination.warn(i.logger, "lookup TC eBPF UDP assignment: ", err)
-		return
+		return false
 	}
 	var sourceMAC net.HardwareAddr
 	if assignment.Path == commonEBPF.TCPathShared && assignment.SourceMACValid != 0 {
@@ -91,7 +92,12 @@ func (i *Inbound) newTCPacket(
 		InterfaceIndex: assignment.InterfaceIndex,
 	}
 	i.udpClientTable.setDirectBinding(key, destination, sourceMAC, assignment.SocketCookie)
+	if takeOwnership {
+		i.udpNat.NewPacketBuffer(key, buffer, source, M.SocksaddrFromNetIP(destination), nil)
+		return true
+	}
 	i.udpNat.NewPacket(key, [][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(destination), nil)
+	return false
 }
 
 func (i *Inbound) lookupProcessInfo(socketCookie uint64) *adapter.ConnectionOwner {
@@ -147,13 +153,13 @@ func (w *tcPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr
 	if w.clientState.isCgroupDataPlane() {
 		return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.key.Source, binding.redirectAddress)
 	}
-	socket, release, err := w.inbound.udpReplySockets.get(destinationAddress, w.replySocketFactory())
+	entry, release, err := w.inbound.udpReplySockets.get(destinationAddress, w.replySocketFactory())
 	if err != nil {
 		w.logReplySocketError(err)
 		return err
 	}
 	defer release()
-	_, err = socket.WriteToUDPAddrPort(buffer.Bytes(), w.key.Source)
+	_, err = entry.conn.WriteToUDPAddrPort(buffer.Bytes(), w.key.Source)
 	return err
 }
 
@@ -243,15 +249,14 @@ func (w *tcPacketWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []
 	}
 	var batchErr error
 	for source, group := range groups {
-		socket, release, err := w.inbound.udpReplySockets.get(source, w.replySocketFactory())
+		entry, release, err := w.inbound.udpReplySockets.get(source, w.replySocketFactory())
 		if err != nil {
 			w.logReplySocketError(err)
 			buf.ReleaseMulti(group.buffers)
 			batchErr = errors.Join(batchErr, err)
 			continue
 		}
-		writer := sBufio.NewPacketBatchWriter(sBufio.NewPacketConn(socket))
-		err = writer.WritePacketBatch(group.buffers, group.destinations)
+		err = entry.writer.WritePacketBatch(group.buffers, group.destinations)
 		release()
 		batchErr = errors.Join(batchErr, err)
 	}
@@ -294,7 +299,8 @@ func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (*net.UDPConn, erro
 	if source.Addr().Is4() {
 		network = "udp4"
 	}
-	listenConfig := net.ListenConfig{Control: func(_ string, _ string, rawConn syscall.RawConn) error {
+	listenConfig := net.ListenConfig{Control: control.UDPSocketBuffer(listener.UDPSocketBufferSize())}
+	listenConfig.Control = control.Append(listenConfig.Control, func(_ string, _ string, rawConn syscall.RawConn) error {
 		err := control.Raw(rawConn, func(fd uintptr) error {
 			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 				return err
@@ -318,7 +324,7 @@ func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (*net.UDPConn, erro
 			}
 		}
 		return nil
-	}}
+	})
 	packetConnection, err := listenConfig.ListenPacket(i.ctx, network, source.String())
 	if err != nil {
 		return nil, E.Cause(err, "bind TC eBPF UDP reply socket to ", source)

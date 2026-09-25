@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
@@ -14,6 +15,7 @@ import (
 type abstractRule struct {
 	disabled atomic.Bool
 	uuid     string
+	history  *urltest.HistoryStorage
 }
 
 func (r *abstractRule) Disabled() bool {
@@ -28,6 +30,9 @@ func (r *abstractRule) ChangeStatus() {
 	for {
 		disabled := r.disabled.Load()
 		if r.disabled.CompareAndSwap(disabled, !disabled) {
+			if r.history != nil {
+				r.history.NotifyUpdated()
+			}
 			return
 		}
 	}

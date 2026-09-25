@@ -1,6 +1,7 @@
 package wireguard
 
 import (
+	"encoding/base64"
 	"errors"
 	"net"
 	"sync"
@@ -17,6 +18,24 @@ import (
 	wgTun "github.com/sagernet/wireguard-go/tun"
 )
 
+func TestEndpointCloseBeforeInitialize(t *testing.T) {
+	endpoint, err := NewEndpoint(EndpointOptions{
+		Context:    t.Context(),
+		PrivateKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := endpoint.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := endpoint.startDevice(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected closed error, got %v", err)
+	}
+}
+
 func TestEndpointWakeRestoresBind(t *testing.T) {
 	for _, deviceWakeFirst := range []bool{false, true} {
 		name := "network-wake-first"
@@ -31,48 +50,93 @@ func TestEndpointWakeRestoresBind(t *testing.T) {
 			if deviceWakeFirst {
 				firstWake, lastWake = lastWake, firstWake
 			}
-			firstWake()
 			if err := endpoint.BindUpdate(); err != nil {
 				t.Fatal(err)
 			}
 			if got := bind.opens.Load(); got != 1 {
 				t.Fatalf("bind reopened while still paused: opens=%d", got)
 			}
+			firstWake()
+			wantOpens := int32(2)
+			if deviceWakeFirst {
+				wantOpens = 1
+			}
+			if got := bind.opens.Load(); got != wantOpens {
+				t.Fatalf("unexpected bind state after first wake: opens=%d, want %d", got, wantOpens)
+			}
 			lastWake()
 			if got := bind.opens.Load(); got != 2 {
-				t.Fatalf("bind did not reopen after both wake events: opens=%d", got)
+				t.Fatalf("bind did not reopen on network wake: opens=%d", got)
 			}
 		})
 	}
 }
 
-func TestEndpointDeviceSleepKeepsBindOpen(t *testing.T) {
+func TestEndpointDeviceSleepAllowsTraffic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		endpoint, pauseManager, bind := newTestEndpoint(t)
+		pauseManager.DevicePause()
+		started := time.Now()
+		if err := endpoint.ensureDeviceStarted(t.Context()); err != nil {
+			t.Fatalf("device sleep blocked connection startup: %v", err)
+		}
+		packet := make([]byte, 20)
+		packet[0] = 0x45
+		if err := endpoint.WritePackets([][]byte{packet}); err != nil {
+			t.Fatalf("device sleep blocked packet write: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed != 0 {
+			t.Fatalf("traffic waited for device wake: %v", elapsed)
+		}
+		if got := bind.opens.Load(); got != 1 {
+			t.Fatalf("device sleep restarted the bind: opens=%d", got)
+		}
+		if err := endpoint.BindUpdate(); err != nil {
+			t.Fatal(err)
+		}
+		if got := bind.opens.Load(); got != 2 {
+			t.Fatalf("device sleep blocked bind update: opens=%d", got)
+		}
+		pauseManager.DeviceWake()
+		if got := bind.opens.Load(); got != 2 {
+			t.Fatalf("device wake restarted the bind: opens=%d", got)
+		}
+	})
+}
+
+func TestEndpointTrafficRetriesFailedNetworkWake(t *testing.T) {
 	endpoint, pauseManager, bind := newTestEndpoint(t)
-	closes := bind.closes.Load()
-	pauseManager.DevicePause()
-	if got := bind.closes.Load(); got != closes {
-		t.Fatalf("device sleep closed the bind: closes=%d, want %d", got, closes)
+	pauseManager.NetworkPause()
+	bind.failNext.Store(true)
+	pauseManager.NetworkWake()
+	if got := bind.opens.Load(); got != 2 {
+		t.Fatalf("network wake did not attempt to reopen bind: opens=%d", got)
 	}
-	if err := endpoint.BindUpdate(); err != nil {
+	if err := endpoint.WritePackets(nil); err != nil {
 		t.Fatal(err)
 	}
-	pauseManager.DeviceWake()
-	if got := bind.opens.Load(); got != 1 {
-		t.Fatalf("device wake unnecessarily reopened the bind: opens=%d", got)
+	if got := bind.opens.Load(); got != 3 {
+		t.Fatalf("traffic did not retry failed network wake: opens=%d", got)
 	}
 }
 
-func TestEndpointBindUpdateWithoutDevice(t *testing.T) {
-	endpoint := &Endpoint{}
-	if err := endpoint.BindUpdate(); err != nil {
-		t.Fatalf("bind update before start: %v", err)
+func TestEndpointWakePreservesIdleSuspension(t *testing.T) {
+	endpoint, pauseManager, bind := newTestEndpoint(t)
+	endpoint.SetIdle(true)
+	pauseManager.DevicePause()
+	pauseManager.NetworkPause()
+	pauseManager.NetworkWake()
+	pauseManager.DeviceWake()
+	if got := bind.opens.Load(); got != 1 || !endpoint.suspended.Load() {
+		t.Fatalf("wake resumed an idle endpoint: opens=%d, suspended=%v", got, endpoint.suspended.Load())
 	}
-	endpoint, _, _ = newTestEndpoint(t)
-	if err := endpoint.Close(); err != nil {
+	packet := make([]byte, 20)
+	packet[0] = 0x45
+	if err := endpoint.WritePackets([][]byte{packet}); err != nil {
 		t.Fatal(err)
 	}
-	if err := endpoint.BindUpdate(); err != nil {
-		t.Fatalf("bind update after close: %v", err)
+	if got := bind.opens.Load(); got != 2 || endpoint.suspended.Load() {
+		t.Fatalf("outbound traffic did not resume the endpoint: opens=%d, suspended=%v", got, endpoint.suspended.Load())
 	}
 }
 
@@ -82,7 +146,6 @@ func TestEndpointWritePacketsDoesNotWaitForWake(t *testing.T) {
 		pause func(pause.Manager)
 	}{
 		{"network", func(manager pause.Manager) { manager.NetworkPause() }},
-		{"device", func(manager pause.Manager) { manager.DevicePause() }},
 		{"both", func(manager pause.Manager) {
 			manager.DevicePause()
 			manager.NetworkPause()
@@ -159,7 +222,7 @@ func newTestEndpoint(t *testing.T) (*Endpoint, pause.Manager, *testEndpointBind)
 		done:         make(chan struct{}),
 		returnDevice: &returnDeviceWrapper{},
 	}
-	endpoint.device = wgDevice
+	endpoint.device.Store(wgDevice)
 	endpoint.pauseCallback = pauseManager.RegisterCallback(endpoint.onPauseUpdated)
 	t.Cleanup(func() { _ = endpoint.Close() })
 	if err := wgDevice.Up(); err != nil {
@@ -196,18 +259,18 @@ func (d *testEndpointDevice) Close() error {
 
 type testEndpointBind struct {
 	conn.Bind
-	opens  atomic.Int32
-	closes atomic.Int32
+	opens    atomic.Int32
+	failNext atomic.Bool
 }
 
 func (b *testEndpointBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.opens.Add(1)
+	if b.failNext.Swap(false) {
+		return nil, 0, errors.New("temporary bind failure")
+	}
 	return nil, 12345, nil
 }
 
-func (b *testEndpointBind) Close() error {
-	b.closes.Add(1)
-	return nil
-}
+func (b *testEndpointBind) Close() error { return nil }
 
 func (b *testEndpointBind) BatchSize() int { return 1 }

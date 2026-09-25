@@ -15,6 +15,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/oomkiller"
 	"github.com/sagernet/sing-box/transport/wireguard"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
@@ -30,6 +31,7 @@ var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.FlowOutboundDomainResolver  = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 )
 
@@ -45,6 +47,7 @@ type Endpoint struct {
 	logger               logger.ContextLogger
 	localAddresses       []netip.Prefix
 	endpoint             *wireguard.Endpoint
+	onDemand             bool
 	bindAccess           sync.Mutex
 	started              atomic.Bool
 	innerDNSQueryOptions adapter.DNSQueryOptions
@@ -58,6 +61,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
 		logger:         logger,
 		localAddresses: options.Address,
+		onDemand:       options.OnDemand,
 	}
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
@@ -100,7 +104,6 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			Logger:           logger,
 			InterfaceFinder:  networkManager.InterfaceFinder(),
 			InterfaceMonitor: networkManager.InterfaceMonitor(),
-			ExcludeInterface: options.Name,
 			IsExempt: func() bool {
 				return networkManager.AutoRedirectOutputMark() != 0
 			},
@@ -139,7 +142,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	ep.endpoint = wgEndpoint
 	if options.InnerDomainResolver != nil {
-		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
+		innerDNSOpts, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
 		if err != nil {
 			return nil, E.Cause(err, "inner domain resolver")
 		}
@@ -150,6 +153,8 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 
 func (w *Endpoint) Start(stage adapter.StartStage) error {
 	switch stage {
+	case adapter.StartStateInitialize:
+		return w.endpoint.Initialize(oomkiller.MemoryPressure(w.ctx))
 	case adapter.StartStateStart:
 		return w.endpoint.Start(false)
 	case adapter.StartStatePostStart:
@@ -174,6 +179,14 @@ func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
 		return
 	}
 	go w.updateBind(ctx)
+}
+
+func (w *Endpoint) OnDemand() bool {
+	return w.onDemand
+}
+
+func (w *Endpoint) SetKeepIdleConnections(keep bool) {
+	w.endpoint.SetIdle(!keep)
 }
 
 func (w *Endpoint) updateBind(ctx context.Context) {
@@ -218,7 +231,7 @@ func (w *Endpoint) JudgeFlow(network uint8, source netip.AddrPort, destination n
 			return tun.FlowVerdict{Action: tun.ActionAccept}
 		}
 	}
-	return adapter.JudgeFlow(w.router, w.Tag(), w.Type(), network, source, destination, firstPacket)
+	return adapter.JudgeFlow(w.router, adapter.InboundContext{Inbound: w.Tag(), InboundType: w.Type()}, network, source, destination, firstPacket)
 }
 
 func (w *Endpoint) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {

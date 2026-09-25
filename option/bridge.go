@@ -7,3 +7,7 @@ type BridgeOutboundOptions struct {
 	IPRoute2RuleIndex  int                   `json:"iproute2_rule_index,omitempty"`
 	DomainResolver     *DomainResolveOptions `json:"domain_resolver,omitempty"`
 }
+
+func (o *BridgeOutboundOptions) TakeDomainResolverOptions() *DomainResolveOptions {
+	return o.DomainResolver
+}

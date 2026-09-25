@@ -9,14 +9,32 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-mux"
+	"github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/common/observable"
 )
+
+type unifiedDelayKey struct{}
+
+// ContextWithUnifiedDelay binds the measurement policy to one instance or request.
+func ContextWithUnifiedDelay(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, unifiedDelayKey{}, enabled)
+}
+
+func UnifiedDelayFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(unifiedDelayKey{}).(bool)
+	return enabled
+}
 
 type HistoryStorage struct {
 	access       sync.RWMutex
@@ -81,7 +99,12 @@ func (s *HistoryStorage) Close() error {
 func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
-		_, err := urlTest(ctx, link, detour)
+		warmContext := adapter.ContextWithKeepSession(ctx)
+		warmContext = mux.ContextWithKeepSession(warmContext)
+		warmContext = anytls.ContextWithKeepSession(warmContext)
+		warmContext = contextWithQUICKeepSession(warmContext)
+		warmContext = snell.ContextWithKeepSession(warmContext)
+		_, err := urlTest(warmContext, link, detour)
 		if err != nil {
 			return 0, err
 		}
@@ -142,7 +165,8 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	resp.Body.Close()
-	if C.URLTestUnifiedDelay {
+	elapsed := time.Since(start)
+	if UnifiedDelayFromContext(ctx) {
 		second := time.Now()
 		var ignoredErr error
 		var secondResp *http.Response
@@ -150,9 +174,9 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		if ignoredErr == nil {
 			resp = secondResp
 			resp.Body.Close()
-			start = second
+			elapsed = time.Since(second)
 		}
 	}
-	t = uint16(time.Since(start) / time.Millisecond)
+	t = uint16(elapsed / time.Millisecond)
 	return
 }

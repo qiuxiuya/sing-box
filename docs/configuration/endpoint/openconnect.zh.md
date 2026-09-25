@@ -2,6 +2,10 @@
 
 !!! question "自 sing-box 1.14.0 起"
 
+!!! quote "sing-box 1.15.0 中的更改"
+
+    :material-plus: [on_demand](#on_demand)
+
 ==仅客户端==
 
 ## 结构
@@ -12,6 +16,8 @@
   "tag": "oc-client",
 
   "system": false,
+  "gso": false,
+  "inner_domain_resolver": "", // or {}
   "name": "",
 
   ... // UDP NAT 字段
@@ -107,6 +113,7 @@
       "promote": false
     }
   ],
+  "on_demand": false,
 
   ... // 拨号字段
 }
@@ -125,6 +132,30 @@
 需要权限，且不能与现有系统接口冲突。
 
 禁用时，sing-box 使用内部网络栈。
+
+### gso
+
+!!! quote ""
+
+    仅支持 Linux。
+
+尝试为系统接口启用通用分段卸载。
+
+当 `system` 为 `true` 时，默认启用。设为 `false` 可禁用。
+
+当 `system` 为 `false` 时，此选项不生效。
+
+### inner_domain_resolver
+
+指定将此 endpoint 用作出站时，解析目标域名所使用的 DNS 解析器。适用于 TCP 和 UDP。
+
+当此端点被选中用于 L3 转发时，也使用此解析器解析尚未解析的目标域名。
+
+此选项使用与 [domain_resolver](/zh/configuration/shared/dial/#domain_resolver) 相同的格式。
+
+未设置时，使用现有 DNS 路由规则及默认 DNS。目标为 IP 地址时不进行域名解析。
+
+此选项不影响 VPN 服务器地址的解析；服务器地址仍使用拨号字段中的 `domain_resolver`。
 
 ### name
 
@@ -633,6 +664,12 @@ MCA 证书和私钥必须同时设置或同时为空。
 交互询问匹配的认证字段，而不是自动提供值。
 
 与 `form_entries.value` 冲突。
+
+### on_demand
+
+!!! question "自 sing-box 1.15.0 起"
+
+允许该 endpoint 在需要时断开连接。
 
 ## UDP NAT 字段
 

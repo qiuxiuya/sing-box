@@ -107,15 +107,24 @@ func (t *GroupTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, c
 			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag)}
 			continue
 		}
-		transport.ExchangeAsync(ctx, message.Copy(), func(response *mDNS.Msg, err error) {
+		childContext := adapter.OverrideContext(ctx)
+		childMessage := message.Copy()
+		go transport.ExchangeAsync(childContext, childMessage, func(response *mDNS.Msg, err error) {
 			resultCh <- result{response, tag, err}
 		})
 	}
 
 	go func() {
+		defer cancel()
 		var firstErr error
 		for range t.serverTags {
-			r := <-resultCh
+			var r result
+			select {
+			case <-ctx.Done():
+				callback(nil, ctx.Err())
+				return
+			case r = <-resultCh:
+			}
 			if r.err == nil && r.response != nil {
 				t.logger.DebugContext(ctx, "fastest response from ", r.tag)
 				cancel()

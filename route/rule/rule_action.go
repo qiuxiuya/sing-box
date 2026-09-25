@@ -524,6 +524,7 @@ func (r *RuleActionSniff) Type() string {
 }
 
 func (r *RuleActionSniff) build() error {
+	var quicEnabled bool
 	for _, name := range r.SnifferNames {
 		switch name {
 		case C.ProtocolTLS:
@@ -532,7 +533,7 @@ func (r *RuleActionSniff) build() error {
 			r.StreamSniffers = append(r.StreamSniffers, sniff.HTTPHost)
 		case C.ProtocolQUIC:
 			r.PacketSniffers = append(r.PacketSniffers, sniff.QUICClientHello)
-			r.PacketSniffers = append(r.PacketSniffers, sniff.QUICShortHeader)
+			quicEnabled = true
 		case C.ProtocolDNS:
 			r.StreamSniffers = append(r.StreamSniffers, sniff.StreamDomainNameQuery)
 			r.PacketSniffers = append(r.PacketSniffers, sniff.DomainNameQuery)
@@ -553,6 +554,10 @@ func (r *RuleActionSniff) build() error {
 		default:
 			return E.New("unknown sniffer: ", name)
 		}
+	}
+	if quicEnabled {
+		// Short headers are ambiguous; try the other configured protocols first.
+		r.PacketSniffers = append(r.PacketSniffers, sniff.QUICShortHeader)
 	}
 	return nil
 }

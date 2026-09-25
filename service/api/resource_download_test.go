@@ -2,18 +2,21 @@ package api
 
 import (
 	"context"
-	"github.com/sagernet/sing-box/common/interrupt"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
-	"github.com/stretchr/testify/require"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+
+	"github.com/stretchr/testify/require"
 )
 
 type resourceDownloadRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f resourceDownloadRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func TestResourceDownloadRequestContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

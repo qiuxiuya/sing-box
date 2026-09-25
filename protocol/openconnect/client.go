@@ -19,6 +19,8 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing-box/transport/device"
 	openconnecttransport "github.com/sagernet/sing-box/transport/openconnect"
 	"github.com/sagernet/sing-openconnect"
 	"github.com/sagernet/sing-tun"
@@ -35,8 +37,9 @@ import (
 
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
-	_ adapter.FlowOutbound                = (*Endpoint)(nil)
+	_ adapter.FlowOutboundDomainResolver  = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 	_ tun.Port                            = (*Endpoint)(nil)
 )
@@ -47,7 +50,9 @@ type Endpoint struct {
 	cancelLoop              context.CancelFunc
 	dnsRouter               adapter.DNSRouter
 	client                  *openconnect.Client
-	device                  openconnecttransport.Device
+	deviceOptions           *device.Options
+	device                  device.Device
+	onDemand                bool
 	server                  string
 	flavor                  string
 	stateAccess             sync.Mutex
@@ -62,6 +67,8 @@ type Endpoint struct {
 	authFormLoopDone        chan struct{}
 	activeTransportLoopDone chan struct{}
 	hotpCounter             atomic.Uint64
+
+	innerDNSQueryOptions adapter.DNSQueryOptions
 }
 
 type clientState struct {
@@ -75,6 +82,10 @@ type clientState struct {
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.OpenConnectEndpointOptions) (adapter.Endpoint, error) {
+	innerDNSQueryOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
+	if err != nil {
+		return nil, E.Cause(err, "inner domain resolver")
+	}
 	tcpKeepAliveEnabled := options.TCPKeepAliveEnabled || options.TCPKeepAlive != 0 || options.TCPKeepAliveInterval != 0
 	if tcpKeepAliveEnabled && options.DisableTCPKeepAlive {
 		return nil, E.New("tcp_keep_alive_enabled conflicts with disable_tcp_keep_alive")
@@ -114,15 +125,14 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		cancelLoop:    cancelLoop,
 		dnsRouter:     service.FromContext[adapter.DNSRouter](ctx),
 		statusUpdated: make(chan struct{}),
+		onDemand:      options.OnDemand,
 	}
+	openConnectEndpoint.innerDNSQueryOptions = innerDNSQueryOptions
 	openConnectEndpoint.state.Store(new(clientState))
 	success := false
 	defer func() {
 		if success {
 			return
-		}
-		if openConnectEndpoint.device != nil {
-			_ = openConnectEndpoint.device.Close()
 		}
 		cancelLoop()
 	}()
@@ -159,11 +169,16 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
+	gso := options.System
+	if options.GSO != nil {
+		gso = *options.GSO
+	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
-	device, err := openconnecttransport.NewDevice(openconnecttransport.DeviceOptions{
+	openConnectEndpoint.deviceOptions = &device.Options{
 		Context:         ctx,
 		Logger:          logger,
 		System:          options.System,
+		GSO:             gso,
 		Handler:         openConnectEndpoint,
 		UDPTimeout:      udpTimeout,
 		ICMPTimeout:     C.ICMPTimeout,
@@ -172,16 +187,13 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		UDPNATMax:       options.UDPNATMax,
 		InterfaceFinder: networkManager.InterfaceFinder(),
 		Name:            options.Name,
+		NamePrefix:      "oc",
 		MTU:             openconnecttransport.DefaultMTU,
-		Configuration: openconnecttransport.Configuration{
+		PacketHeadroom:  openconnecttransport.PacketHeadroom,
+		Configuration: device.Configuration{
 			MTU: openconnecttransport.DefaultMTU,
 		},
-	})
-	if err != nil {
-		return nil, err
 	}
-	openConnectEndpoint.device = device
-	device.SetPacketWriter(openConnectEndpoint.writePacketBuffers)
 	clientOptions, err := openConnectEndpoint.buildClientOptions(options, outboundDialer)
 	if err != nil {
 		return nil, err
@@ -356,9 +368,9 @@ func (e *Endpoint) handleTunnelConfiguration(event openconnect.TunnelConfigurati
 	if err != nil {
 		return E.Cause(err, "build route set")
 	}
-	err = e.device.UpdateConfiguration(openconnecttransport.Configuration{
-		MTU:       configuration.MTU,
-		Addresses: configuration.Addresses,
+	err = e.device.UpdateConfiguration(device.Configuration{
+		MTU:     configuration.MTU,
+		Address: configuration.Addresses,
 	})
 	if err != nil {
 		return E.Cause(err, "update device configuration")
@@ -419,6 +431,17 @@ func (e *Endpoint) updateState(update func(state *clientState)) {
 }
 
 func (e *Endpoint) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStateInitialize {
+		e.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(e.loopContext)
+		tunnelDevice, err := device.New(*e.deviceOptions)
+		if err != nil {
+			return err
+		}
+		tunnelDevice.SetPacketWriter(e.writePacketBuffers)
+		e.device = tunnelDevice
+		e.deviceOptions = nil
+		return nil
+	}
 	if stage != adapter.StartStatePostStart {
 		return nil
 	}
@@ -473,7 +496,7 @@ func (e *Endpoint) Close() error {
 	activeTransportLoopDone := e.activeTransportLoopDone
 	e.stateAccess.Unlock()
 	e.cancelLoop()
-	err := E.Errors(e.client.Close(), e.device.Close())
+	err := common.Close(e.client, e.device)
 	if readLoopDone != nil {
 		<-readLoopDone
 	}
@@ -491,8 +514,55 @@ func (e *Endpoint) InterfaceUpdated(ctx context.Context) {
 	e.client.RestartSession()
 }
 
+func (e *Endpoint) OnDemand() bool {
+	return e.onDemand
+}
+
+func (e *Endpoint) SetKeepIdleConnections(keep bool) {
+	if !keep {
+		e.client.Suspend()
+	}
+}
+
+func (e *Endpoint) waitReady(ctx context.Context) error {
+	if !e.onDemand {
+		if !e.ready() || !e.client.Ready() {
+			return E.New("endpoint is not ready yet")
+		}
+		return nil
+	}
+	e.client.Resume()
+	waitCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+	defer cancel()
+	err := e.client.WaitReady(waitCtx)
+	if err != nil {
+		return err
+	}
+	for {
+		e.statusAccess.Lock()
+		statusUpdated := e.statusUpdated
+		terminalError := e.terminalError
+		e.statusAccess.Unlock()
+		if terminalError != "" {
+			return E.New(terminalError)
+		}
+		if e.ready() {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-statusUpdated:
+		}
+	}
+}
+
 func (e *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
 	return adapter.PreMatchFlow
+}
+
+func (e *Endpoint) FlowDomainResolveOptions() adapter.DNSQueryOptions {
+	return e.innerDNSQueryOptions
 }
 
 func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) {
@@ -525,6 +595,9 @@ func (e *Endpoint) ready() bool {
 }
 
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	if e.onDemand {
+		e.client.Resume()
+	}
 	if !e.ready() {
 		return E.New("endpoint is not ready yet")
 	}
@@ -536,6 +609,9 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 }
 
 func (e *Endpoint) writePacketBuffers(packetBuffers []*buf.Buffer) error {
+	if e.onDemand {
+		e.client.Resume()
+	}
 	if !e.ready() {
 		buf.ReleaseMulti(packetBuffers)
 		return nil
@@ -562,11 +638,12 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	if !e.ready() || !e.client.Ready() {
-		return nil, E.New("endpoint is not ready yet")
+	readyErr := e.waitReady(ctx)
+	if readyErr != nil {
+		return nil, readyErr
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, e.innerDNSQueryOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -580,11 +657,12 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	if !e.ready() || !e.client.Ready() {
-		return nil, netip.Addr{}, E.New("endpoint is not ready yet")
+	readyErr := e.waitReady(ctx)
+	if readyErr != nil {
+		return nil, netip.Addr{}, readyErr
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, e.innerDNSQueryOptions)
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}

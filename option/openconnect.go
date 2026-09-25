@@ -4,7 +4,9 @@ import "github.com/sagernet/sing/common/json/badoption"
 
 type OpenConnectEndpointOptions struct {
 	DialerOptions
+	InnerDomainResolver            *DomainResolveOptions                `json:"inner_domain_resolver,omitempty"`
 	System                         bool                                 `json:"system,omitempty"`
+	GSO                            *bool                                `json:"gso,omitempty"`
 	Name                           string                               `json:"name,omitempty"`
 	UDPTimeout                     badoption.Duration                   `json:"udp_timeout,omitempty"`
 	UDPMapping                     UDPNATBehavior                       `json:"udp_mapping,omitempty"`
@@ -46,6 +48,11 @@ type OpenConnectEndpointOptions struct {
 	AllowInsecureCrypto            bool                                 `json:"allow_insecure_crypto,omitempty"`
 	TLS                            OpenConnectTLSOptions                `json:"tls,omitempty"`
 	FormEntries                    []OpenConnectFormEntryOptions        `json:"form_entries,omitempty"`
+	OnDemand                       bool                                 `json:"on_demand,omitempty"`
+}
+
+func (o *OpenConnectEndpointOptions) TakeInnerDomainResolverOptions() *DomainResolveOptions {
+	return o.InnerDomainResolver
 }
 
 type OpenConnectTokenOptions struct {

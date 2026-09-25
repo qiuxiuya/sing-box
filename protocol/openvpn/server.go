@@ -17,6 +17,8 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing-box/transport/device"
 	ovpntransport "github.com/sagernet/sing-box/transport/openvpn"
 	ovpn "github.com/sagernet/sing-openvpn"
 	"github.com/sagernet/sing-tun"
@@ -28,7 +30,7 @@ import (
 )
 
 var (
-	_ adapter.FlowOutbound               = (*ServerEndpoint)(nil)
+	_ adapter.FlowOutboundDomainResolver = (*ServerEndpoint)(nil)
 	_ dialer.PacketDialerWithDestination = (*ServerEndpoint)(nil)
 )
 
@@ -42,10 +44,13 @@ type ServerEndpoint struct {
 	dnsRouter      adapter.DNSRouter
 	listener       *listener.Listener
 	server         *ovpn.Server
-	device         ovpntransport.Device
+	deviceOptions  *device.Options
+	device         device.Device
 	localAddresses []netip.Prefix
 	started        atomic.Bool
 	readLoopDone   chan struct{}
+
+	innerDNSQueryOptions adapter.DNSQueryOptions
 }
 
 type udpEgressPacketConn struct {
@@ -69,6 +74,10 @@ func (c *udpEgressPacketConn) WriteTo(buffer []byte, destination net.Addr) (int,
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.OpenVPNServerEndpointOptions) (adapter.Endpoint, error) {
+	innerDNSQueryOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
+	if err != nil {
+		return nil, E.Cause(err, "inner domain resolver")
+	}
 	if options.MTU == 0 {
 		options.MTU = ovpntransport.DefaultMTU
 	}
@@ -86,6 +95,7 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
 		localAddresses: options.Address,
 	}
+	serverEndpoint.innerDNSQueryOptions = innerDNSQueryOptions
 	serverOptions, err := buildServerOptions(options)
 	if err != nil {
 		cancelLoop()
@@ -102,10 +112,15 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
-	device, err := ovpntransport.NewDevice(ovpntransport.DeviceOptions{
+	gso := options.System
+	if options.GSO != nil {
+		gso = *options.GSO
+	}
+	serverEndpoint.deviceOptions = &device.Options{
 		Context:         ctx,
 		Logger:          logger,
 		System:          options.System,
+		GSO:             gso,
 		Handler:         serverEndpoint,
 		UDPTimeout:      udpTimeout,
 		ICMPTimeout:     C.ICMPTimeout,
@@ -114,19 +129,14 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		UDPNATMax:       options.UDPNATMax,
 		InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
 		Name:            options.Name,
+		NamePrefix:      "ovpn",
 		MTU:             options.MTU,
-		Configuration: ovpntransport.Configuration{
-			MTU:      options.MTU,
-			Address:  options.Address,
-			Topology: options.Topology,
+		PacketHeadroom:  ovpntransport.PacketHeadroom,
+		Configuration: device.Configuration{
+			MTU:     options.MTU,
+			Address: options.Address,
 		},
-	})
-	if err != nil {
-		cancelLoop()
-		return nil, err
 	}
-	serverEndpoint.device = device
-	device.SetPacketWriter(serverEndpoint.writePacketBuffersByDestination)
 	return serverEndpoint, nil
 }
 
@@ -162,6 +172,17 @@ func validateServerTopology(topology string) error {
 }
 
 func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
+	if stage == adapter.StartStateInitialize {
+		s.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(s.ctx)
+		tunnelDevice, err := device.New(*s.deviceOptions)
+		if err != nil {
+			return err
+		}
+		tunnelDevice.SetPacketWriter(s.writePacketBuffersByDestination)
+		s.device = tunnelDevice
+		s.deviceOptions = nil
+		return nil
+	}
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -200,7 +221,7 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 		if err == nil {
 			tuneOpenVPNUDPSocket(packetConn)
 			if egressEnabled {
-				udpConn := packetConn.(*net.UDPConn)
+				udpConn := s.listener.UDPConn()
 				networkManager := service.FromContext[adapter.NetworkManager](s.ctx)
 				egressPool := tun.NewUDPEgressPool(tun.UDPEgressPoolOptions{
 					Logger:           s.logger,
@@ -208,7 +229,6 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 					Control:          listenConfig.Control,
 					InterfaceFinder:  networkManager.InterfaceFinder(),
 					InterfaceMonitor: networkManager.InterfaceMonitor(),
-					ExcludeInterface: s.options.Name,
 					IsExempt: func() bool {
 						return networkManager.AutoRedirectOutputMark() != 0
 					},
@@ -647,6 +667,10 @@ func (s *ServerEndpoint) PreMatchFlow(network string, destination netip.Addr) ad
 	return adapter.PreMatchFlow
 }
 
+func (s *ServerEndpoint) FlowDomainResolveOptions() adapter.DNSQueryOptions {
+	return s.innerDNSQueryOptions
+}
+
 func (s *ServerEndpoint) PortAddresses() (netip.Addr, netip.Addr) {
 	return s.device.PortAddresses()
 }
@@ -703,7 +727,7 @@ func (s *ServerEndpoint) writeRouteMisses(routeMisses []*ovpn.RouteMissError) {
 	replies := make([][]byte, 0, len(routeMisses))
 	for _, routeMiss := range routeMisses {
 		sourceAddress := packetSourceAddress(routeMiss.Packet, inet4Address, inet6Address)
-		reply, built := tun.BuildUnreachable(routeMiss.Packet, sourceAddress, headroom)
+		reply, built := tun.BuildICMPError(routeMiss.Packet, tun.ICMPErrorNoRoute, sourceAddress, 0, headroom)
 		if built {
 			replies = append(replies, reply)
 		}
@@ -732,7 +756,7 @@ func (s *ServerEndpoint) DialContext(ctx context.Context, network string, destin
 		return nil, E.New("endpoint is not ready yet")
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := s.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := s.dnsRouter.Lookup(ctx, destination.Fqdn, s.innerDNSQueryOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -750,7 +774,7 @@ func (s *ServerEndpoint) ListenPacketWithDestination(ctx context.Context, destin
 		return nil, netip.Addr{}, E.New("endpoint is not ready yet")
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := s.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := s.dnsRouter.Lookup(ctx, destination.Fqdn, s.innerDNSQueryOptions)
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}

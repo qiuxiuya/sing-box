@@ -34,10 +34,11 @@ func TestL3UDPDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), 0, 0)
 	defer dispatcher.Close()
+	stage := dispatcher.NewStage(nil)
 
 	request := buildTestIPv4UDPPacket(client, fakeDestination, []byte("request"))
-	require.True(t, dispatcher.Dispatch(request))
-	dispatcher.Flush()
+	require.True(t, stage.Dispatch(request))
+	stage.Flush()
 	require.Len(t, port.writtenPackets, 1)
 
 	forwardIP := header.IPv4(port.writtenPackets[0])
@@ -95,10 +96,11 @@ func TestL3UDPSniffOverrideDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), 0, 0)
 	defer dispatcher.Close()
+	stage := dispatcher.NewStage(nil)
 
 	request := buildTestIPv4UDPPacket(client, originalDestination, []byte("request"))
-	require.True(t, dispatcher.Dispatch(request))
-	dispatcher.Flush()
+	require.True(t, stage.Dispatch(request))
+	stage.Flush()
 	require.Equal(t, 1, dnsRouter.lookupCount)
 	require.Len(t, port.writtenPackets, 1)
 
@@ -140,7 +142,7 @@ type testL3RouterNATHandler struct {
 }
 
 func (h *testL3RouterNATHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
-	return adapter.JudgeFlow(h.router, "tun-in", C.TypeTun, network, source, destination, firstPacket)
+	return adapter.JudgeFlow(h.router, adapter.InboundContext{Inbound: "tun-in", InboundType: C.TypeTun}, network, source, destination, firstPacket)
 }
 
 type testL3NATFlowOutbound struct {

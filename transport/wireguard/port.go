@@ -23,9 +23,7 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 	if err := e.startDevice(); err != nil {
 		return err
 	}
-	e.deviceAccess.Lock()
-	wgDevice := e.device
-	e.deviceAccess.Unlock()
+	wgDevice := e.device.Load()
 	if wgDevice == nil {
 		return E.New("WireGuard device is not ready")
 	}
@@ -78,7 +76,7 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 		} else {
 			source = e.tunDevice.Inet6Address()
 		}
-		reply, replyOk := tun.BuildUnreachable(packet, source, state.headroom)
+		reply, replyOk := tun.BuildICMPError(packet, tun.ICMPErrorNoRoute, source, 0, state.headroom)
 		if replyOk {
 			replies = append(replies, reply)
 		}

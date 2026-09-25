@@ -149,6 +149,11 @@ type ProviderHealthCheckOptions struct {
 	Timeout  badoption.Duration `json:"timeout,omitempty"`
 }
 
+type OverrideAnyTLSOptions struct {
+	ClientMetadata *string `json:"client_metadata,omitempty"`
+	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
+}
+
 type OverrideDialerOptions struct {
 	Detour               *string                            `json:"detour,omitempty" reference:"outbound"`
 	BindInterface        *string                            `json:"bind_interface,omitempty"`
@@ -162,6 +167,7 @@ type OverrideDialerOptions struct {
 	TCPMultiPath         *bool                              `json:"tcp_multi_path,omitempty"`
 	TCPKeepAlive         *badoption.Duration                `json:"tcp_keep_alive,omitempty"`
 	TCPKeepAliveInterval *badoption.Duration                `json:"tcp_keep_alive_interval,omitempty"`
+	UDPGSO               *bool                              `json:"udp_gso,omitempty"`
 	UDPFragment          *bool                              `json:"udp_fragment,omitempty"`
 	DomainResolver       *DomainResolveOptions              `json:"domain_resolver,omitempty"`
 	NetworkStrategy      *NetworkStrategy                   `json:"network_strategy,omitempty"`
@@ -174,11 +180,6 @@ type OverrideDialerOptions struct {
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
-}
-
-type OverrideAnyTLSOptions struct {
-	ClientMetadata *string `json:"client_metadata,omitempty"`
-	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
 }
 
 type OverrideTLSOptions struct {

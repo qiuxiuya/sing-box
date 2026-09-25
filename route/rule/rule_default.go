@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -64,7 +65,8 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		abstractDefaultRule{
 			domainMatchStrategy: C.DomainMatchStrategy(options.DomainMatchStrategy),
 			abstractRule: abstractRule{
-				uuid: id.String(),
+				uuid:    id.String(),
+				history: service.PtrFromContext[urltest.HistoryStorage](ctx),
 			},
 			invert: options.Invert,
 			action: action,
@@ -293,6 +295,16 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}
+	if options.DNSServerAddress != nil && options.DNSServerAddress.Size() > 0 {
+		item := NewDNSServerAddressItem(ctx, options.DNSServerAddress)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
+	if options.DNSSearchDomain != nil && options.DNSSearchDomain.Size() > 0 {
+		item := NewDNSSearchDomainItem(ctx, options.DNSSearchDomain)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
 	if len(options.RuleSet) > 0 {
 		//nolint:staticcheck
 		if options.Deprecated_RulesetIPCIDRMatchSource {
@@ -324,7 +336,8 @@ func NewLogicalRule(ctx context.Context, logger log.ContextLogger, options optio
 	rule := &LogicalRule{
 		abstractLogicalRule{
 			abstractRule: abstractRule{
-				uuid: id.String(),
+				uuid:    id.String(),
+				history: service.PtrFromContext[urltest.HistoryStorage](ctx),
 			},
 			rules:               make([]adapter.HeadlessRule, len(options.Rules)),
 			domainMatchStrategy: C.DomainMatchStrategy(options.DomainMatchStrategy),
@@ -348,6 +361,13 @@ func NewLogicalRule(ctx context.Context, logger log.ContextLogger, options optio
 		err = validateNoNestedRuleActions(subOptions, true)
 		if err != nil {
 			return nil, E.Cause(err, "sub rule[", i, "]")
+		}
+		if subOptions.Type == C.RuleTypeLogical {
+			if subOptions.LogicalOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+				subOptions.LogicalOptions.DomainMatchStrategy = option.DomainMatchStrategy(rule.domainMatchStrategy)
+			}
+		} else if subOptions.DefaultOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+			subOptions.DefaultOptions.DomainMatchStrategy = option.DomainMatchStrategy(rule.domainMatchStrategy)
 		}
 		subRule, err := NewRule(ctx, logger, subOptions, false)
 		if err != nil {

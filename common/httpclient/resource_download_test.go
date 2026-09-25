@@ -3,9 +3,6 @@ package httpclient
 import (
 	"context"
 	"fmt"
-	boxTLS "github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/logger"
 	"io"
 	"net"
 	"net/http"
@@ -14,8 +11,12 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/common/interrupt"
+	boxTLS "github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -96,7 +97,6 @@ func TestResourceDownloadConnectionPoolIsolation(t *testing.T) {
 			})
 		}
 	}
-
 }
 
 func TestResourceDownloadResetPreservesActiveBody(t *testing.T) {

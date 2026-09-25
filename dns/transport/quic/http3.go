@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -21,13 +22,13 @@ import (
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	sHTTP "github.com/sagernet/sing/protocol/http"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -91,7 +92,7 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 	if path == "" {
 		path = "/dns-query"
 	}
-	err = sHTTP.URLSetPath(&destinationURL, path)
+	err = badhttp.URLSetPath(&destinationURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +102,9 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 	}
 	if !serverAddr.IsValid() {
 		return nil, E.New("invalid server address: ", serverAddr)
+	}
+	if options.Method == "" {
+		options.Method = http.MethodPost
 	}
 	t := &HTTP3Transport{
 		TransportAdapter: dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeHTTP3, tag, options.RemoteDNSServerOptions),
@@ -123,7 +127,7 @@ func (t *HTTP3Transport) newTransport() *http3.Transport {
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, cfg)
+			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, qtls.ConfigWithGSO(qtls.ConfigWithGSO(cfg, t.dialer), conn))
 			if dialErr != nil {
 				conn.Close()
 				return nil, dialErr
@@ -175,7 +179,7 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	var body io.Reader
 	switch t.method {
 	case http.MethodGet:
-		query := url.Values{}
+		query := destination.Query()
 		query.Set("dns", base64.RawURLEncoding.EncodeToString(rawMessage))
 		destination.RawQuery = query.Encode()
 	case http.MethodPost:

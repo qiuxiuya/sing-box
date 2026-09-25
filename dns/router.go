@@ -44,7 +44,6 @@ type Router struct {
 	client                 adapter.DNSClient
 	rawRules               []option.DNSRule
 	rules                  []adapter.DNSRule
-	ruleByUUID             map[string]adapter.DNSRule
 	defaultDomainStrategy  C.DomainStrategy
 	dnsReverseMapping      *freelru.Cache[netip.Addr, string]
 	platformInterface      adapter.PlatformInterface
@@ -54,6 +53,7 @@ type Router struct {
 	closing                bool
 	defaultRejectRcode     int
 	allowResolverDiscovery bool
+	ruleByUUID             map[string]adapter.DNSRule
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -65,10 +65,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		rawRules:               make([]option.DNSRule, 0, len(options.Rules)),
 		rules:                  make([]adapter.DNSRule, 0, len(options.Rules)),
-		ruleByUUID:             make(map[string]adapter.DNSRule),
 		defaultDomainStrategy:  C.DomainStrategy(options.Strategy),
 		defaultRejectRcode:     options.DefaultRejectRcode.Build(),
 		allowResolverDiscovery: options.AllowResolverDiscovery,
+		ruleByUUID:             make(map[string]adapter.DNSRule),
 	}
 	if options.DNSClientOptions.IndependentCache {
 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
@@ -1095,7 +1095,11 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	if r.powerManager != nil {
 		recorder := r.powerManager.Recorder()
 		if recorder != nil {
-			recorder.CountDNSQuery()
+			var domain string
+			if len(message.Question) == 1 {
+				domain = message.Question[0].Name
+			}
+			recorder.CountDNSQuery(domain)
 		}
 	}
 	if len(message.Question) != 1 {
@@ -1133,6 +1137,8 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	r.logger.DebugContext(ctx, "exchange ", FormatQuestion(message.Question[0].String()))
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
+	metadata.SniffHost = ""
+	metadata.CacheIPs = nil
 	metadata.QueryType = message.Question[0].Qtype
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
@@ -1314,6 +1320,8 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	r.logger.DebugContext(ctx, "lookup domain ", domain)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
+	metadata.SniffHost = ""
+	metadata.CacheIPs = nil
 	metadata.Domain = FqdnToDomain(domain)
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
@@ -1419,10 +1427,14 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 }
 
 func (r *Router) Rules() []adapter.DNSRule {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	return r.rules
 }
 
 func (r *Router) Rule(uuid string) (adapter.DNSRule, bool) {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	rule, exists := r.ruleByUUID[uuid]
 	return rule, exists
 }

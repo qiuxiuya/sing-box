@@ -76,20 +76,7 @@ jobs:
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
-          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-            go run -v ./cmd/internal/read_tag --ci --nightly
-          elif [[ "$GITHUB_REF_NAME" == "stable" ]]; then
-            base_version="$(awk '/^#### [0-9]+\.[0-9]+\.[0-9]+/ { print $2; exit }' docs/changelog.md)"
-            if [[ -z "$base_version" ]]; then
-              echo "unable to determine stable version from docs/changelog.md" >&2
-              exit 1
-            fi
-            version="$base_version-$(git rev-parse --short HEAD)"
-            echo "version=$version" >> "$GITHUB_ENV"
-          else
-            echo "no reachable version tag" >&2
-            exit 1
-          fi
+          go run -v ./cmd/internal/read_tag --ci --nightly
       - name: Set outputs
         id: outputs
         run: |-
@@ -1227,7 +1214,7 @@ jobs:
           path: 'dist'
   build_apple_library:
     name: Build Apple library (${{ matrix.artifact }})
-    runs-on: ${{ matrix.build && 'macos-26' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.build && 'xcode-27' || 'ubuntu-latest' }}
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'Apple-release' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak'
     needs:
       - calculate_version
@@ -1298,7 +1285,7 @@ jobs:
           compression-level: 1
   build_apple:
     name: Build Apple release clients
-    runs-on: ${{ matrix.if && 'macos-26' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.if && 'xcode-27' || 'ubuntu-latest' }}
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' || inputs.build == 'iOS-jailbreak'
     needs:
       - calculate_version
@@ -1572,7 +1559,7 @@ jobs:
             --api-key $ASC_KEY_ID \
             --api-issuer 00000000-0000-0000-0000-000000000000
       - name: Publish to TestFlight
-        if: matrix.if && matrix.type == 'app-store' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/testing'
+        if: matrix.if && matrix.type == 'app-store' && github.event_name == 'workflow_dispatch'
         run: |-
           arguments=(publish_testflight "${{ matrix.platform }}")
           if [[ -n "$TEST_MESSAGE" ]]; then
@@ -1629,7 +1616,7 @@ jobs:
           path: 'dist'
   build_apple_app_store:
     name: Build Apple App Store clients
-    runs-on: ${{ matrix.if && 'macos-26' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.if && 'xcode-27' || 'ubuntu-latest' }}
     if: github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
     needs:
       - calculate_version

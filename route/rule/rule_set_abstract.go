@@ -131,7 +131,7 @@ func (s *abstractRuleSet) loadBytes(content []byte, ruleset adapter.RuleSet) err
 	default:
 		return E.New("unknown rule-set format: ", s.format)
 	}
-	plainRuleSet, err := ruleSet.Upgrade()
+	plainRuleSet, err := mmapRuleSet(s.ctx, s.logger, s.tag, ruleSet).Upgrade()
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package v2raygrpclite
 
 import (
 	std_bufio "bufio"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -9,8 +10,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
@@ -27,7 +28,9 @@ type GunConn struct {
 	flusher       http.Flusher
 	create        chan struct{}
 	err           error
+	cancel        context.CancelFunc
 	readRemaining int
+	onClose       func()
 }
 
 func newGunConn(reader io.Reader, writer io.Writer, flusher http.Flusher) *GunConn {
@@ -39,10 +42,11 @@ func newGunConn(reader io.Reader, writer io.Writer, flusher http.Flusher) *GunCo
 	}
 }
 
-func newLateGunConn(writer io.Writer) *GunConn {
+func newLateGunConn(writer io.Writer, cancel context.CancelFunc) *GunConn {
 	return &GunConn{
 		create: make(chan struct{}),
 		writer: writer,
+		cancel: cancel,
 	}
 }
 
@@ -57,11 +61,11 @@ func (c *GunConn) setup(reader io.Reader, err error) {
 
 func (c *GunConn) Read(b []byte) (n int, err error) {
 	n, err = c.read(b)
-	return n, v2rayhttp.WrapHTTP2Error(err)
+	return n, baderror.WrapH2(err)
 }
 
 func (c *GunConn) read(b []byte) (n int, err error) {
-	if c.reader == nil {
+	if c.create != nil {
 		<-c.create
 		if c.err != nil {
 			return 0, c.err
@@ -109,7 +113,7 @@ func (c *GunConn) Write(b []byte) (n int, err error) {
 	common.Must1(buffer.Write(b))
 	_, err = c.writer.Write(buffer.Bytes())
 	if err != nil {
-		return 0, v2rayhttp.WrapHTTP2Error(err)
+		return 0, baderror.WrapH2(err)
 	}
 	if c.flusher != nil {
 		c.flusher.Flush()
@@ -128,7 +132,7 @@ func (c *GunConn) WriteBuffer(buffer *buf.Buffer) error {
 	binary.PutUvarint(header[6:], uint64(dataLen))
 	err := common.Error(c.writer.Write(buffer.Bytes()))
 	if err != nil {
-		return v2rayhttp.WrapHTTP2Error(err)
+		return baderror.WrapH2(err)
 	}
 	if c.flusher != nil {
 		c.flusher.Flush()
@@ -141,7 +145,24 @@ func (c *GunConn) FrontHeadroom() int {
 }
 
 func (c *GunConn) Close() error {
-	return common.Close(c.rawReader, c.writer)
+	var reader io.Reader
+	if c.create != nil {
+		select {
+		case <-c.create:
+			reader = c.rawReader
+		default:
+		}
+	} else {
+		reader = c.rawReader
+	}
+	err := common.Close(reader, c.writer)
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return err
 }
 
 func (c *GunConn) LocalAddr() net.Addr {

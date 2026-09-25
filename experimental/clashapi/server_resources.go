@@ -3,6 +3,7 @@ package clashapi
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -22,6 +23,11 @@ import (
 const defaultExternalUIDownloadURL = "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip"
 
 func (s *Server) checkAndDownloadExternalUI(update bool) error {
+	s.updateAccess.Lock()
+	defer s.updateAccess.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 	if s.externalUI == "" {
 		return nil
 	}
@@ -68,6 +74,7 @@ func (s *Server) downloadExternalUI() error {
 	if err != nil {
 		return err
 	}
+	defer response.Body.Close()
 	switch response.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotModified:
@@ -88,17 +95,11 @@ func (s *Server) downloadExternalUI() error {
 	default:
 		return E.New("download external UI failed: ", response.Status)
 	}
-	defer response.Body.Close()
-	removeAllInDirectory(s.ctx, s.externalUI)
-	err = s.downloadZIP(response.Body, s.externalUI)
+	err = s.installExternalUI(response.Body)
 	if err != nil {
-		removeAllInDirectory(s.ctx, s.externalUI)
 		return err
 	}
-	eTagHeader := response.Header.Get("Etag")
-	if eTagHeader != "" {
-		s.lastEtag = eTagHeader
-	}
+	s.lastEtag = response.Header.Get("Etag")
 	s.lastUpdated = time.Now()
 	if s.cacheFile != nil {
 		err = s.cacheFile.SaveExternalUI("ExternalUI", &adapter.SavedBinary{
@@ -114,8 +115,35 @@ func (s *Server) downloadExternalUI() error {
 	return nil
 }
 
+func (s *Server) installExternalUI(body io.Reader) error {
+	output := filepath.Clean(s.externalUI)
+	suffix := rand.Text()
+	staging := output + ".update-" + suffix
+	backup := output + ".backup-" + suffix
+	if err := filemanager.MkdirAll(s.ctx, staging, 0o755); err != nil {
+		return err
+	}
+	defer filemanager.RemoveAll(s.ctx, staging)
+	if err := s.downloadZIP(body, staging); err != nil {
+		return err
+	}
+	if err := filemanager.Rename(s.ctx, output, backup); err != nil {
+		return err
+	}
+	if err := filemanager.Rename(s.ctx, staging, output); err != nil {
+		if restoreErr := filemanager.Rename(s.ctx, backup, output); restoreErr != nil {
+			return E.Errors(err, E.Cause(restoreErr, "restore external UI from ", backup))
+		}
+		return err
+	}
+	return filemanager.RemoveAll(s.ctx, backup)
+}
+
 func (s *Server) resolveExternalUITransport() (adapter.HTTPTransport, error) {
 	httpClientManager := service.FromContext[adapter.HTTPClientManager](s.ctx)
+	if httpClientManager == nil {
+		return nil, E.New("missing HTTP client manager")
+	}
 	contextLogger := s.logger.(log.ContextLogger)
 	if s.externalUIHTTPClient != nil && !s.externalUIHTTPClient.IsEmpty() {
 		if s.externalUIDownloadDetour != "" { //nolint:staticcheck
@@ -163,6 +191,9 @@ func (s *Server) downloadZIP(body io.Reader, output string) error {
 		if trimDir {
 			pathElements = pathElements[1:]
 		}
+		if !filepath.IsLocal(filepath.Join(pathElements...)) {
+			return E.New("invalid external UI archive path: ", file.Name)
+		}
 		saveDirectory := output
 		if len(pathElements) > 1 {
 			saveDirectory = filepath.Join(saveDirectory, filepath.Join(pathElements[:len(pathElements)-1]...))
@@ -194,16 +225,6 @@ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) e
 	return common.Error(io.Copy(saveFile, reader))
 }
 
-func removeAllInDirectory(ctx context.Context, directory string) {
-	dirEntries, err := filemanager.ReadDir(ctx, directory)
-	if err != nil {
-		return
-	}
-	for _, dirEntry := range dirEntries {
-		filemanager.RemoveAll(ctx, filepath.Join(directory, dirEntry.Name()))
-	}
-}
-
 func zipIsInSingleDirectory(files []*zip.File) bool {
 	var singleDirectory string
 	for _, file := range files {
@@ -211,7 +232,7 @@ func zipIsInSingleDirectory(files []*zip.File) bool {
 			continue
 		}
 		pathElements := strings.Split(file.Name, "/")
-		if len(pathElements) == 0 {
+		if len(pathElements) < 2 {
 			return false
 		}
 		if singleDirectory == "" {

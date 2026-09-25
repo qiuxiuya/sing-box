@@ -68,10 +68,10 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	}
 	var processPath string
 	if c.Metadata.ProcessInfo != nil {
-		if len(c.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
-			processPath = c.Metadata.ProcessInfo.AndroidPackageNames[0]
-		} else if c.Metadata.ProcessInfo.ProcessPath != "" {
-			processPath = c.Metadata.ProcessInfo.ProcessPath
+		if len(c.Metadata.ProcessInfo.PackageNames) > 0 {
+			processPath = c.Metadata.ProcessInfo.PackageNames[0]
+		} else if len(c.Metadata.ProcessInfo.ProcessPaths) > 0 {
+			processPath = c.Metadata.ProcessInfo.ProcessPaths[0]
 		}
 		if processPath == "" {
 			if c.Metadata.ProcessInfo.UserId != -1 {
@@ -89,7 +89,6 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	} else {
 		rule = "final"
 	}
-	chains := trafficcontrol.TrackerMetadata(c).Chains()
 	return json.Marshal(map[string]any{
 		"id": c.ID,
 		"metadata": map[string]any{
@@ -107,7 +106,7 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 		"upload":      c.Upload.Load(),
 		"download":    c.Download.Load(),
 		"start":       c.CreatedAt,
-		"chains":      chains,
+		"chains":      c.Chain,
 		"rule":        rule,
 		"rulePayload": "",
 	})

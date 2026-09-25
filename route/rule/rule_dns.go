@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
@@ -113,7 +114,8 @@ func NewDefaultDNSRule(ctx context.Context, logger log.ContextLogger, options op
 	rule := &DefaultDNSRule{
 		abstractDefaultRule: abstractDefaultRule{
 			abstractRule: abstractRule{
-				uuid: id.String(),
+				uuid:    id.String(),
+				history: service.PtrFromContext[urltest.HistoryStorage](ctx),
 			},
 			invert: options.Invert,
 			action: NewDNSRuleAction(logger, options.DNSRuleAction),
@@ -382,6 +384,16 @@ func NewDefaultDNSRule(ctx context.Context, logger log.ContextLogger, options op
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}
+	if options.DNSServerAddress != nil && options.DNSServerAddress.Size() > 0 {
+		item := NewDNSServerAddressItem(ctx, options.DNSServerAddress)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
+	if options.DNSSearchDomain != nil && options.DNSSearchDomain.Size() > 0 {
+		item := NewDNSSearchDomainItem(ctx, options.DNSSearchDomain)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
 	if options.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
 		if legacyDNSMode {
 			deprecated.Report(ctx, deprecated.OptionRuleSetIPCIDRAcceptEmpty)
@@ -503,7 +515,8 @@ func NewLogicalDNSRule(ctx context.Context, logger log.ContextLogger, options op
 	r := &LogicalDNSRule{
 		abstractLogicalRule: abstractLogicalRule{
 			abstractRule: abstractRule{
-				uuid: id.String(),
+				uuid:    id.String(),
+				history: service.PtrFromContext[urltest.HistoryStorage](ctx),
 			},
 			rules:  make([]adapter.HeadlessRule, len(options.Rules)),
 			invert: options.Invert,

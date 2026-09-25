@@ -28,10 +28,12 @@ type ManagedTransport struct {
 	factory       func(resourceDownload bool) (innerTransport, error)
 	cheapRebuild  bool
 
-	dialer  N.Dialer
-	headers http.Header
-	host    string
-	tag     string
+	dialer          N.Dialer
+	headers         http.Header
+	host            string
+	tag             string
+	detour          string
+	defaultOutbound bool
 }
 
 type transportEpoch struct {

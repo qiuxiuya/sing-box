@@ -58,6 +58,7 @@ type InboundContext struct {
 
 	RouteRule     string
 	RouteOutbound string
+	OutboundChain []Outbound
 
 	// sniffer
 
@@ -67,6 +68,8 @@ type InboundContext struct {
 	SniffContext any
 	SnifferNames []string
 	SniffError   error
+	// Destination used for QUIC sniff caching, before routing overrides.
+	SniffDestination M.Socksaddr
 
 	// cache
 
@@ -99,6 +102,7 @@ type InboundContext struct {
 	SourceGeoIPCode                     string
 	GeoIPCode                           string
 	ProcessInfo                         *ConnectionOwner
+	ProcessInfoResolver                 func() *ConnectionOwner `json:"-"`
 	SourceMACAddress                    net.HardwareAddr
 	SourceHostname                      string
 	QueryType                           uint16
@@ -119,32 +123,17 @@ type InboundContext struct {
 	DestinationPortMatch         bool
 	DeferredIPCIDRMatchGroups    uint8
 	IgnoreDestinationIPCIDRMatch bool
-
-	// extended metadata
-	Extended *InboundContextExtended
 }
 
-type InboundContextExtended struct {
-	RealOutboundChain []string
-}
-
-func (c *InboundContext) InitExtended() {
-	if c.Extended == nil {
-		c.Extended = new(InboundContextExtended)
+// ResolveProcessInfo upgrades a UID/package lookup only when a path matcher
+// needs it, without mutating the metadata or its cached owner. The resolver is
+// shared safely by copies of the connection metadata.
+// Inbound/platform-provided owners without a resolver remain authoritative.
+func (c *InboundContext) ResolveProcessInfo() *ConnectionOwner {
+	if c.ProcessInfoResolver != nil {
+		return c.ProcessInfoResolver()
 	}
-}
-
-func (c *InboundContext) AppendRealOutbound(tag string) {
-	if c.Extended != nil {
-		c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
-	}
-}
-
-func (c *InboundContext) GetRealOutboundChain() []string {
-	if c.Extended != nil {
-		return c.Extended.RealOutboundChain
-	}
-	return nil
+	return c.ProcessInfo
 }
 
 func (c *InboundContext) ResetRuleCache() {
@@ -219,8 +208,17 @@ func DNSTransportTagFromContext(ctx context.Context) (string, bool) {
 	return transportTag, loaded
 }
 
+func ContextForMultiplexSession(ctx context.Context) context.Context {
+	var sessionContext InboundContext
+	metadata := ContextFrom(ctx)
+	if metadata != nil {
+		sessionContext.Outbound = metadata.Outbound
+	}
+	ctx = ContextWithDNSTransportTag(ctx, "")
+	return WithContext(ctx, &sessionContext)
+}
+
 func WithContext(ctx context.Context, inboundContext *InboundContext) context.Context {
-	inboundContext.InitExtended()
 	return context.WithValue(ctx, (*inboundContextKey)(nil), inboundContext)
 }
 
