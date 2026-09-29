@@ -76,11 +76,17 @@ func (c *CacheFile) SaveDNSCache(transportName string, qName string, qType uint1
 
 func (c *CacheFile) DeleteDNSCache(transportName string, qName string, qType uint16, rawMessage []byte) {
 	saveKey := saveCacheKey{transportName, qName, qType}
+	// Wait for active writes before deleting, so they cannot restore a corrupt value.
+	c.saveDNSCacheFlushAccess.Lock()
+	defer c.saveDNSCacheFlushAccess.Unlock()
 	c.saveDNSCacheAccess.Lock()
 	defer c.saveDNSCacheAccess.Unlock()
-	_, hasPending := c.saveDNSCache[saveKey]
+	pending, hasPending := c.saveDNSCache[saveKey]
 	if hasPending {
-		return
+		if !bytes.Equal(pending.rawMessage, rawMessage) {
+			return
+		}
+		delete(c.saveDNSCache, saveKey)
 	}
 	key := make([]byte, 2+len(qName))
 	binary.BigEndian.PutUint16(key, qType)
@@ -130,6 +136,8 @@ func (c *CacheFile) flushPendingDNSCache(saveKey saveCacheKey, logger logger.Log
 }
 
 func (c *CacheFile) flushPendingDNSCacheWith(saveKey saveCacheKey, logger logger.Logger, save func(saveDNSCacheEntry) error) {
+	c.saveDNSCacheFlushAccess.RLock()
+	defer c.saveDNSCacheFlushAccess.RUnlock()
 	for {
 		c.saveDNSCacheAccess.RLock()
 		entry, loaded := c.saveDNSCache[saveKey]

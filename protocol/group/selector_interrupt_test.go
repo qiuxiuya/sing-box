@@ -173,16 +173,20 @@ func newSelectorInterruptTestConn() *selectorInterruptTestConn {
 	return &selectorInterruptTestConn{closed: make(chan struct{})}
 }
 
-func (c *selectorInterruptTestConn) Close() error                { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *selectorInterruptTestConn) Close() error { c.once.Do(func() { close(c.closed) }); return nil }
+
 func (c *selectorInterruptTestConn) Read([]byte) (int, error)    { <-c.closed; return 0, net.ErrClosed }
 func (c *selectorInterruptTestConn) Write(p []byte) (int, error) { return len(p), nil }
 func (c *selectorInterruptTestConn) ReadFrom([]byte) (int, net.Addr, error) {
 	<-c.closed
 	return 0, nil, net.ErrClosed
 }
+
 func (c *selectorInterruptTestConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
-func (c *selectorInterruptTestConn) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
-func (c *selectorInterruptTestConn) RemoteAddr() net.Addr                      { return &net.TCPAddr{} }
-func (c *selectorInterruptTestConn) SetDeadline(time.Time) error               { return nil }
-func (c *selectorInterruptTestConn) SetReadDeadline(time.Time) error           { return nil }
-func (c *selectorInterruptTestConn) SetWriteDeadline(time.Time) error          { return nil }
+
+func (c *selectorInterruptTestConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
+
+func (c *selectorInterruptTestConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *selectorInterruptTestConn) SetDeadline(time.Time) error      { return nil }
+func (c *selectorInterruptTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *selectorInterruptTestConn) SetWriteDeadline(time.Time) error { return nil }

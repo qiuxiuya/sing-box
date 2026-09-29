@@ -287,3 +287,5 @@ func (m *loadBalanceURLTestOutboundManager) Outbound(tag string) (adapter.Outbou
 	outbound, loaded := m.outbounds[tag]
 	return outbound, loaded
 }
+
+func (g *loadBalanceURLTestGroup) Type() string { return "loadbalance" }

@@ -102,6 +102,9 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 	if !serverAddr.IsValid() {
 		return nil, E.New("invalid server address: ", serverAddr)
 	}
+	if options.Method == "" {
+		options.Method = http.MethodPost
+	}
 	t := &HTTP3Transport{
 		TransportAdapter: dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeHTTP3, tag, options.RemoteDNSServerOptions),
 		logger:           logger,
@@ -175,7 +178,7 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	var body io.Reader
 	switch t.method {
 	case http.MethodGet:
-		query := url.Values{}
+		query := destination.Query()
 		query.Set("dns", base64.RawURLEncoding.EncodeToString(rawMessage))
 		destination.RawQuery = query.Encode()
 	case http.MethodPost:

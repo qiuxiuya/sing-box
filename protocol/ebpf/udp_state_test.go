@@ -132,7 +132,7 @@ func TestUDPReplySocketLifecycle(t *testing.T) {
 	if _, _, err = pool.get(destination, create); err == nil {
 		t.Fatal("closed inbound accepted a reply socket")
 	}
-	if _, err = first.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
+	if _, err = first.conn.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
 		t.Fatal("UDP reply socket remained open after inbound closure")
 	}
 }
@@ -185,7 +185,7 @@ func TestUDPReplySocketPoolResetsForNetworkChange(t *testing.T) {
 	if first == second || created != 2 {
 		t.Fatalf("network reset did not replace the reply socket: first=%p second=%p created=%d", first, second, created)
 	}
-	if _, err = first.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
+	if _, err = first.conn.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
 		t.Fatal("reset reply socket remained open")
 	}
 	_ = pool.close()
@@ -225,7 +225,7 @@ func TestUDPDirectReplyBindingChecksGeneration(t *testing.T) {
 func TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort(t *testing.T) {
 	var pool udpReplySocketPool
 	counts := make(map[int]int)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		destination := netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)}),
 			443,
@@ -251,7 +251,7 @@ func TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort(t *testing.T) {
 func TestUDPClientTableShardsSpreadAcrossClientAddress(t *testing.T) {
 	var table udpClientTable
 	counts := make(map[*udpClientShard]int)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		client := netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{192, 168, byte(i >> 8), byte(i)}),
 			51413,

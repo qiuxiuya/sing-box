@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
@@ -67,6 +68,8 @@ type InboundContext struct {
 	SniffContext any
 	SnifferNames []string
 	SniffError   error
+	// Destination used for QUIC sniff caching, before routing overrides.
+	SniffDestination M.Socksaddr
 
 	// cache
 
@@ -99,6 +102,7 @@ type InboundContext struct {
 	SourceGeoIPCode                     string
 	GeoIPCode                           string
 	ProcessInfo                         *ConnectionOwner
+	ProcessInfoResolver                 func() *ConnectionOwner `json:"-"`
 	SourceMACAddress                    net.HardwareAddr
 	SourceHostname                      string
 	QueryType                           uint16
@@ -125,6 +129,7 @@ type InboundContext struct {
 }
 
 type InboundContextExtended struct {
+	access            sync.Mutex
 	RealOutboundChain []string
 }
 
@@ -136,15 +141,30 @@ func (c *InboundContext) InitExtended() {
 
 func (c *InboundContext) AppendRealOutbound(tag string) {
 	if c.Extended != nil {
+		c.Extended.access.Lock()
 		c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
+		c.Extended.access.Unlock()
 	}
 }
 
 func (c *InboundContext) GetRealOutboundChain() []string {
 	if c.Extended != nil {
-		return c.Extended.RealOutboundChain
+		c.Extended.access.Lock()
+		defer c.Extended.access.Unlock()
+		return append([]string(nil), c.Extended.RealOutboundChain...)
 	}
 	return nil
+}
+
+// ResolveProcessInfo upgrades a UID/package lookup only when a path matcher
+// needs it, without mutating the metadata or its cached owner. The resolver is
+// shared safely by copies of the connection metadata.
+// Inbound/platform-provided owners without a resolver remain authoritative.
+func (c *InboundContext) ResolveProcessInfo() *ConnectionOwner {
+	if c.ProcessInfoResolver != nil {
+		return c.ProcessInfoResolver()
+	}
+	return c.ProcessInfo
 }
 
 func (c *InboundContext) ResetRuleCache() {

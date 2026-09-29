@@ -1,11 +1,13 @@
 package cachefile
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/sagernet/bbolt"
+	"github.com/sagernet/sing/common/logger"
 
 	"github.com/stretchr/testify/require"
 )
@@ -114,4 +116,78 @@ func TestDeleteDNSCachePreservesPendingValue(t *testing.T) {
 	actualMessage, _, loaded := cache.LoadDNSCache(transportName, questionName, questionType)
 	require.True(t, loaded)
 	require.Equal(t, freshMessage, actualMessage)
+}
+
+func TestDNSCacheFlushFailurePreservesPendingValue(t *testing.T) {
+	cache := newDNSCacheTestCache(t)
+	key := saveCacheKey{"local", "example.com.", 1}
+	cache.queueDNSCacheSave(key, []byte("pending"), time.Now().Add(time.Hour))
+	cache.flushPendingDNSCacheWith(key, logger.NOP(), func(saveDNSCacheEntry) error { return errors.New("write failed") })
+	message, _, loaded := cache.LoadDNSCache(key.TransportName, key.QuestionName, key.QType)
+	require.True(t, loaded)
+	require.Equal(t, []byte("pending"), message)
+	require.True(t, cache.queueDNSCacheSave(key, []byte("retry"), time.Now().Add(time.Hour)))
+	cache.flushPendingDNSCache(key, logger.NOP())
+	message, _, loaded = cache.LoadDNSCache(key.TransportName, key.QuestionName, key.QType)
+	require.True(t, loaded)
+	require.Equal(t, []byte("retry"), message)
+	require.Empty(t, cache.saveDNSCache)
+}
+
+func TestDNSCacheFlushFailurePreservesNewerPendingValue(t *testing.T) {
+	cache := newDNSCacheTestCache(t)
+	key := saveCacheKey{"local", "example.com.", 1}
+	cache.queueDNSCacheSave(key, []byte("old"), time.Now().Add(time.Hour))
+	calls := 0
+	cache.flushPendingDNSCacheWith(key, logger.NOP(), func(entry saveDNSCacheEntry) error {
+		calls++
+		if calls == 1 {
+			cache.queueDNSCacheSave(key, []byte("new"), time.Now().Add(time.Hour))
+		} else {
+			require.Equal(t, []byte("new"), entry.rawMessage)
+		}
+		return errors.New("write failed")
+	})
+	require.Equal(t, 2, calls)
+	message, _, loaded := cache.LoadDNSCache(key.TransportName, key.QuestionName, key.QType)
+	require.True(t, loaded)
+	require.Equal(t, []byte("new"), message)
+}
+
+func TestDeleteDNSCacheDeletesMatchingPendingValue(t *testing.T) {
+	cache := newDNSCacheTestCache(t)
+	key := saveCacheKey{"local", "example.com.", 1}
+	cache.queueDNSCacheSave(key, []byte("corrupt"), time.Now().Add(time.Hour))
+	cache.DeleteDNSCache(key.TransportName, key.QuestionName, key.QType, []byte("corrupt"))
+	cache.flushPendingDNSCache(key, logger.NOP())
+	_, _, loaded := cache.LoadDNSCache(key.TransportName, key.QuestionName, key.QType)
+	require.False(t, loaded)
+}
+
+func TestDeleteDNSCacheWaitsForActiveWrite(t *testing.T) {
+	cache := newDNSCacheTestCache(t)
+	key := saveCacheKey{"local", "example.com.", 1}
+	cache.queueDNSCacheSave(key, []byte("corrupt"), time.Now().Add(time.Hour))
+	writing := make(chan struct{})
+	release := make(chan struct{})
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		cache.flushPendingDNSCacheWith(key, logger.NOP(), func(entry saveDNSCacheEntry) error {
+			close(writing)
+			<-release
+			return cache.SaveDNSCache(key.TransportName, key.QuestionName, key.QType, entry.rawMessage, entry.expireAt)
+		})
+	}()
+	<-writing
+	deleted := make(chan struct{})
+	go func() {
+		cache.DeleteDNSCache(key.TransportName, key.QuestionName, key.QType, []byte("corrupt"))
+		close(deleted)
+	}()
+	close(release)
+	<-flushed
+	<-deleted
+	_, _, loaded := cache.LoadDNSCache(key.TransportName, key.QuestionName, key.QType)
+	require.False(t, loaded)
 }

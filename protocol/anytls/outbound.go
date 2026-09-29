@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -24,10 +23,6 @@ import (
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.AnyTLSOutboundOptions](registry, C.TypeAnyTLS, NewOutbound)
-
-	if !strings.Contains(util.Version, "sing-box") {
-		util.Version = util.Version + " sing-box/" + C.Version
-	}
 }
 
 var _ adapter.OutboundWithMultiplex = (*Outbound)(nil)
@@ -107,7 +102,7 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 
 func clientMetadataOrDefault(clientMetadata *string) string {
 	if clientMetadata == nil {
-		return util.Version
+		return util.Version + " sing-box/" + C.Version
 	}
 	return *clientMetadata
 }

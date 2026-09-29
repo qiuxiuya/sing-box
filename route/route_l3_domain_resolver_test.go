@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -152,6 +153,43 @@ func TestPreMatchFlowResolvesSniffOverrideDestination(t *testing.T) {
 	require.Equal(t, adapter.PreMatchFlow, result.Action)
 	require.Equal(t, netip.MustParseAddrPort("203.0.113.1:443"), result.Destination)
 	require.Equal(t, 1, dnsRouter.lookupCount)
+}
+
+func TestPreMatchResolvedFlowKeepsNestedGroupQUICCache(t *testing.T) {
+	leaf := &testResolvingFlowOutbound{
+		testFlowOutbound: &testFlowOutbound{outboundType: "wireguard", tag: "vpn"},
+		queryOptions:     adapter.DNSQueryOptions{Strategy: C.DomainStrategyIPv4Only},
+	}
+	inner := &testOutboundGroup{selected: leaf}
+	outer := &testOutboundGroup{selected: inner}
+	router, metadata := newPreMatchQUICRouter(t, 30*time.Millisecond)
+	originalDestination := metadata.Destination
+	router.outbound = &testL3OutboundManager{defaultOutbound: outer}
+	dnsRouter := &testL3DNSRouter{addresses: []netip.Addr{netip.MustParseAddr("203.0.113.1")}}
+	router.dns = dnsRouter
+	metadata.Protocol = C.ProtocolQUIC
+	metadata.SniffHost = "example.com"
+	metadata.SniffDestination = originalDestination
+	metadata.Destination = M.ParseSocksaddr("example.com:443")
+	metadata.DestOverride = true
+	// Matching-only addresses must not replace the selected endpoint's resolver.
+	metadata.CacheIPs = []netip.Addr{netip.MustParseAddr("192.0.2.99")}
+	result := router.preMatchFlow(context.Background(), &metadata, originalDestination, nil, "")
+	require.Equal(t, adapter.PreMatchFlow, result.Action)
+	require.Same(t, leaf, result.Outbound)
+	require.Equal(t, netip.MustParseAddrPort("203.0.113.1:443"), result.Destination)
+	require.Equal(t, leaf.queryOptions, dnsRouter.options)
+	tracker := result.NewTracker()
+	tracker.AttachFlow(&preMatchQUICHandle{tracker: tracker})
+	tracker.CloseFlow(tun.FlowCloseFinished)
+	host, loaded := router.lookupQUICSniff(metadata.Source, originalDestination)
+	require.True(t, loaded)
+	require.Equal(t, "example.com", host)
+	_, wrongKey := router.lookupQUICSniff(metadata.Source, M.SocksaddrFrom(result.Destination.Addr(), result.Destination.Port()))
+	require.False(t, wrongKey)
+	require.Eventually(t, func() bool { return router.quicSniffCache.Len() == 0 }, time.Second, time.Millisecond)
+	tracker.CloseFlow(tun.FlowCloseFinished)
+	require.Zero(t, router.quicSniffCache.Len())
 }
 
 type testL3DNSRouter struct {

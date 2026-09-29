@@ -51,6 +51,10 @@ type Endpoint struct {
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
+	innerDNSQueryOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
+	if err != nil {
+		return nil, E.Cause(err, "inner domain resolver")
+	}
 	ep := &Endpoint{
 		Adapter:        endpoint.NewAdapterWithDialerOptions(C.TypeWireGuard, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
 		ctx:            ctx,
@@ -138,13 +142,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	ep.endpoint = wgEndpoint
-	if options.InnerDomainResolver != nil {
-		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
-		if err != nil {
-			return nil, E.Cause(err, "inner domain resolver")
-		}
-		ep.innerDNSQueryOptions = innerDNSOpts
-	}
+	ep.innerDNSQueryOptions = innerDNSQueryOptions
 	return ep, nil
 }
 

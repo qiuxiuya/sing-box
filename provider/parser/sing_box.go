@@ -24,13 +24,25 @@ func (o *SingBoxDocument) UnmarshalJSONContext(ctx context.Context, inputContent
 	}
 	outbounds, hasOutbounds := content.Get("outbounds")
 	if hasOutbounds {
+		outboundList, valid := outbounds.(badjson.JSONArray)
+		if !valid {
+			return E.New("outbounds must be an array")
+		}
 		var outs badjson.JSONArray
-		for i, outbound := range outbounds.(badjson.JSONArray) {
-			typeVal, loaded := outbound.(*badjson.JSONObject).Get("type")
+		for i, outbound := range outboundList {
+			object, valid := outbound.(*badjson.JSONObject)
+			if !valid || object == nil {
+				return E.New("outbound[", i, "] must be an object")
+			}
+			typeVal, loaded := object.Get("type")
 			if !loaded {
 				return E.New("missing type in outbound[", i, "]")
 			}
-			switch typeVal.(string) {
+			outboundType, valid := typeVal.(string)
+			if !valid {
+				return E.New("outbound[", i, "] type must be a string")
+			}
+			switch outboundType {
 			case C.TypeDirect, C.TypeBlock, C.TypeDNS, C.TypeSelector, C.TypeURLTest, C.TypePass:
 				continue
 			default:

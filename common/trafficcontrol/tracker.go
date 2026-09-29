@@ -3,6 +3,7 @@ package trafficcontrol
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,44 +77,66 @@ func (t TrackerMetadata) Chains() []string {
 	return chains
 }
 
+// Stream trackers are published after dialing, when the actual group selection
+// is known. The counters also initialize tracking for handlers without a handshake.
 func (m *Manager) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	upload := new(atomic.Int64)
-	download := new(atomic.Int64)
-	trackerMetadata := m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download)
-	trafficCounters := m.trafficCounters(trackerMetadata)
-	uploadCounters := []*atomic.Int64{upload}
-	downloadCounters := []*atomic.Int64{download}
-	if trafficCounters != nil {
-		uploadCounters = append(uploadCounters, &trafficCounters.UploadBytes)
-		downloadCounters = append(downloadCounters, &trafficCounters.DownloadBytes)
-	}
-	tracker := &connTracker{
-		ExtendedConn: bufio.NewInt64CounterConn(conn, uploadCounters, downloadCounters),
-		metadata:     trackerMetadata,
-		manager:      m,
-	}
-	m.join(tracker)
+	tracker := &connTracker{trackerState: trackerState{manager: m, metadata: m.newTrackerMetadata(metadata, matchedRule, matchOutbound, new(atomic.Int64), new(atomic.Int64))}}
+	tracker.self = tracker
+	tracker.ExtendedConn = bufio.NewCounterConn(conn, []N.CountFunc{tracker.countUpload}, []N.CountFunc{tracker.countDownload})
+	m.pendingConnections.Store(tracker.metadata.ID, tracker)
 	return tracker
 }
 
 func (m *Manager) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	upload := new(atomic.Int64)
-	download := new(atomic.Int64)
-	trackerMetadata := m.newTrackerMetadata(metadata, matchedRule, matchOutbound, upload, download)
-	trafficCounters := m.trafficCounters(trackerMetadata)
-	uploadCounters := []*atomic.Int64{upload}
-	downloadCounters := []*atomic.Int64{download}
-	if trafficCounters != nil {
-		uploadCounters = append(uploadCounters, &trafficCounters.UploadBytes)
-		downloadCounters = append(downloadCounters, &trafficCounters.DownloadBytes)
-	}
-	tracker := &packetConnTracker{
-		PacketConn: bufio.NewInt64CounterPacketConn(conn, uploadCounters, nil, downloadCounters, nil),
-		metadata:   trackerMetadata,
-		manager:    m,
-	}
-	m.join(tracker)
+	tracker := &packetConnTracker{trackerState: trackerState{manager: m, metadata: m.newTrackerMetadata(metadata, matchedRule, matchOutbound, new(atomic.Int64), new(atomic.Int64))}}
+	tracker.self = tracker
+	tracker.PacketConn = bufio.NewCounterPacketConn(conn, []N.CountFunc{tracker.countUpload}, []N.CountFunc{tracker.countDownload})
+	m.pendingConnections.Store(tracker.metadata.ID, tracker)
 	return tracker
+}
+
+type trackerState struct {
+	once     sync.Once
+	metadata TrackerMetadata
+	manager  *Manager
+	self     Tracker
+	counters *TrafficCounters
+}
+
+func (t *trackerState) start(remote any) {
+	t.once.Do(func() {
+		if selection, loaded := common.Cast[outboundSelection](remote); loaded {
+			t.metadata.Chain, t.metadata.Outbound, t.metadata.OutboundType = selection.trackedOutbound()
+			// The selection is immutable; do not reconstruct it from current group state.
+			t.metadata.outboundManager = nil
+		}
+		t.counters = t.manager.trafficCounters(t.metadata)
+		t.manager.join(t.self)
+		t.manager.pendingConnections.Delete(t.metadata.ID)
+	})
+}
+
+func (t *trackerState) countUpload(n int64) {
+	t.start(nil)
+	t.metadata.Upload.Add(n)
+	if t.counters != nil {
+		t.counters.UploadBytes.Add(n)
+	}
+}
+
+func (t *trackerState) countDownload(n int64) {
+	t.start(nil)
+	t.metadata.Download.Add(n)
+	if t.counters != nil {
+		t.counters.DownloadBytes.Add(n)
+	}
+}
+
+func (t *trackerState) Metadata() *TrackerMetadata { return &t.metadata }
+
+func (t *trackerState) close() {
+	t.start(nil)
+	t.manager.leave(t.self)
 }
 
 func (m *Manager) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
@@ -168,16 +191,16 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
 
 type connTracker struct {
 	N.ExtendedConn
-	metadata TrackerMetadata
-	manager  *Manager
+	trackerState
 }
 
-func (t *connTracker) Metadata() *TrackerMetadata {
-	return &t.metadata
+func (t *connTracker) ConnHandshakeSuccess(conn net.Conn) error {
+	t.start(conn)
+	return N.ReportConnHandshakeSuccess(t.ExtendedConn, conn)
 }
 
 func (t *connTracker) Close() error {
-	t.manager.leave(t)
+	t.trackerState.close()
 	return t.ExtendedConn.Close()
 }
 
@@ -247,16 +270,16 @@ func (t *flowTracker) Close() error {
 
 type packetConnTracker struct {
 	N.PacketConn
-	metadata TrackerMetadata
-	manager  *Manager
+	trackerState
 }
 
-func (t *packetConnTracker) Metadata() *TrackerMetadata {
-	return &t.metadata
+func (t *packetConnTracker) PacketConnHandshakeSuccess(conn net.PacketConn) error {
+	t.start(conn)
+	return N.ReportPacketConnHandshakeSuccess(t.PacketConn, conn)
 }
 
 func (t *packetConnTracker) Close() error {
-	t.manager.leave(t)
+	t.trackerState.close()
 	return t.PacketConn.Close()
 }
 

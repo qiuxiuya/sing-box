@@ -13,7 +13,6 @@ import (
 	"time"
 	"unsafe"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -22,6 +21,7 @@ import (
 	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/json/badoption"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -99,15 +99,13 @@ func TestInternalListenerSetSynchronizesCloseAndUDPWrite(t *testing.T) {
 	source := netip.MustParseAddr("127.0.0.1")
 	var writers sync.WaitGroup
 	for range 8 {
-		writers.Add(1)
-		go func() {
-			defer writers.Done()
+		writers.Go(func() {
 			for range 256 {
 				_ = listeners.selectedPort()
 				_ = listeners.String()
 				_ = listeners.writeUDP([]byte{0}, nil, client, source)
 			}
-		}()
+		})
 	}
 	if err := listeners.close(); err != nil {
 		t.Fatal(err)
@@ -275,7 +273,7 @@ func TestParsePortRanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []commonEBPF.PortRange{{Start: 80, End: 83}, {Start: 443, End: 443}, {Start: 8000, End: 8002}}
+	want := []portRange{{Start: 80, End: 83}, {Start: 443, End: 443}, {Start: 8000, End: 8002}}
 	if !slices.Equal(ranges, want) {
 		t.Fatalf("unexpected port ranges: got %v, want %v", ranges, want)
 	}

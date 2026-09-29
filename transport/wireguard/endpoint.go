@@ -217,28 +217,25 @@ func (e *Endpoint) Start(postStart bool) error {
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers)
 	e.tunDevice.SetDevice(wgDevice)
-	var ipcConf strings.Builder
-	ipcConf.WriteString(e.ipcConf)
-	for _, peer := range e.peers {
-		ipcConf.WriteString(peer.GenerateIpcLines())
-	}
-	err = wgDevice.IpcSet(ipcConf.String())
-	if err != nil {
-		wgDevice.Close()
-		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
-	}
-	for _, peer := range e.peers {
+	domainPeers := make(map[device.NoisePublicKey]*peerConfig)
+	for peerIndex, peer := range e.peers {
 		if !peer.destination.IsDomain() {
 			continue
 		}
 		var publicKey device.NoisePublicKey
-		common.Must(publicKey.FromHex(peer.publicKeyHex))
-		wgPeer, found := wgDevice.LookupActivePeer(publicKey)
-		if !found {
+		err = publicKey.FromHex(peer.publicKeyHex)
+		if err != nil {
 			wgDevice.Close()
-			return E.New("missing configured peer: ", peer.destination)
+			return E.Cause(err, "decode public key for peer ", peerIndex)
 		}
-		wgPeer.SetEndpointResolver(func() ([]conn.Endpoint, error) {
+		domainPeers[publicKey] = &e.peers[peerIndex]
+	}
+	if len(domainPeers) > 0 {
+		wgDevice.SetEndpointResolverFunc(func(publicKey device.NoisePublicKey) ([]conn.Endpoint, error) {
+			peer, found := domainPeers[publicKey]
+			if !found {
+				return nil, nil
+			}
 			addresses, lookupErr := e.options.ResolvePeer(peer.destination.Fqdn)
 			if lookupErr != nil {
 				return nil, lookupErr
@@ -257,6 +254,16 @@ func (e *Endpoint) Start(postStart bool) error {
 			}
 			return endpoints, nil
 		})
+	}
+	var ipcConf strings.Builder
+	ipcConf.WriteString(e.ipcConf)
+	for _, peer := range e.peers {
+		ipcConf.WriteString(peer.GenerateIpcLines())
+	}
+	err = wgDevice.IpcSet(ipcConf.String())
+	if err != nil {
+		wgDevice.Close()
+		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
 	}
 	e.deviceAccess.Lock()
 	e.device = wgDevice
@@ -300,7 +307,7 @@ func (e *Endpoint) startDevice() error {
 	if isDone(e.done) {
 		return net.ErrClosed
 	}
-	if e.isPaused() {
+	if e.isNetworkPaused() {
 		return errNetworkPaused
 	}
 	e.deviceAccess.Lock()
@@ -313,23 +320,23 @@ func (e *Endpoint) startDevice() error {
 	if e.device == nil {
 		return net.ErrClosed
 	}
-	if e.isPaused() {
+	if e.isNetworkPaused() {
 		return errNetworkPaused
 	}
 	return e.device.Up()
 }
 
 func (e *Endpoint) waitNetworkActive(ctx context.Context) error {
-	if !e.isPaused() {
+	if !e.isNetworkPaused() {
 		return nil
 	}
 	timer := time.NewTimer(networkPauseGracePeriod)
 	defer timer.Stop()
-	for e.isPaused() {
+	for e.isNetworkPaused() {
 		e.pauseAccess.Lock()
 		updated := e.pauseUpdated
 		e.pauseAccess.Unlock()
-		if !e.isPaused() {
+		if !e.isNetworkPaused() {
 			return nil
 		}
 		select {
@@ -341,7 +348,7 @@ func (e *Endpoint) waitNetworkActive(ctx context.Context) error {
 			return net.ErrClosed
 		case <-updated:
 		case <-timer.C:
-			if e.isPaused() {
+			if e.isNetworkPaused() {
 				return errNetworkPaused
 			}
 		}
@@ -349,9 +356,10 @@ func (e *Endpoint) waitNetworkActive(ctx context.Context) error {
 	return nil
 }
 
-func (e *Endpoint) isPaused() bool {
-	// These accessors use atomic state, unlike the pause manager's channel-based IsPaused.
-	return e.pause != nil && (e.pause.IsDevicePaused() || e.pause.IsNetworkPaused())
+func (e *Endpoint) isNetworkPaused() bool {
+	// Device sleep does not stop WireGuard or block outbound traffic.
+	// IsNetworkPaused uses atomic state, unlike the channel-based IsPaused.
+	return e.pause != nil && e.pause.IsNetworkPaused()
 }
 
 func (e *Endpoint) notifyPauseUpdated() {
@@ -393,7 +401,7 @@ func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
 }
 
 func (e *Endpoint) BindUpdate() error {
-	if e.isPaused() {
+	if e.isNetworkPaused() {
 		return nil
 	}
 	e.deviceAccess.Lock()
@@ -401,7 +409,7 @@ func (e *Endpoint) BindUpdate() error {
 	if e.device == nil {
 		return nil
 	}
-	if e.isPaused() {
+	if e.isNetworkPaused() {
 		return nil
 	}
 	return e.device.BindUpdate()
@@ -418,8 +426,8 @@ func (e *Endpoint) onPauseUpdated(event int) {
 	switch event {
 	case pause.EventNetworkPause:
 		err = e.device.Down()
-	case pause.EventDeviceWake, pause.EventNetworkWake:
-		if e.isPaused() {
+	case pause.EventNetworkWake:
+		if e.isNetworkPaused() {
 			return
 		}
 		err = e.device.Up()

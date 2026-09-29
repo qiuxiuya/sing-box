@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-snell/snellv4"
 	"github.com/sagernet/sing-snell/snellv6"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -464,16 +465,23 @@ func (c *quicProxyLazyPacketConn) dialUDPOverTCP(ctx context.Context) (net.Packe
 	return packetConn, nil
 }
 
-func (c *quicProxyLazyPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+func (c *quicProxyLazyPacketConn) writeError() error {
 	select {
 	case <-c.closed:
-		return 0, net.ErrClosed
+		return net.ErrClosed
 	default:
 	}
 	select {
 	case <-c.writeTimer.Wait():
-		return 0, os.ErrDeadlineExceeded
+		return os.ErrDeadlineExceeded
 	default:
+		return nil
+	}
+}
+
+func (c *quicProxyLazyPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	if err := c.writeError(); err != nil {
+		return 0, err
 	}
 	if len(payload) == 0 {
 		select {
@@ -558,6 +566,49 @@ func (c *quicProxyLazyPacketConn) WritePacket(buffer *buf.Buffer, destination M.
 	defer buffer.Release()
 	_, err := c.WriteTo(buffer.Bytes(), destination)
 	return err
+}
+
+var _ N.PacketBatchWriter = (*quicProxyLazyPacketConn)(nil)
+
+func (c *quicProxyLazyPacketConn) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	if len(buffers) == 0 || len(buffers) != len(destinations) {
+		buf.ReleaseMulti(buffers)
+		return os.ErrInvalid
+	}
+	for len(buffers) > 0 {
+		if err := c.writeError(); err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		select {
+		case <-c.initDone:
+			if c.connErr != nil {
+				buf.ReleaseMulti(buffers)
+				return c.connErr
+			}
+			packetConn := bufio.NewPacketConn(c.conn)
+			if writer, created := bufio.CreatePacketBatchWriter(packetConn); created {
+				// Buffers may have been allocated before the underlying transport was known.
+				options := N.NewReadWaitOptions(nil, packetConn)
+				for index, buffer := range buffers {
+					buffers[index] = options.Copy(buffer)
+				}
+				return writer.WritePacketBatch(buffers, destinations)
+			}
+			// Keep lazy-connection deadline and close checks on the sequential path.
+			return bufio.NewPacketBatchWriter(struct{ N.PacketWriter }{c}).WritePacketBatch(buffers, destinations)
+		default:
+			// Use the existing first-packet path for QUIC sniffing and init payload fusion.
+			// Empty packets retain WriteTo's behavior and do not consume initialization.
+			if err := c.WritePacket(buffers[0], destinations[0]); err != nil {
+				buf.ReleaseMulti(buffers[1:])
+				return err
+			}
+			buffers = buffers[1:]
+			destinations = destinations[1:]
+		}
+	}
+	return nil
 }
 
 func (c *quicProxyLazyPacketConn) Close() error {

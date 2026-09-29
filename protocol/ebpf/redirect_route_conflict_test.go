@@ -7,8 +7,9 @@ import (
 	"net/netip"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/netlink"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 // TestCheckRedirectRouteConflictSeesARouteOnAnotherInterface proves the

@@ -127,6 +127,9 @@ func NewHTTPSRaw(
 	serverAddr M.Socksaddr,
 	tlsConfig tls.Config,
 ) *HTTPSTransport {
+	if method == "" {
+		method = http.MethodPost
+	}
 	if tlsConfig != nil {
 		dialer = tls.NewDialer(dialer, tlsConfig)
 	}
@@ -211,7 +214,7 @@ func (t *HTTPSTransport) exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	var body io.Reader
 	switch t.method {
 	case http.MethodGet:
-		query := url.Values{}
+		query := destination.Query()
 		query.Set("dns", base64.RawURLEncoding.EncodeToString(rawMessage))
 		destination.RawQuery = query.Encode()
 	case http.MethodPost:

@@ -54,6 +54,7 @@ type Manager struct {
 	outbound adapter.OutboundManager
 
 	connections             compatible.Map[uuid.UUID, Tracker]
+	pendingConnections      compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]
 	closedUploadTotal       int64
@@ -157,8 +158,8 @@ func (m *Manager) leave(tracker Tracker) {
 		m.closedConnectionsAccess.Unlock()
 		return
 	}
-	metadata.ClosedAt = closedAt
 	metadataCopy := *metadata
+	metadataCopy.ClosedAt = closedAt
 	if m.closedConnectionsLimit > 0 && m.closedConnections.Len() >= m.closedConnectionsLimit {
 		evicted := m.closedConnections.PopFront()
 		m.closedUploadTotal += evicted.Upload.Load()
@@ -237,6 +238,11 @@ func (m *Manager) Connection(id uuid.UUID) Tracker {
 }
 
 func (m *Manager) CloseAllConnections() {
+	// Dialing connections have no final attribution yet, but must still close.
+	m.pendingConnections.Range(func(_ uuid.UUID, tracker Tracker) bool {
+		tracker.Close()
+		return true
+	})
 	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
 		tracker.Close()
 		return true

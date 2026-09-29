@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,11 +35,11 @@ var (
 
 var _ adapter.DNSClient = (*Client)(nil)
 
-func reverseRotateSlice[T any](slice []T, steps int32) []T {
+func reverseRotateSlice[T any](slice []T, steps uint32) []T {
 	if len(slice) <= 1 {
 		return slice
 	}
-	steps = steps % int32(len(slice))
+	steps = steps % uint32(len(slice))
 	return append(slice[len(slice)-int(steps):], slice[:len(slice)-int(steps)]...)
 }
 
@@ -53,9 +54,19 @@ func removeAnswersOfType(answers []dns.RR, rrType uint16) []dns.RR {
 }
 
 type dnsMsg struct {
-	ipv4Index atomic.Int32
-	ipv6Index atomic.Int32
+	ipv4Index atomic.Uint32
+	ipv6Index atomic.Uint32
 	msg       *dns.Msg
+}
+
+func nextRotation(index *atomic.Uint32, length int) uint32 {
+	for {
+		previous := index.Load()
+		next := (previous%uint32(length) + 1) % uint32(length)
+		if index.CompareAndSwap(previous, next) {
+			return next
+		}
+	}
 }
 
 func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
@@ -72,8 +83,7 @@ func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
 		}
 	}
 	if len(ipv4Answers) > 1 {
-		newIndex := (dm.ipv4Index.Add(1) % int32(len(ipv4Answers)))
-		dm.ipv4Index.Store(newIndex)
+		newIndex := nextRotation(&dm.ipv4Index, len(ipv4Answers))
 		rotatedIPv4 := reverseRotateSlice(ipv4Answers, newIndex)
 		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeA)
 		for _, ipv4 := range rotatedIPv4 {
@@ -81,8 +91,7 @@ func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
 		}
 	}
 	if len(ipv6Answers) > 1 {
-		newIndex := (dm.ipv6Index.Add(1) % int32(len(ipv6Answers)))
-		dm.ipv6Index.Store(newIndex)
+		newIndex := nextRotation(&dm.ipv6Index, len(ipv6Answers))
 		rotatedIPv6 := reverseRotateSlice(ipv6Answers, newIndex)
 		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeAAAA)
 		for _, ipv6 := range rotatedIPv6 {
@@ -116,7 +125,8 @@ type Client struct {
 	logger            logger.ContextLogger
 	cache             *freelru.Cache[dnsCacheKey, *dnsMsg]
 	roundRobinIndex   *freelru.Cache[dnsCacheKey, *dnsMsg]
-	cacheLock         compatible.Map[dnsCacheKey, chan struct{}]
+	roundRobinAccess  sync.Mutex
+	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 }
 
@@ -170,6 +180,11 @@ type dnsCacheKey struct {
 	transportTag string
 	clientSubnet netip.Prefix
 	environment  uint64
+}
+
+type dnsExchangeKey struct {
+	dnsCacheKey
+	timeout time.Duration
 }
 
 func (k dnsCacheKey) persistentName() string {
@@ -330,6 +345,10 @@ func (o *exchangeOperation) release() {
 }
 
 func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, allowWait bool) (*exchangeOperation, *dns.Msg, exchangeStatus, error) {
+	err := ctx.Err()
+	if err != nil {
+		return nil, nil, exchangeDone, err
+	}
 	if len(message.Question) == 0 {
 		if c.logger != nil {
 			c.logger.WarnContext(ctx, "bad question size: ", len(message.Question))
@@ -363,10 +382,35 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		disableCache:    disableCache,
 	}
 	if !disableCache {
-		cacheKey := c.newCacheKey(transport, question, message, options)
-		operation.cacheKey = cacheKey
-		cond, loaded := c.cacheLock.LoadOrStore(cacheKey, make(chan struct{}))
-		if loaded {
+		for {
+			cacheKey := c.newCacheKey(transport, question, message, options)
+			operation.cacheKey = cacheKey
+			exchangeKey := dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
+			cond, loaded := c.cacheLock.LoadOrStore(exchangeKey, make(chan struct{}))
+			if !loaded {
+				operation.releaseCond = func() {
+					c.cacheLock.Delete(exchangeKey)
+					close(cond)
+				}
+			}
+			response, ttl, isStale := c.loadResponse(cacheKey)
+			if response != nil {
+				if isStale && !options.DisableOptimisticCache {
+					c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
+					logOptimisticResponse(c.logger, ctx, response)
+					response.Id = message.Id
+					operation.release()
+					return nil, response, exchangeDone, nil
+				} else if !isStale {
+					logCachedResponse(c.logger, ctx, response, ttl)
+					response.Id = message.Id
+					operation.release()
+					return nil, response, exchangeDone, nil
+				}
+			}
+			if !loaded {
+				break
+			}
 			if !allowWait {
 				return nil, nil, exchangeWait, nil
 			}
@@ -375,28 +419,11 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 			case <-ctx.Done():
 				return nil, nil, exchangeDone, ctx.Err()
 			}
-			cacheKey = c.newCacheKey(transport, question, message, options)
-			operation.cacheKey = cacheKey
-		} else {
-			operation.releaseCond = func() {
-				c.cacheLock.Delete(cacheKey)
-				close(cond)
+			err = ctx.Err()
+			if err != nil {
+				return nil, nil, exchangeDone, err
 			}
-		}
-		response, ttl, isStale := c.loadResponse(cacheKey)
-		if response != nil {
-			if isStale && !options.DisableOptimisticCache {
-				c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
-				logOptimisticResponse(c.logger, ctx, response)
-				response.Id = message.Id
-				operation.release()
-				return nil, response, exchangeDone, nil
-			} else if !isStale {
-				logCachedResponse(c.logger, ctx, response, ttl)
-				response.Id = message.Id
-				operation.release()
-				return nil, response, exchangeDone, nil
-			}
+			// Rejoin deduplication under the current environment before retrying.
 		}
 	}
 
@@ -458,12 +485,17 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 }
 
 func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
+	if options.Timeout == 0 {
+		options.Timeout = c.timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, options.Timeout)
+	defer cancel()
 	operation, earlyResponse, status, err := c.beginExchange(ctx, transport, message, options, responseChecker, true)
 	if status != exchangeReady {
 		return earlyResponse, err
 	}
 	defer operation.release()
-	response, err := c.exchangeToTransport(operation.ctx, transport, operation.message, options.Timeout)
+	response, err := c.exchangeToTransport(operation.ctx, transport, operation.message)
 	if err != nil {
 		return nil, err
 	}
@@ -471,18 +503,26 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 }
 
 func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, callback func(response *dns.Msg, err error)) {
+	if options.Timeout == 0 {
+		options.Timeout = c.timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, options.Timeout)
 	operation, earlyResponse, status, err := c.beginExchange(ctx, transport, message, options, responseChecker, false)
 	switch status {
 	case exchangeDone:
+		cancel()
 		callback(earlyResponse, err)
 		return
 	case exchangeWait:
 		go func() {
-			callback(c.Exchange(ctx, transport, message, options, responseChecker))
+			response, exchangeErr := c.Exchange(ctx, transport, message, options, responseChecker)
+			cancel()
+			callback(response, exchangeErr)
 		}()
 		return
 	}
 	finish := func(response *dns.Msg, exchangeErr error) {
+		cancel()
 		if exchangeErr != nil {
 			operation.release()
 			callback(nil, exchangeErr)
@@ -492,7 +532,7 @@ func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTranspo
 		operation.release()
 		callback(finishedResponse, finishErr)
 	}
-	c.exchangeToTransportAsync(operation.ctx, transport, operation.message, options.Timeout, finish)
+	c.exchangeToTransportAsync(operation.ctx, transport, operation.message, finish)
 }
 
 func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, domain string, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) ([]netip.Addr, error) {
@@ -541,6 +581,11 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 }
 
 func (c *Client) ClearCache() {
+	if c.roundRobinIndex != nil {
+		c.roundRobinAccess.Lock()
+		c.roundRobinIndex.Purge()
+		c.roundRobinAccess.Unlock()
+	}
 	if c.cache != nil {
 		c.cache.Purge()
 	}
@@ -643,11 +688,13 @@ func (c *Client) loadResponse(key dnsCacheKey) (*dns.Msg, int, bool) {
 	if c.dnsCache != nil {
 		response, ttl, isStale := c.loadPersistentResponse(key)
 		if response != nil && c.roundRobinIndex != nil {
+			c.roundRobinAccess.Lock()
 			state, loaded := c.roundRobinIndex.Get(key)
 			if !loaded {
 				state = &dnsMsg{}
 				c.roundRobinIndex.Add(key, state)
 			}
+			c.roundRobinAccess.Unlock()
 			state.applyRoundRobin(response)
 		}
 		return response, ttl, isStale
@@ -747,8 +794,14 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 	}
 	go func() {
 		defer c.backgroundRefresh.Delete(key)
+		timeout := options.Timeout
+		if timeout == 0 {
+			timeout = c.timeout
+		}
 		ctx := adapter.ContextWithDNSTransportTag(c.ctx, transport.Tag())
-		response, err := c.exchangeToTransport(ctx, transport, message, options.Timeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		response, err := c.exchangeToTransport(ctx, transport, message)
 		if err != nil {
 			if c.logger != nil {
 				c.logger.DebugContext(ctx, "optimistic refresh failed for ", FqdnToDomain(key.Name), ": ", err)
@@ -810,12 +863,7 @@ func stripDNSPadding(response *dns.Msg) {
 	}
 }
 
-func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration) (*dns.Msg, error) {
-	if timeout == 0 {
-		timeout = c.timeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
 	response, err := transport.Exchange(ctx, message)
 	if err == nil {
 		stripDNSPadding(response)
@@ -828,13 +876,8 @@ func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNST
 	return nil, err
 }
 
-func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration, callback func(response *dns.Msg, err error)) {
-	if timeout == 0 {
-		timeout = c.timeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+func (c *Client) exchangeToTransportAsync(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, callback func(response *dns.Msg, err error)) {
 	transport.ExchangeAsync(ctx, message, func(response *dns.Msg, err error) {
-		cancel()
 		if err == nil {
 			stripDNSPadding(response)
 			callback(response, nil)

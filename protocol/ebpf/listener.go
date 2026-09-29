@@ -9,17 +9,19 @@ import (
 	"sync"
 	"syscall"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/udpio"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 type internalListenerHandler interface {
@@ -49,7 +51,10 @@ func (i *Inbound) newInternalListener(
 		OOBPacketHandler:    handler,
 		DisablePacketOutput: true,
 		DisableLog:          true,
-		SocketControl:       i.socketControl(ipv6Listener),
+		SocketControl: control.Append(
+			listener.UDPSocketBufferControl(),
+			i.socketControl(ipv6Listener),
+		),
 	})
 }
 

@@ -349,6 +349,13 @@ func NewLogicalRule(ctx context.Context, logger log.ContextLogger, options optio
 		if err != nil {
 			return nil, E.Cause(err, "sub rule[", i, "]")
 		}
+		if subOptions.Type == C.RuleTypeLogical {
+			if subOptions.LogicalOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+				subOptions.LogicalOptions.DomainMatchStrategy = option.DomainMatchStrategy(rule.domainMatchStrategy)
+			}
+		} else if subOptions.DefaultOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+			subOptions.DefaultOptions.DomainMatchStrategy = option.DomainMatchStrategy(rule.domainMatchStrategy)
+		}
 		subRule, err := NewRule(ctx, logger, subOptions, false)
 		if err != nil {
 			return nil, E.Cause(err, "sub rule[", i, "]")

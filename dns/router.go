@@ -1133,6 +1133,8 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	r.logger.DebugContext(ctx, "exchange ", FormatQuestion(message.Question[0].String()))
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
+	metadata.SniffHost = ""
+	metadata.CacheIPs = nil
 	metadata.QueryType = message.Question[0].Qtype
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
@@ -1314,6 +1316,8 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	r.logger.DebugContext(ctx, "lookup domain ", domain)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
+	metadata.SniffHost = ""
+	metadata.CacheIPs = nil
 	metadata.Domain = FqdnToDomain(domain)
 	metadata.DNSResponse = nil
 	metadata.NamedDNSResponses = nil
@@ -1419,10 +1423,14 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 }
 
 func (r *Router) Rules() []adapter.DNSRule {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	return r.rules
 }
 
 func (r *Router) Rule(uuid string) (adapter.DNSRule, bool) {
+	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	rule, exists := r.ruleByUUID[uuid]
 	return rule, exists
 }

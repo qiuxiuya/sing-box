@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -44,7 +45,7 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.BridgeOutboundOptions) (adapter.Outbound, error) {
-	domainResolveOptions, err := adapter.DNSQueryOptionsFrom(ctx, options.DomainResolver)
+	domainResolveOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.DomainResolver)
 	if err != nil {
 		return nil, err
 	}

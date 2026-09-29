@@ -2,5 +2,5 @@
 
 package route
 
-//nolint:unused // keeps NetworkManager platform-neutral when eBPF is unavailable
+//nolint:unused // storage type for the build-tagged NetworkManager field
 type ebpfSelfBypassState struct{}

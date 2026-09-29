@@ -3,8 +3,10 @@ package option
 import "github.com/sagernet/sing/common/json/badoption"
 
 type OpenConnectEndpointOptions struct {
+	InnerDomainResolver *DomainResolveOptions `json:"inner_domain_resolver,omitempty"`
 	DialerOptions
 	System                         bool                                 `json:"system,omitempty"`
+	GSO                            *bool                                `json:"gso,omitempty"`
 	Name                           string                               `json:"name,omitempty"`
 	UDPTimeout                     badoption.Duration                   `json:"udp_timeout,omitempty"`
 	UDPMapping                     UDPNATBehavior                       `json:"udp_mapping,omitempty"`

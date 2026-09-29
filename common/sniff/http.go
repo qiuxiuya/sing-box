@@ -23,6 +23,6 @@ func HTTPHost(_ context.Context, metadata *adapter.InboundContext, reader io.Rea
 		}
 	}
 	metadata.Protocol = C.ProtocolHTTP
-	metadata.SniffHost = M.ParseSocksaddr(request.Host).AddrString()
+	metadata.SniffHost = M.ParseSocksaddr(request.Host).Fqdn
 	return nil
 }

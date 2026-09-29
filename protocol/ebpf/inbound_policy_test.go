@@ -7,8 +7,9 @@ import (
 	"reflect"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/log"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 // TestRevertBypassCIDRBackendsRevertsMostRecentFirst proves the unwind order:
@@ -70,7 +71,11 @@ func (e errString) Error() string { return string(e) }
 // attachment-related.
 func newLoopbackTestTCBackend(t *testing.T) *commonEBPF.TCBackend {
 	t.Helper()
-	policy, err := commonEBPF.CompilePolicy(commonEBPF.PolicyConfig{EnableTCP: true})
+	policy, err := commonEBPF.CompileActionPolicy(commonEBPF.ActionPolicy{
+		EnableTCP: true,
+		Local:     commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
+		Shared:    commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
+	})
 	if err != nil {
 		t.Fatalf("compile policy: %v", err)
 	}
@@ -88,11 +93,14 @@ func newLoopbackTestTCBackend(t *testing.T) *commonEBPF.TCBackend {
 	return backend
 }
 
-func bypassPolicyFor(t *testing.T, prefixes ...netip.Prefix) commonEBPF.BypassCIDRPolicy {
+func bypassPolicyFor(t *testing.T, prefixes ...netip.Prefix) []commonEBPF.CIDRDecision {
 	t.Helper()
-	policy, err := commonEBPF.CompileBypassCIDRPolicy(prefixes)
-	if err != nil {
-		t.Fatalf("compile bypass CIDR policy: %v", err)
+	policy := make([]commonEBPF.CIDRDecision, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			t.Fatalf("invalid bypass CIDR prefix: %s", prefix)
+		}
+		policy = append(policy, commonEBPF.CIDRDecision{Prefix: prefix.Masked(), Action: commonEBPF.DecisionPass})
 	}
 	return policy
 }
@@ -140,7 +148,7 @@ func TestApplyBypassCIDRPolicyRevertsAnEarlierBackendWhenALaterOneFails(t *testi
 	if !reflect.DeepEqual(inbound.bypassRuleSetPolicy, previous) {
 		t.Fatalf("bypassRuleSetPolicy = %+v, want it left at the previous policy on failure", inbound.bypassRuleSetPolicy)
 	}
-	changed, revertCheckErr := tc.UpdateCompiledBypassCIDR(previous)
+	changed, revertCheckErr := tc.UpdateLocalDestinationDecisions(previous)
 	if revertCheckErr != nil {
 		t.Fatalf("re-apply the previous policy to check TC's state: %v", revertCheckErr)
 	}
@@ -161,7 +169,7 @@ func TestApplyBypassCIDRPolicyRevertsAnEarlierBackendWhenALaterOneFails(t *testi
 
 // TestApplyBypassCIDRPolicyLeavesBackendVersionOnFailedRevert is the
 // companion to the test above for the case EBPFDiagnostics'
-// BypassRuleSetConsistent=false is meant to flag: a backend's own
+// A scoped rule-set consistency=false is meant to flag: a backend's own
 // compensating revert fails too, so its true state relative to
 // bypassRuleSetPolicy is unknown. Its recorded version is left at the value
 // it reached during this attempt's forward apply (the last point it was
@@ -309,11 +317,11 @@ func TestBypassRuleSetRetryCountOnlyCountsSchedulerRetries(t *testing.T) {
 // to collapse into fewer, in-cap prefixes: each address is spaced four
 // apart, so no two are adjacent and compileBypassCIDRPolicy's IPSetBuilder
 // cannot merge any of them into a larger CIDR block.
-func oversizedBypassPolicy(t *testing.T) commonEBPF.BypassCIDRPolicy {
+func oversizedBypassPolicy(t *testing.T) []commonEBPF.CIDRDecision {
 	t.Helper()
 	const entries = 65537
 	prefixes := make([]netip.Prefix, 0, entries)
-	for i := 0; i < entries; i++ {
+	for i := range entries {
 		offset := uint32(i) * 4
 		addr := netip.AddrFrom4([4]byte{10, byte(offset >> 16), byte(offset >> 8), byte(offset)})
 		prefixes = append(prefixes, netip.PrefixFrom(addr, 32))
@@ -355,7 +363,7 @@ func TestApplyBypassCIDRPolicySucceedsAcrossRealBackends(t *testing.T) {
 }
 
 // TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure proves
-// the distinction EBPFDiagnostics' BypassRuleSetExpectedPolicyVersion exists
+// the distinction between confirmed and expected policy versions exists
 // for: bypassRuleSetPolicyVersion only ever names the last successfully
 // applied content, but a diagnostics reader watching while a retry is
 // outstanding needs to see what this inbound is currently trying to

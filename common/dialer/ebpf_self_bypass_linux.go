@@ -3,14 +3,16 @@
 package dialer
 
 import (
+	"runtime"
 	"syscall"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []option.Inbound) error {
@@ -34,7 +36,13 @@ func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []opt
 	if localInstances == 0 {
 		return nil
 	}
-	tracker, err := commonEBPF.NewSelfBypass()
+	var tracker *commonEBPF.SelfBypass
+	var err error
+	if runtime.GOOS == "android" {
+		tracker, err = commonEBPF.NewSelfBypassWithCapacity(commonEBPF.CompactSelfBypassSocketCapacity)
+	} else {
+		tracker, err = commonEBPF.NewSelfBypass()
+	}
 	if err != nil {
 		return err
 	}

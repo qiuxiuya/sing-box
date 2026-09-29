@@ -74,6 +74,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			}
 			fallbackAddrNextProto := make(map[string]M.Socksaddr)
 			for nextProto, destination := range options.FallbackForALPN {
+				if destination == nil {
+					return nil, E.New("invalid fallback address for ALPN ", nextProto)
+				}
 				fallbackAddr := destination.Build()
 				if !fallbackAddr.IsValid() {
 					return nil, E.New("invalid fallback address for ALPN ", nextProto, ": ", fallbackAddr)

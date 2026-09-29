@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -133,6 +134,7 @@ type HTTP2Conn struct {
 	writer io.Writer
 	create chan struct{}
 	err    error
+	cancel context.CancelFunc
 }
 
 func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
@@ -142,10 +144,11 @@ func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
 	}
 }
 
-func NewLateHTTPConn(writer io.Writer) *HTTP2Conn {
+func NewLateHTTPConn(writer io.Writer, cancel context.CancelFunc) *HTTP2Conn {
 	return &HTTP2Conn{
 		create: make(chan struct{}),
 		writer: writer,
+		cancel: cancel,
 	}
 }
 
@@ -156,23 +159,37 @@ func (c *HTTP2Conn) Setup(reader io.Reader, err error) {
 }
 
 func (c *HTTP2Conn) Read(b []byte) (n int, err error) {
-	if c.reader == nil {
+	if c.create != nil {
 		<-c.create
 		if c.err != nil {
-			return 0, WrapHTTP2Error(c.err)
+			return 0, baderror.WrapH2(c.err)
 		}
 	}
 	n, err = c.reader.Read(b)
-	return n, WrapHTTP2Error(err)
+	return n, baderror.WrapH2(err)
 }
 
 func (c *HTTP2Conn) Write(b []byte) (n int, err error) {
 	n, err = c.writer.Write(b)
-	return n, WrapHTTP2Error(err)
+	return n, baderror.WrapH2(err)
 }
 
 func (c *HTTP2Conn) Close() error {
-	return common.Close(c.reader, c.writer)
+	var reader io.Reader
+	if c.create != nil {
+		select {
+		case <-c.create:
+			reader = c.reader
+		default:
+		}
+	} else {
+		reader = c.reader
+	}
+	err := common.Close(reader, c.writer)
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
 }
 
 func (c *HTTP2Conn) LocalAddr() net.Addr {

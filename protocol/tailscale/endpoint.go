@@ -138,6 +138,10 @@ type Endpoint struct {
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TailscaleEndpointOptions) (adapter.Endpoint, error) {
+	innerDNSQueryOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
+	if err != nil {
+		return nil, E.Cause(err, "inner domain resolver")
+	}
 	stateDirectory := options.StateDirectory
 	if stateDirectory == "" {
 		stateDirectory = "tailscale"
@@ -258,13 +262,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		systemInterfaceMTU:         options.SystemInterfaceMTU,
 		keyAuth:                    options.AuthKey != "",
 	}
-	if options.InnerDomainResolver != nil {
-		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
-		if err != nil {
-			return nil, E.Cause(err, "inner domain resolver")
-		}
-		ep.innerDNSQueryOptions = innerDNSOpts
-	}
+	ep.innerDNSQueryOptions = innerDNSQueryOptions
 	return ep, nil
 }
 

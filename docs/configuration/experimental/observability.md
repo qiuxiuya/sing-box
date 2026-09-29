@@ -12,6 +12,8 @@ Long-term time series are intended to be stored by Prometheus. sing-box keeps
 only a bounded in-memory connection ring and does not create, append to, or
 prune a local database file.
 
+TCP and UDP connections are published when the dial completes and the handshake is reported. Outbound chains record the actual group selections for that connection, including network-specific URLTest selections, and remain unchanged when a group switches later. Handlers without a handshake are tracked on their first traffic or close; failed dials retain the initial routing attribution. Kernel flows use the final outbound chosen by pre-match.
+
 ### Structure
 
 ```json

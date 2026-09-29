@@ -19,6 +19,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestProcessMetadata(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		owner *adapter.ConnectionOwner
+		want  string
+	}{
+		{name: "missing"},
+		{name: "path", owner: &adapter.ConnectionOwner{ProcessPath: "/app/main", AndroidPackageNames: []string{"app.package"}}, want: "/app/main"},
+		{name: "package", owner: &adapter.ConnectionOwner{AndroidPackageNames: []string{"app.package", "other.package"}}, want: "app.package"},
+		{name: "empty path", owner: &adapter.ConnectionOwner{ProcessPath: "", AndroidPackageNames: []string{"app.package"}}, want: "app.package"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			metadata := testMetadata()
+			metadata.Metadata.ProcessInfo = testCase.owner
+			require.Equal(t, testCase.want, dimensionValue(metadata, "process"))
+			require.Equal(t, testCase.want, newTestManager(t, true).connectionFromMetadata(metadata).Process)
+			require.Empty(t, newTestManager(t, false).connectionFromMetadata(metadata).Process)
+		})
+	}
+}
+
 func TestPrometheusMetrics(t *testing.T) {
 	manager := newTestManager(t, true)
 	metadata := testMetadata()

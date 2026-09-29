@@ -8,9 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"time"
 
-	ECommon "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
@@ -18,6 +16,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
+	ECommon "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,30 +62,27 @@ func (s *sharedRewrite) logMissingSharedTCPRedirect(
 	if listener.Port() != s.listeners.selectedPort() || !s.inbound.isCgroupRedirectAddress(listener.Addr()) {
 		return
 	}
-	allowed, suppressed := s.tcpWarnings.allow(time.Now())
-	if !allowed {
-		return
-	}
-	args := []any{
+	s.tcpWarnings.errorContext(
+		s.inbound.logger, ctx,
 		"missing shared-network TCP redirect state",
 		": client=", client,
 		" listener=", listener,
-	}
-	if suppressed > 0 {
-		args = append(args, " (", suppressed, " similar errors suppressed)")
-	}
-	s.inbound.logger.ErrorContext(ctx, args...)
+	)
 }
 
 func (s *sharedRewrite) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+	s.handlePacket(buffer, oob, source, false)
+}
+
+func (s *sharedRewrite) handlePacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr, takeOwnership bool) bool {
 	backend := s.sharedBackendInstance()
 	if backend == nil {
-		return
+		return false
 	}
 	tokenAddress, _, _, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		s.udpWarnings.packetInfo.warn(s.inbound.logger, "read shared-network UDP token address: ", err)
-		return
+		return false
 	}
 	client := source.AddrPort()
 	tokenDestination := netip.AddrPortFrom(tokenAddress, s.listeners.selectedPort())
@@ -98,7 +94,7 @@ func (s *sharedRewrite) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		original, flow, err = backend.LookupFlow(ECommon.ProtocolUDP, client, tokenDestination)
 		if err != nil {
 			s.udpWarnings.originalDestination.warn(s.inbound.logger, "lookup shared-network UDP original destination: ", err)
-			return
+			return false
 		}
 		retainedFlow = true
 		key = udpSessionKey{
@@ -114,7 +110,12 @@ func (s *sharedRewrite) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		}
 		s.releaseFlows(released)
 	}
+	if takeOwnership {
+		s.udpNat.NewPacketBuffer(key, buffer, source, M.SocksaddrFromNetIP(original.Destination), nil)
+		return true
+	}
 	s.udpNat.NewPacket(key, [][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), nil)
+	return false
 }
 
 func (s *sharedRewrite) NewOOBPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr) {
@@ -123,8 +124,9 @@ func (s *sharedRewrite) NewOOBPacketBatch(buffers []*buf.Buffer, oobs [][]byte, 
 		return
 	}
 	for index, buffer := range buffers {
-		s.NewPacket(buffer, oobs[index], sources[index])
-		buffer.Release()
+		if !s.handlePacket(buffer, oobs[index], sources[index], true) {
+			buffer.Release()
+		}
 	}
 }
 

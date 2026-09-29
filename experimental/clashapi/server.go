@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,7 +51,6 @@ type Server struct {
 	outbound       adapter.OutboundManager
 	provider       adapter.ProviderManager
 	endpoint       adapter.EndpointManager
-	inbound        adapter.InboundManager
 	logger         log.Logger
 	httpServer     *http.Server
 	trafficManager *trafficcontrol.Manager
@@ -69,7 +69,9 @@ type Server struct {
 	cacheFile                 adapter.CacheFile
 	lastEtag                  string
 	lastUpdated               time.Time
-	ticker                    *time.Ticker
+	updateAccess              sync.Mutex
+	updateCancel              context.CancelFunc
+	updateDone                chan struct{}
 }
 
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.LifecycleService, error) {
@@ -102,7 +104,6 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		outbound:  service.FromContext[adapter.OutboundManager](ctx),
 		provider:  service.FromContext[adapter.ProviderManager](ctx),
 		endpoint:  service.FromContext[adapter.EndpointManager](ctx),
-		inbound:   service.FromContext[adapter.InboundManager](ctx),
 		logger:    logFactory.NewLogger("clash-api"),
 		httpServer: &http.Server{
 			Addr:    options.ExternalController,
@@ -159,7 +160,6 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
-		mountEBPFRouter(r, s.inbound)
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
 			r.Mount("/restart", restartRouter(ctx, logFactory))
@@ -195,6 +195,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 		if !s.externalController {
 			break
 		}
+		s.ctx, s.updateCancel = context.WithCancel(s.ctx)
 		var forceUpdate bool
 		if s.externalUI != "" && s.cacheFile != nil {
 			if savedExternalUI := s.cacheFile.LoadExternalUI("ExternalUI"); savedExternalUI != nil {
@@ -208,7 +209,8 @@ func (s *Server) Start(stage adapter.StartStage) error {
 			}
 		}
 		s.checkAndDownloadExternalUI(forceUpdate)
-		if s.externalUIUpdateInterval != 0 && !s.lastUpdated.IsZero() {
+		if s.externalUI != "" && s.externalUIUpdateInterval > 0 {
+			s.updateDone = make(chan struct{})
 			go s.loopUpdate()
 		}
 		var (
@@ -242,24 +244,31 @@ func externalUICacheMatchesURL(savedExternalUI *adapter.SavedBinary, downloadURL
 }
 
 func (s *Server) loopUpdate() {
-	s.ticker = time.NewTicker(s.externalUIUpdateInterval)
-	if time.Since(s.lastUpdated) > s.externalUIUpdateInterval {
+	defer close(s.updateDone)
+	ticker := time.NewTicker(s.externalUIUpdateInterval)
+	defer ticker.Stop()
+	s.updateAccess.Lock()
+	due := time.Since(s.lastUpdated) > s.externalUIUpdateInterval
+	s.updateAccess.Unlock()
+	if due {
 		s.checkAndDownloadExternalUI(true)
 	}
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-s.ticker.C:
+		case <-ticker.C:
 			s.checkAndDownloadExternalUI(true)
 		}
 	}
 }
 
 func (s *Server) Close() error {
-	if s.ticker != nil {
-		s.ticker.Stop()
+	if s.updateCancel != nil {
+		s.updateCancel()
+	}
+	if s.updateDone != nil {
+		<-s.updateDone
 	}
 	return common.Close(
 		common.PtrOrNil(s.httpServer),

@@ -26,6 +26,7 @@ var (
 	bucketMode             = []byte("clash_mode")
 	bucketRuleSet          = []byte("rule_set")
 	bucketExternalUI       = []byte("external_ui")
+	bucketBranch           = []byte("ref1nd")
 	bucketOutboundProvider = []byte("outbound_provider")
 
 	bucketNameList = []string{
@@ -34,7 +35,7 @@ var (
 		string(bucketMode),
 		string(bucketRuleSet),
 		string(bucketExternalUI),
-		string(bucketOutboundProvider),
+		string(bucketBranch),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}
@@ -45,30 +46,31 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx                context.Context
-	logger             logger.Logger
-	path               string
-	cacheID            []byte
-	cacheIDText        string
-	storeFakeIP        bool
-	storeRDRC          bool
-	storeDNS           bool
-	disableExpire      bool
-	rdrcTimeout        time.Duration
-	optimisticTimeout  time.Duration
-	DB                 *bbolt.DB
-	dbAccess           sync.RWMutex
-	saveMetadataAccess sync.Mutex
-	saveMetadata       *adapter.FakeIPMetadata
-	saveMetadataTimer  *time.Timer
-	saveFakeIPAccess   sync.RWMutex
-	saveDomain         map[netip.Addr]string
-	saveAddress4       map[string]netip.Addr
-	saveAddress6       map[string]netip.Addr
-	saveRDRCAccess     sync.RWMutex
-	saveRDRC           map[saveCacheKey]bool
-	saveDNSCacheAccess sync.RWMutex
-	saveDNSCache       map[saveCacheKey]saveDNSCacheEntry
+	ctx                     context.Context
+	logger                  logger.Logger
+	path                    string
+	cacheID                 []byte
+	cacheIDText             string
+	storeFakeIP             bool
+	storeRDRC               bool
+	storeDNS                bool
+	disableExpire           bool
+	rdrcTimeout             time.Duration
+	optimisticTimeout       time.Duration
+	DB                      *bbolt.DB
+	dbAccess                sync.RWMutex
+	saveMetadataAccess      sync.Mutex
+	saveMetadata            *adapter.FakeIPMetadata
+	saveMetadataTimer       *time.Timer
+	saveFakeIPAccess        sync.RWMutex
+	saveDomain              map[netip.Addr]string
+	saveAddress4            map[string]netip.Addr
+	saveAddress6            map[string]netip.Addr
+	saveRDRCAccess          sync.RWMutex
+	saveRDRC                map[saveCacheKey]bool
+	saveDNSCacheAccess      sync.RWMutex
+	saveDNSCacheFlushAccess sync.RWMutex
+	saveDNSCache            map[saveCacheKey]saveDNSCacheEntry
 }
 
 type saveCacheKey struct {
@@ -445,36 +447,11 @@ func (c *CacheFile) StoreGroupExpand(group string, isExpand bool) error {
 }
 
 func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
-	var savedSet adapter.SavedBinary
-	err := c.view(func(t *bbolt.Tx) error {
-		bucket := c.bucket(t, bucketRuleSet)
-		if bucket == nil {
-			return os.ErrNotExist
-		}
-		setBinary := bucket.Get([]byte(tag))
-		if len(setBinary) == 0 {
-			return os.ErrInvalid
-		}
-		return savedSet.UnmarshalBinary(setBinary)
-	})
-	if err != nil {
-		return nil
-	}
-	return &savedSet
+	return c.loadBranchBinary(bucketRuleSet, tag, true)
 }
 
 func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
-	return c.batch(func(t *bbolt.Tx) error {
-		bucket, err := c.createBucket(t, bucketRuleSet)
-		if err != nil {
-			return err
-		}
-		setBinary, err := set.MarshalBinary()
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(tag), setBinary)
-	})
+	return c.saveBranchBinary(bucketRuleSet, tag, set)
 }
 
 func (c *CacheFile) LoadExternalUI(tag string) *adapter.SavedBinary {
@@ -511,34 +488,9 @@ func (c *CacheFile) SaveExternalUI(tag string, info *adapter.SavedBinary) error 
 }
 
 func (c *CacheFile) LoadSubscription(tag string) *adapter.SavedBinary {
-	var savedSet adapter.SavedBinary
-	err := c.DB.View(func(t *bbolt.Tx) error {
-		bucket := c.bucket(t, bucketOutboundProvider)
-		if bucket == nil {
-			return os.ErrNotExist
-		}
-		setBinary := bucket.Get([]byte(tag))
-		if len(setBinary) == 0 {
-			return os.ErrInvalid
-		}
-		return savedSet.UnmarshalBinary(setBinary)
-	})
-	if err != nil {
-		return nil
-	}
-	return &savedSet
+	return c.loadBranchBinary(bucketOutboundProvider, tag, false)
 }
 
 func (c *CacheFile) SaveSubscription(tag string, sub *adapter.SavedBinary) error {
-	return c.DB.Batch(func(t *bbolt.Tx) error {
-		bucket, err := c.createBucket(t, bucketOutboundProvider)
-		if err != nil {
-			return err
-		}
-		setBinary, err := sub.MarshalBinary()
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(tag), setBinary)
-	})
+	return c.saveBranchBinary(bucketOutboundProvider, tag, sub)
 }

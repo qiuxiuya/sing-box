@@ -32,12 +32,13 @@ import (
 var defaultPacketSniffers = []sniff.PacketSniffer{
 	sniff.DomainNameQuery,
 	sniff.QUICClientHello,
-	sniff.QUICShortHeader,
 	sniff.STUNMessage,
 	sniff.UTP,
 	sniff.UDPTracker,
 	sniff.DTLSRecord,
 	sniff.NTP,
+	// Fall back to the short-header heuristic after more specific sniffers.
+	sniff.QUICShortHeader,
 }
 
 // Deprecated: use RouteConnectionEx instead.
@@ -318,19 +319,24 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 }
 
 func (r *Router) wrapQUICSniffIdleCache(metadata adapter.InboundContext, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
-	if onClose == nil || metadata.Protocol != C.ProtocolQUIC || metadata.SniffHost == "" {
+	if metadata.Protocol != C.ProtocolQUIC || metadata.SniffHost == "" {
 		return onClose
 	}
 	source := metadata.Source
-	destination := metadata.Destination
-	if metadata.DestOverride && metadata.OriginDestination.IsValid() {
-		destination = metadata.OriginDestination
+	destination := metadata.SniffDestination
+	if !destination.IsValid() {
+		destination = metadata.Destination
+		if metadata.DestOverride && metadata.OriginDestination.IsValid() {
+			destination = metadata.OriginDestination
+		}
 	}
 	sniffHost := metadata.SniffHost
-	return func(err error) {
+	return N.OnceClose(func(err error) {
 		r.refreshQUICSniff(source, destination, sniffHost)
-		onClose(err)
-	}
+		if onClose != nil {
+			onClose(err)
+		}
+	})
 }
 
 func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
@@ -343,6 +349,9 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 		return continueResult
 	}
 	for currentRuleIndex, currentRule := range r.rules {
+		if currentRule.Disabled() {
+			continue
+		}
 		metadata.ResetRuleCache()
 		if !currentRule.Match(&metadata) {
 			continue
@@ -383,6 +392,7 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				}
 				continue
 			}
+			r.processQUICSniff(ctx, &metadata)
 			if metadata.SniffHost != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.SniffHost, ", client: ", metadata.Client)
 			} else if metadata.SniffHost != "" {
@@ -399,6 +409,9 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 		case *R.RuleActionRouteOptions:
 			applyRouteOptionsOverride(&metadata, action)
 		case *R.RuleActionRoute:
+			if isPassOutbound(r.outbound, action.Outbound) {
+				continue
+			}
 			applyRouteOptionsOverride(&metadata, &action.RuleActionRouteOptions)
 			return r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
 		case *R.RuleActionBypass:
@@ -547,8 +560,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	metadataCopy := *metadata
 	result.NewTracker = func() tun.FlowTracker {
 		r.logger.InfoContext(ctx, "pre-match: forward ", metadataCopy.Network, " connection from ", metadataCopy.Source.AddrString(), " to ", metadataCopy.Destination.AddrString(), " via outbound/", outbound.Type(), "[", outbound.Tag(), "]")
-		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+1)
+		flowTrackers := make([]tun.FlowTracker, 0, len(r.trackers)+2)
 		flowTrackers = append(flowTrackers, newFlowLogger(ctx, r.logger, metadataCopy, outbound))
+		if onClose := r.wrapQUICSniffIdleCache(metadataCopy, nil); onClose != nil {
+			flowTrackers = append(flowTrackers, &flowCloseCallback{onClose: onClose})
+		}
 		for _, tracker := range r.trackers {
 			flowTracker := tracker.RoutedFlow(ctx, metadataCopy, matchedRule, outbound)
 			if flowTracker != nil {
@@ -671,13 +687,8 @@ match:
 		var routeOptions *R.RuleActionRouteOptions
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionRoute:
-			if selectedOutbound, loaded := r.outbound.Outbound(action.Outbound); loaded {
-				if selectedOutbound.Type() == C.TypeSelector {
-					selectedOutbound = selectedOutbound.(adapter.SelectorGroup).Selected()
-				}
-				if selectedOutbound.Type() == C.TypePass {
-					continue
-				}
+			if isPassOutbound(r.outbound, action.Outbound) {
+				continue
 			}
 			routeOptions = &action.RuleActionRouteOptions
 		case *R.RuleActionRouteOptions:
@@ -933,16 +944,7 @@ func (r *Router) actionSniff(
 		}
 	finally:
 		if err == nil {
-			if metadata.Protocol == C.ProtocolQUIC {
-				if metadata.SniffHost != "" {
-					r.cacheQUICSniff(metadata.Source, metadata.Destination, metadata.SniffHost)
-				} else {
-					if sniffHost, ok := r.lookupQUICSniff(metadata.Source, metadata.Destination); ok {
-						metadata.SniffHost = sniffHost
-						r.logger.DebugContext(ctx, "restored QUIC SNI from cache: ", sniffHost)
-					}
-				}
-			}
+			r.processQUICSniff(ctx, metadata)
 			if metadata.SniffHost != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.SniffHost, ", client: ", metadata.Client)
 			} else if metadata.SniffHost != "" {
@@ -1008,6 +1010,7 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 			metadata.DestinationAddresses = addresses
 			r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
 		}
+		metadata.IPVersion = 0
 		if len(addresses) > 0 {
 			if isAllIPv4(addresses) {
 				metadata.IPVersion = 4
@@ -1035,6 +1038,26 @@ func isAllIPv6(addresses []netip.Addr) bool {
 		}
 	}
 	return true
+}
+
+// Pass applies to a direct route target or the selected member of one selector,
+// matching the pass outbound's routing semantics without consuming dynamic selection.
+func isPassOutbound(manager adapter.OutboundManager, tag string) bool {
+	if tag == "" {
+		return false
+	}
+	outbound, loaded := manager.Outbound(tag)
+	if !loaded || outbound == nil {
+		return false
+	}
+	if outbound.Type() == C.TypeSelector {
+		group, ok := outbound.(adapter.SelectorGroup)
+		if !ok {
+			return false
+		}
+		outbound = group.Selected()
+	}
+	return outbound != nil && outbound.Type() == C.TypePass
 }
 
 func (r *Router) Rule(uuid string) (adapter.Rule, bool) {

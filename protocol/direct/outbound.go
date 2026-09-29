@@ -45,6 +45,7 @@ type Outbound struct {
 	logger               logger.ContextLogger
 	network              adapter.NetworkManager
 	dialer               dialer.ParallelInterfaceDialer
+	domainResolveOptions adapter.DNSQueryOptions
 	domainStrategy       C.DomainStrategy
 	directDomainStrategy C.DomainStrategy
 	fallbackDelay        time.Duration
@@ -82,6 +83,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
 		}),
 		proxyProto: options.ProxyProtocol,
+	}
+	// Snapshot the eagerly resolved options before the dialer's lazy initialization
+	// can write them during the first concurrent L4 connection.
+	if resolveDialer, loaded := outboundDialer.(dialer.ResolveDialer); loaded {
+		outbound.domainResolveOptions = resolveDialer.QueryOptions()
 	}
 	if options.ProxyProtocol > 2 {
 		return nil, E.New("invalid proxy protocol option: ", options.ProxyProtocol)
@@ -212,11 +218,7 @@ func (h *Outbound) PreMatchFlow(network string, destination netip.Addr) adapter.
 }
 
 func (h *Outbound) FlowDomainResolveOptions() adapter.DNSQueryOptions {
-	resolveDialer, loaded := h.dialer.(dialer.ResolveDialer)
-	if !loaded {
-		return adapter.DNSQueryOptions{}
-	}
-	return resolveDialer.QueryOptions()
+	return h.domainResolveOptions
 }
 
 func (h *Outbound) PortAddresses() (netip.Addr, netip.Addr) {

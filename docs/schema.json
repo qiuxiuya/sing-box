@@ -3582,6 +3582,21 @@
         "bypass_private_address": {
           "type": "boolean"
         },
+        "bypass_rule_set": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-tag-reference": "rule_set"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "rule_set"
+              }
+            }
+          ]
+        },
         "include_uid": {
           "anyOf": [
             {
@@ -3754,6 +3769,21 @@
         "bypass_private_address": {
           "type": "boolean"
         },
+        "bypass_rule_set": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-tag-reference": "rule_set"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "rule_set"
+              }
+            }
+          ]
+        },
         "include_source_cidr": {
           "anyOf": [
             {
@@ -3849,6 +3879,9 @@
             },
             "tag": {
               "type": "string"
+            },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
             },
             "detour": {
               "type": "string",
@@ -3953,6 +3986,9 @@
               "$ref": "#/$defs/Duration"
             },
             "system": {
+              "type": "boolean"
+            },
+            "gso": {
               "type": "boolean"
             },
             "name": {
@@ -4240,7 +4276,13 @@
               "minimum": 0,
               "maximum": 65535
             },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
             "system": {
+              "type": "boolean"
+            },
+            "gso": {
               "type": "boolean"
             },
             "name": {
@@ -4623,7 +4665,13 @@
             "proxy_protocol_accept_no_header": {
               "type": "boolean"
             },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
             "system": {
+              "type": "boolean"
+            },
+            "gso": {
               "type": "boolean"
             },
             "name": {
@@ -15757,6 +15805,9 @@
             }
           ]
         },
+        "certificate_pin_sha256": {
+          "type": "string"
+        },
         "client_certificate": {
           "anyOf": [
             {
@@ -15787,9 +15838,6 @@
           ]
         },
         "client_key_path": {
-          "type": "string"
-        },
-        "certificate_pin_sha256": {
           "type": "string"
         },
         "fragment": {
