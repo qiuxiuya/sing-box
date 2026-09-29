@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
@@ -20,6 +19,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 const (
@@ -202,12 +203,15 @@ type Inbound struct {
 func (i *Inbound) localTCEnabled() bool {
 	return i.localEnabled && i.localDataPlane == localDataPlaneTC
 }
+
 func (i *Inbound) localCgroupEnabled() bool {
 	return i.localEnabled && i.localDataPlane == localDataPlaneCgroup
 }
+
 func (i *Inbound) sharedSocketAssignEnabled() bool {
 	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlaneSocketAssign
 }
+
 func (i *Inbound) sharedRewriteEnabled() bool {
 	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlanePacketRewrite
 }
@@ -376,10 +380,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		return nil
 	}
-	if err = loadRuleSets("local", &inbound.bypassRuleSet, options.BypassRuleSet, options.Local.BypassRuleSet); err != nil {
+	if err = loadRuleSets("local", &inbound.bypassRuleSet, options.Local.BypassRuleSet); err != nil {
 		return nil, err
 	}
-	if err = loadRuleSets("shared", &inbound.sharedBypassRuleSet, options.BypassRuleSet, options.Shared.BypassRuleSet); err != nil {
+	if err = loadRuleSets("shared", &inbound.sharedBypassRuleSet, options.Shared.BypassRuleSet); err != nil {
 		return nil, err
 	}
 	udpTimeout := C.UDPTimeout

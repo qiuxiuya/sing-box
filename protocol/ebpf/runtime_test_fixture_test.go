@@ -33,6 +33,7 @@ func (r *testTCRuntime) AttachmentDescriptions() []string {
 	}
 	return descriptions
 }
+
 func (r *testTCRuntime) AttachmentDiagnostics() []commonEBPF.AttachmentInfo {
 	return append([]commonEBPF.AttachmentInfo(nil), r.attachments...)
 }
@@ -62,9 +63,11 @@ func (r *testSharedKernelRuntime) AttachmentDescriptions() []string {
 	}
 	return descriptions
 }
+
 func (r *testSharedKernelRuntime) AttachmentDiagnostics() []commonEBPF.AttachmentInfo {
 	return append([]commonEBPF.AttachmentInfo(nil), r.attachments...)
 }
+
 func (r *testSharedKernelRuntime) BackendClosed() bool {
 	return r.backend == nil || r.backend.IsClosed()
 }

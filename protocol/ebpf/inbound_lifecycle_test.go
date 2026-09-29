@@ -8,8 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func TestNeedsLPMPolicyUsesCompiledEntries(t *testing.T) {
@@ -200,6 +201,7 @@ func (r *retryTestTCRuntime) Backend() *commonEBPF.TCBackend { return nil }
 func (r *retryTestTCRuntime) NetworkInfo() commonEBPF.TCNetworkInfo {
 	return commonEBPF.TCNetworkInfo{}
 }
+
 func (r *retryTestTCRuntime) TCDiagnostics() commonEBPF.TCDiagnostics {
 	return commonEBPF.TCDiagnostics{}
 }

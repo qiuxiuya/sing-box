@@ -8,9 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"time"
 
-	ECommon "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/buf"
@@ -18,6 +16,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
+	ECommon "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,19 +62,12 @@ func (s *sharedRewrite) logMissingSharedTCPRedirect(
 	if listener.Port() != s.listeners.selectedPort() || !s.inbound.isCgroupRedirectAddress(listener.Addr()) {
 		return
 	}
-	allowed, suppressed := s.tcpWarnings.allow(time.Now())
-	if !allowed {
-		return
-	}
-	args := []any{
+	s.tcpWarnings.errorContext(
+		s.inbound.logger, ctx,
 		"missing shared-network TCP redirect state",
 		": client=", client,
 		" listener=", listener,
-	}
-	if suppressed > 0 {
-		args = append(args, " (", suppressed, " similar errors suppressed)")
-	}
-	s.inbound.logger.ErrorContext(ctx, args...)
+	)
 }
 
 func (s *sharedRewrite) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {

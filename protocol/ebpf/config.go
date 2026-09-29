@@ -10,10 +10,11 @@ import (
 	"strconv"
 	"strings"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func normalizeEnablement(localOption, sharedOption *bool) (bool, bool, error) {
@@ -252,7 +253,6 @@ func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error
 		return nil
 	}
 	if options.DataPlane != "" || options.DNSMode != "" || len(options.Interface) > 0 || options.IPv6 != nil || options.BypassPrivateAddress != nil ||
-		len(options.BypassRuleSet) > 0 ||
 		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
 		len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {

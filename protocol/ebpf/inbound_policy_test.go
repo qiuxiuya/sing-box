@@ -7,8 +7,9 @@ import (
 	"reflect"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/log"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 // TestRevertBypassCIDRBackendsRevertsMostRecentFirst proves the unwind order:
@@ -320,7 +321,7 @@ func oversizedBypassPolicy(t *testing.T) []commonEBPF.CIDRDecision {
 	t.Helper()
 	const entries = 65537
 	prefixes := make([]netip.Prefix, 0, entries)
-	for i := 0; i < entries; i++ {
+	for i := range entries {
 		offset := uint32(i) * 4
 		addr := netip.AddrFrom4([4]byte{10, byte(offset >> 16), byte(offset >> 8), byte(offset)})
 		prefixes = append(prefixes, netip.PrefixFrom(addr, 32))

@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -227,7 +228,7 @@ func TestQUICProxyLazyPacketBatchInterruptInit(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("batch did not start lazy initialization")
 			}
-			var expected error = os.ErrDeadlineExceeded
+			expected := os.ErrDeadlineExceeded
 			if closeConnection {
 				expected = net.ErrClosed
 				require.NoError(t, conn.Close())

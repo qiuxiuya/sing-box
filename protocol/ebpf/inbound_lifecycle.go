@@ -10,9 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func (i *Inbound) Start(stage adapter.StartStage) error {
@@ -368,9 +369,7 @@ func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend)
 	if backend == nil || backend.UDPUserspaceCleanupMode() != "ringbuf" {
 		return
 	}
-	i.cgroupReleaseWait.Add(1)
-	go func() {
-		defer i.cgroupReleaseWait.Done()
+	i.cgroupReleaseWait.Go(func() {
 		for {
 			socketCookie, err := backend.ReadUDPRelease()
 			if err != nil {
@@ -381,7 +380,7 @@ func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend)
 			}
 			i.udpNat.ReleaseSocket(socketCookie)
 		}
-	}()
+	})
 }
 
 func (i *Inbound) selfBypassMode() string {

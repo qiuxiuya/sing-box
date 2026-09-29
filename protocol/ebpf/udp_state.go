@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing/common/bufio"
 	N "github.com/sagernet/sing/common/network"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -498,7 +498,7 @@ func (p *udpReplySocketPool) addCount(delta int64) {
 // shard lock and validates the selected entry before closing it, so concurrent
 // cache hits cannot lose a socket that became active during the scan.
 func (p *udpReplySocketPool) evictOldestIdle() bool {
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		selectedShard := -1
 		var selectedSource netip.AddrPort
 		var selectedEntry *udpReplySocketEntry
@@ -620,10 +620,7 @@ func (p *udpReplySocketPool) runSweeper(ctx context.Context, wake <-chan struct{
 			default:
 			}
 		}
-		delay := time.Until(next)
-		if delay < 0 {
-			delay = 0
-		}
+		delay := max(time.Until(next), 0)
 		timer.Reset(delay)
 		timerChannel = timer.C
 	}

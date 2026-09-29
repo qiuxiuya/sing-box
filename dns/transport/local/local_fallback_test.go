@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
-	mDNS "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/dns/transport/local/systemconfig"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	mDNS "github.com/miekg/dns"
 )
 
 type fallbackTestConfig struct{ config *systemconfig.Config }
@@ -89,7 +90,7 @@ func TestLocalResolvedFallback(t *testing.T) {
 		t.Fatal(initial)
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

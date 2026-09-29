@@ -119,7 +119,7 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 		TCLastReconcileAt:        &observedReconcile,
 		TCNetworkGeneration:      3,
 	})
-	if diagnostics.SchemaVersion != 6 || diagnostics.TCBackendMode != "socket_assign" ||
+	if diagnostics.SchemaVersion != 8 || diagnostics.TCBackendMode != "socket_assign" ||
 		diagnostics.TCListenerLookupMode != "sockmap" || diagnostics.TCAttachmentMode != "tcx" ||
 		diagnostics.TCDeliveryInterfaceIndex != 42 || diagnostics.TCAttachmentCount != 2 ||
 		diagnostics.TCNetworkGeneration != 3 || diagnostics.TCLastHealthCheckAt == nil ||
@@ -130,12 +130,12 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 }
 
 func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
-	if adapter.EBPFDiagnosticsSchemaVersion != 6 {
-		t.Fatalf("schema version = %d, want 6 after adding effective TC runtime fields", adapter.EBPFDiagnosticsSchemaVersion)
+	if adapter.EBPFDiagnosticsSchemaVersion != 8 {
+		t.Fatalf("schema version = %d, want 8 after removing the per-inbound compatibility field", adapter.EBPFDiagnosticsSchemaVersion)
 	}
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
-	if diagnostics.SchemaVersion != 6 {
-		t.Fatalf("diagnostics schema version = %d, want 6", diagnostics.SchemaVersion)
+	if diagnostics.SchemaVersion != 8 {
+		t.Fatalf("diagnostics schema version = %d, want 8", diagnostics.SchemaVersion)
 	}
 }
 
@@ -379,6 +379,18 @@ func TestDiagnosticsLastErrorPicksTheMostRecentAcrossCategories(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsLastErrorIncludesSharedRewriteWarnings(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.policyWarnings.record(time.Now().Add(-time.Minute), "older: policy issue")
+	shared := &sharedRewrite{}
+	shared.udpWarnings.originalDestination.record(time.Now(), "newer: shared UDP issue")
+	inbound.setSharedRewrite(shared)
+	diagnostics := inbound.Diagnostics()
+	if diagnostics.LastError != "newer: shared UDP issue" {
+		t.Fatalf("LastError = %q, want the shared packet-rewrite warning", diagnostics.LastError)
+	}
+}
+
 // TestDiagnosticsWriteJSONRoundTrips proves the JSON writer actually
 // produces valid, complete JSON matching the struct's fields -- not just
 // that it doesn't panic.
@@ -411,10 +423,15 @@ func TestDiagnosticsWriteTextIncludesTheKeyFields(t *testing.T) {
 		"Tag:", "State:", "Attachments:", "Recovery pending:", "UDP sessions:", "UDP NAT:", "UDP reply sockets:",
 		"tc_socket_lookup_failures=", "tc_sk_assign_failures=", "tc_assignment_update_failures=",
 		"tc_local_fragment_passes=", "tc_shared_fragment_passes=",
-		"shared_ingress_passes=", "shared_egress_passes=", "shared_ingress_fragment_passes=", "shared_egress_fragment_passes=",
+		"shared_ingress_fragment_passes=", "shared_egress_fragment_passes=",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text output missing %q; got:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"shared_ingress_passes=", "shared_egress_passes="} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("text output still reports removed counter %q; got:\n%s", unwanted, text)
 		}
 	}
 }

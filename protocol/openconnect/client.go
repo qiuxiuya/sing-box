@@ -169,27 +169,29 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
+	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	gso := options.System
 	if options.GSO != nil {
 		gso = *options.GSO
 	}
-	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+
 	openConnectEndpoint.deviceOptions = &device.Options{
-		Context:         ctx,
-		Logger:          logger,
-		System:          options.System,
-		GSO:             gso,
-		Handler:         openConnectEndpoint,
-		UDPTimeout:      udpTimeout,
-		ICMPTimeout:     C.ICMPTimeout,
-		UDPMapping:      tun.NATMapping(options.UDPMapping),
-		UDPFiltering:    tun.NATFiltering(options.UDPFiltering),
-		UDPNATMax:       options.UDPNATMax,
-		InterfaceFinder: networkManager.InterfaceFinder(),
-		Name:            options.Name,
-		NamePrefix:      "oc",
-		MTU:             openconnecttransport.DefaultMTU,
-		PacketHeadroom:  openconnecttransport.PacketHeadroom,
+		Context:             ctx,
+		Logger:              logger,
+		System:              options.System,
+		GSO:                 gso,
+		Handler:             openConnectEndpoint,
+		UDPTimeout:          udpTimeout,
+		ICMPTimeout:         C.ICMPTimeout,
+		UDPMapping:          tun.NATMapping(options.UDPMapping),
+		UDPFiltering:        tun.NATFiltering(options.UDPFiltering),
+		UDPNATMax:           options.UDPNATMax,
+		InterfaceFinder:     networkManager.InterfaceFinder(),
+		Name:                options.Name,
+		NamePrefix:          "oc",
+		MTU:                 openconnecttransport.DefaultMTU,
+		PacketFrontHeadroom: openconnect.PacketHeadroom,
+		PacketRearHeadroom:  openconnect.PacketRearHeadroom,
 		Configuration: device.Configuration{
 			MTU: openconnecttransport.DefaultMTU,
 		},
@@ -519,7 +521,9 @@ func (e *Endpoint) OnDemand() bool {
 }
 
 func (e *Endpoint) SetKeepIdleConnections(keep bool) {
-	if !keep {
+	if keep {
+		e.client.Resume()
+	} else {
 		e.client.Suspend()
 	}
 }

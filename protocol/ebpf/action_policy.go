@@ -6,8 +6,9 @@ import (
 	"net/netip"
 	"sort"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 // validateActionPolicyScope keeps data-plane-specific mapping decisions in
@@ -250,14 +251,15 @@ func appendPortDecisions(scope *commonEBPF.ActionScope, bypass []portRange, dnsM
 			}
 		}
 	}
-	if dnsMode == dnsModeHijack {
+	switch dnsMode {
+	case dnsModeHijack:
 		if enableTCP {
 			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolTCP, Port: 53, Action: commonEBPF.DecisionIntercept})
 		}
 		if enableUDP {
 			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolUDP, Port: 53, Action: commonEBPF.DecisionIntercept})
 		}
-	} else if dnsMode == dnsModeOff {
+	case dnsModeOff:
 		if enableTCP {
 			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolTCP, Port: 53, Action: commonEBPF.DecisionPass})
 		}

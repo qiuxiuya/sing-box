@@ -57,6 +57,7 @@ type Manager struct {
 	closedUploadTotal       int64
 	closedDownloadTotal     int64
 	closedConnectionsLimit  int
+	closedConnectionsTTL    time.Duration
 
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 	eventObserver   *observable.Observer[ConnectionEvent]
@@ -78,7 +79,7 @@ func (m *Manager) Name() string {
 func (m *Manager) Start(stage adapter.StartStage) error {
 	if stage == adapter.StartStateInitialize {
 		m.eventObserver = observable.NewObserver(m.eventSubscriber, 64)
-		m.cleaner = cleanup.Add(m.Clear)
+		m.cleaner = cleanup.Add(m.cleanupClosedConnections)
 	}
 	return nil
 }
@@ -120,6 +121,14 @@ func (m *Manager) SetClosedConnectionsLimit(limit int) {
 		m.closedUploadTotal += evicted.Upload.Load()
 		m.closedDownloadTotal += evicted.Download.Load()
 	}
+	m.closedConnectionsAccess.Unlock()
+}
+
+// SetClosedConnectionsTTL protects recent history from GC cleanup. A non-positive
+// TTL preserves the default behavior of clearing all closed connections on GC.
+func (m *Manager) SetClosedConnectionsTTL(ttl time.Duration) {
+	m.closedConnectionsAccess.Lock()
+	m.closedConnectionsTTL = ttl
 	m.closedConnectionsAccess.Unlock()
 }
 
@@ -248,4 +257,23 @@ func (m *Manager) Clear() {
 		m.closedDownloadTotal += element.Value.Download.Load()
 	}
 	m.closedConnections.Init()
+}
+
+func (m *Manager) cleanupClosedConnections() {
+	m.cleanupClosedConnectionsAt(time.Now())
+}
+
+func (m *Manager) cleanupClosedConnectionsAt(now time.Time) {
+	m.closedConnectionsAccess.Lock()
+	defer m.closedConnectionsAccess.Unlock()
+	cutoff := now.Add(-m.closedConnectionsTTL)
+	for element := m.closedConnections.Front(); element != nil; {
+		next := element.Next()
+		if m.closedConnectionsTTL <= 0 || element.Value.ClosedAt.Before(cutoff) {
+			evicted := m.closedConnections.Remove(element)
+			m.closedUploadTotal += evicted.Upload.Load()
+			m.closedDownloadTotal += evicted.Download.Load()
+		}
+		element = next
+	}
 }

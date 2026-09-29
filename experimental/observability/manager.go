@@ -115,6 +115,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	m.startedAt = time.Now()
+	m.traffic.SetClosedConnectionsTTL(m.recentTTL)
 	m.traffic.SetClosedConnectionsLimit(m.recentConnections)
 	m.traffic.SetConnectionObserver(m)
 	m.logger.Info("observability started with ", m.recentConnections, " recent connections in memory")

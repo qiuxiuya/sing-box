@@ -53,7 +53,8 @@ func TestTunDeviceAdapterReadBatch(t *testing.T) {
 
 func assertAdapterReadPackets(t *testing.T, reader interface {
 	Read([][]byte, []int, int) (int, error)
-}, packets [][]byte) {
+}, packets [][]byte,
+) {
 	t.Helper()
 	const offset = 32
 	buffers := make([][]byte, len(packets))

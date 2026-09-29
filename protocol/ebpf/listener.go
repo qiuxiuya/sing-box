@@ -9,7 +9,6 @@ import (
 	"sync"
 	"syscall"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/udpio"
@@ -21,6 +20,8 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 type internalListenerHandler interface {

@@ -65,15 +65,11 @@ func TestEndpointOnDemandReferenceTransitions(t *testing.T) {
 				require.True(t, endpoint.suspended.Load())
 				require.EqualValues(t, 1, bind.opens.Load(), "network updates must not wake an idle endpoint")
 
-				// A referenced system interface resumes immediately; a userspace
-				// endpoint waits until the next outbound request or packet.
+				// Referenced endpoints resume immediately in both system and
+				// userspace modes.
 				endpoint.SetIdle(false)
-				require.Equal(t, !system, endpoint.suspended.Load())
-				if system {
-					require.EqualValues(t, 2, bind.opens.Load())
-				} else {
-					require.EqualValues(t, 1, bind.opens.Load())
-				}
+				require.False(t, endpoint.suspended.Load())
+				require.EqualValues(t, 2, bind.opens.Load())
 				require.NoError(t, demandEndpoint(t, endpoint, path))
 				require.False(t, endpoint.suspended.Load())
 				require.EqualValues(t, 2, bind.opens.Load())
