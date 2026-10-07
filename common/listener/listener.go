@@ -10,7 +10,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/settings"
-	"github.com/sagernet/sing-box/common/udpgso"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
@@ -24,7 +23,6 @@ import (
 )
 
 type Listener struct {
-	disableGSO               bool
 	ctx                      context.Context
 	logger                   logger.ContextLogger
 	network                  []string
@@ -74,7 +72,6 @@ func New(
 		logger:                   options.Logger,
 		network:                  options.Network,
 		listenOptions:            options.Listen,
-		disableGSO:               udpgso.Disabled(options.Listen.UDPGSO),
 		connHandler:              options.ConnectionHandler,
 		packetHandler:            options.PacketHandler,
 		oobPacketHandler:         options.OOBPacketHandler,
@@ -99,7 +96,7 @@ func (l *Listener) Start() error {
 	if common.Contains(l.network, N.NetworkUDP) {
 		_, err := l.ListenUDP()
 		if err != nil {
-			return err
+			return E.Errors(err, l.Close())
 		}
 		l.packetOutboundClosed = make(chan struct{})
 		l.packetOutbound = make(chan *N.PacketBuffer, 64)
@@ -119,11 +116,11 @@ func (l *Listener) Start() error {
 		}
 		systemProxy, err := settings.NewSystemProxy(l.ctx, M.ParseSocksaddrHostPort(listenAddrString, listenPort), l.systemProxySOCKS, nil)
 		if err != nil {
-			return E.Cause(err, "initialize system proxy")
+			return E.Errors(E.Cause(err, "initialize system proxy"), l.Close())
 		}
 		err = systemProxy.Enable()
 		if err != nil {
-			return E.Errors(E.Cause(err, "set system proxy"), systemProxy.Close())
+			return E.Errors(E.Cause(err, "set system proxy"), systemProxy.Close(), l.Close())
 		}
 		l.systemProxy = systemProxy
 	}

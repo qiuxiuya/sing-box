@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 
 	"github.com/stretchr/testify/require"
 )
@@ -25,10 +26,10 @@ func (o *snapshotOutbound) Type() string { return o.kind }
 
 func TestResolvedChainTrafficAttribution(t *testing.T) {
 	manager := newTestManager(t, true)
-	require.NoError(t, manager.traffic.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.traffic.Close()) })
-	require.NoError(t, manager.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, scope.Start("traffic", manager.traffic, adapter.StartStateInitialize))
+	require.NoError(t, scope.Start("observability", manager, adapter.StartStateInitialize))
 	outer := &snapshotOutbound{tag: "select", kind: "selector"}
 	balance := &snapshotOutbound{tag: "balance", kind: "loadbalance"}
 	leaf := &snapshotOutbound{tag: "first", kind: "direct"}
@@ -61,10 +62,10 @@ func TestResolvedChainTrafficAttribution(t *testing.T) {
 func TestRecentConnectionsSurviveGC(t *testing.T) {
 	manager := newTestManager(t, true)
 	manager.recentTTL = time.Hour
-	require.NoError(t, manager.traffic.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.traffic.Close()) })
-	require.NoError(t, manager.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, scope.Start("traffic", manager.traffic, adapter.StartStateInitialize))
+	require.NoError(t, scope.Start("observability", manager, adapter.StartStateInitialize))
 	outbound := &snapshotOutbound{tag: "direct", kind: "direct"}
 	flow := manager.traffic.RoutedFlow(context.Background(), adapter.InboundContext{
 		Network: "udp", OutboundChain: []adapter.Outbound{outbound},

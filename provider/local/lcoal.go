@@ -42,6 +42,7 @@ type ProviderLocal struct {
 	lastEPOpts  []option.Endpoint
 	lastUpdated time.Time
 	watcher     *fswatch.Watcher
+	closed      bool
 
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
@@ -60,10 +61,11 @@ func NewProviderInline(ctx context.Context, router adapter.Router, logFactory lo
 		logger:  logger,
 	}
 	provider.RewriteDetourForProvider(options.Outbounds, options.Endpoints)
-	provider.UpdateOutbounds(nil, options.Outbounds)
 	if len(options.Endpoints) > 0 {
 		provider.RewriteDetourForProviderEndpoints(options.Endpoints, options.Outbounds)
-		provider.UpdateEndpoints(nil, options.Endpoints)
+	}
+	if err := provider.UpdateNodes(options.Outbounds, options.Endpoints); err != nil {
+		return nil, err
 	}
 	return provider, nil
 }
@@ -96,7 +98,6 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 			if uErr != nil {
 				logger.Error(E.Cause(uErr, "reload provider ", tag))
 			}
-			provider.UpdateGroups()
 		},
 	})
 	if err != nil {
@@ -107,12 +108,14 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 }
 
 func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
+	if err := s.Adapter.Start(); err != nil {
+		return err
+	}
 	if s.path != "" {
 		err := s.reloadFile(s.path)
 		if err != nil {
 			return err
 		}
-		s.UpdateGroups()
 		if s.watcher != nil {
 			err := s.watcher.Start()
 			if err != nil {
@@ -120,7 +123,8 @@ func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.
 			}
 		}
 	}
-	return s.Adapter.Start()
+	s.UpdateGroups()
+	return nil
 }
 
 func (s *ProviderLocal) UpdatedAt() time.Time {
@@ -132,6 +136,9 @@ func (s *ProviderLocal) UpdatedAt() time.Time {
 func (s *ProviderLocal) reloadFile(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return context.Canceled
+	}
 	file, err := filemanager.Open(s.ctx, path)
 	if err != nil {
 		return err
@@ -154,13 +161,20 @@ func (s *ProviderLocal) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	updateErr := s.UpdateNodes(outboundOpts, endpointOpts)
+	s.UpdateGroups()
+	if updateErr != nil {
+		return updateErr
+	}
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
 
 func (s *ProviderLocal) Close() error {
-	return common.Close(&s.Adapter, common.PtrOrNil(s.watcher))
+	err := common.Close(common.PtrOrNil(s.watcher))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return E.Errors(err, s.Adapter.Close())
 }

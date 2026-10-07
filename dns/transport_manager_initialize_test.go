@@ -15,17 +15,19 @@ type initializeTestTransport struct {
 func (*initializeTestTransport) Type() string           { return "local" }
 func (*initializeTestTransport) Tag() string            { return "local" }
 func (*initializeTestTransport) Dependencies() []string { return nil }
-func (t *initializeTestTransport) Start(stage adapter.StartStage) error {
+func (t *initializeTestTransport) Start(stage adapter.StartStage, _ *adapter.Scope) error {
 	t.stages = append(t.stages, stage)
 	return nil
 }
 
 func TestImplicitDefaultDNSReceivesInitialize(t *testing.T) {
 	transport := new(initializeTestTransport)
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), nil, nil, "")
+	manager := NewTransportManager(nil, nil, "")
 	manager.Initialize(func() (adapter.DNSTransport, error) { return transport, nil })
+	scope := adapter.NewScope(t.Context(), log.NewNOPFactory().Logger())
+	t.Cleanup(func() { _ = scope.Close() })
 	for _, stage := range adapter.ListStartStages {
-		if err := manager.Start(stage); err != nil {
+		if err := manager.Start(stage, scope); err != nil {
 			t.Fatal(err)
 		}
 	}

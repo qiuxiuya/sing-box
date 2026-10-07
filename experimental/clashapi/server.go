@@ -21,11 +21,9 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/clashmode"
-	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/experimental/observability"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
@@ -64,6 +62,7 @@ type Server struct {
 	externalUIDownloadURL     string
 	externalUIDownloadURLHash [32]byte
 	externalUIHTTPClient      *option.HTTPClientOptions
+	externalUITransport       adapter.HTTPTransport
 	externalUIDownloadDetour  string
 	externalUIUpdateInterval  time.Duration
 	cacheFile                 adapter.CacheFile
@@ -185,17 +184,22 @@ func (s *Server) Name() string {
 	return "clash server"
 }
 
-func (s *Server) Start(stage adapter.StartStage) error {
+func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateStart:
-		if s.externalUIDownloadDetour != "" && (s.externalUIHTTPClient == nil || s.externalUIHTTPClient.IsEmpty()) {
-			deprecated.Report(s.ctx, deprecated.OptionLegacyClashAPIExternalUIDownloadDetour)
+		if s.externalController && s.externalUI != "" {
+			transport, err := s.resolveExternalUITransport()
+			if err != nil {
+				return E.Cause(err, "create external UI http client")
+			}
+			s.externalUITransport = transport
 		}
 	case adapter.StartStateStarted:
 		if !s.externalController {
 			break
 		}
 		s.ctx, s.updateCancel = context.WithCancel(s.ctx)
+		scope.Add(s.closeUpdate)
 		var forceUpdate bool
 		if s.externalUI != "" && s.cacheFile != nil {
 			if savedExternalUI := s.cacheFile.LoadExternalUI("ExternalUI"); savedExternalUI != nil {
@@ -228,6 +232,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "external controller listen error")
 		}
+		scope.Add(s.httpServer.Close)
 		s.logger.Info("restful api listening at ", listener.Addr())
 		go func() {
 			err = s.httpServer.Serve(listener)
@@ -263,16 +268,14 @@ func (s *Server) loopUpdate() {
 	}
 }
 
-func (s *Server) Close() error {
+func (s *Server) closeUpdate() error {
 	if s.updateCancel != nil {
 		s.updateCancel()
 	}
 	if s.updateDone != nil {
 		<-s.updateDone
 	}
-	return common.Close(
-		common.PtrOrNil(s.httpServer),
-	)
+	return nil
 }
 
 func authentication(serverSecret string) func(next http.Handler) http.Handler {

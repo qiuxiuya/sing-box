@@ -40,7 +40,10 @@ func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapt
 func (m *Manager) Initialize() {
 }
 
-func (m *Manager) Start(stage adapter.StartStage) error {
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage == adapter.StartStateInitialize {
+		scope.Add(m.Close)
+	}
 	m.access.Lock()
 	if m.started && m.stage >= stage {
 		panic("already started")
@@ -88,7 +91,7 @@ func (m *Manager) Close() error {
 			monitor.Finish()
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Providers() []adapter.Provider {

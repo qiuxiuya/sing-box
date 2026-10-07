@@ -22,7 +22,6 @@ import (
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -127,7 +126,7 @@ func (t *HTTP3Transport) newTransport() *http3.Transport {
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, qtls.ConfigWithGSO(qtls.ConfigWithGSO(cfg, t.dialer), conn))
+			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, cfg)
 			if dialErr != nil {
 				conn.Close()
 				return nil, dialErr
@@ -144,17 +143,16 @@ func (t *HTTP3Transport) newTransport() *http3.Transport {
 	}
 }
 
-func (t *HTTP3Transport) Start(stage adapter.StartStage) error {
+func (t *HTTP3Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	scope.Add(func() error {
+		t.transportAccess.Lock()
+		defer t.transportAccess.Unlock()
+		return t.transport.Close()
+	})
 	return dialer.InitializeDetour(t.dialer)
-}
-
-func (t *HTTP3Transport) Close() error {
-	t.transportAccess.Lock()
-	defer t.transportAccess.Unlock()
-	return t.transport.Close()
 }
 
 func (t *HTTP3Transport) Reset() {

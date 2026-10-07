@@ -149,9 +149,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		reuse:         options.Reuse,
 		quicProxyMode: version == 5 || version == 6 && options.V6Options.QUICProxyMode,
 	}
-	if outbound.quicProxyMode {
-		outbound.quicDestCache = expiringmap.New[quicDestCacheKey, uint64](quicDestCacheTTL)
-	}
 	return outbound, nil
 }
 
@@ -239,16 +236,6 @@ func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	}
 }
 
-func (h *Outbound) Close() error {
-	if h.quicDestCache != nil {
-		h.quicDestCache.Close()
-	}
-	if h.client == nil {
-		return nil
-	}
-	return h.client.Close()
-}
-
 type simpleObfsDialer struct {
 	N.Dialer
 	mode string
@@ -310,6 +297,20 @@ func (h *Outbound) CloseIdleConnections() {
 	if h.client != nil {
 		h.client.CloseIdleConnections()
 	}
+}
+
+func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateInitialize {
+		return nil
+	}
+	if h.client != nil {
+		scope.Add(h.client.Close)
+	}
+	if h.quicProxyMode {
+		h.quicDestCache = expiringmap.New[quicDestCacheKey, uint64](quicDestCacheTTL)
+		scope.Add(func() error { h.quicDestCache.Close(); return nil })
+	}
+	return nil
 }
 
 func (h *Outbound) isRecentQUICDest(source M.Socksaddr, destination M.Socksaddr) bool {

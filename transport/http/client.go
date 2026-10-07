@@ -51,6 +51,7 @@ type ClientOptions struct {
 	DisableVersionFallback bool
 	HTTP2Options           option.HTTP2Options
 	HTTP3Options           option.QUICOptions
+	H3CongestionControl    option.H3CongestionControl
 }
 
 type http3Client interface {
@@ -221,7 +222,10 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if c.http3Available() {
-		conn, err := c.http3.DialContext(ctx, destination)
+		attemptCtx, cancel := c.http3AttemptContext(ctx)
+		conn, err := c.http3.DialContext(attemptCtx, destination)
+		err = http3AttemptError(ctx, attemptCtx, err)
+		cancel()
 		if err == nil {
 			c.clearHTTP3Broken()
 			return conn, nil

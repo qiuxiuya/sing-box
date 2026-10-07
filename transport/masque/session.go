@@ -192,7 +192,12 @@ func (s *session) writePackets(buffers []*buf.Buffer) error {
 	for i, buffer := range buffers {
 		datagram := transportHTTP.PrependContextID(buffer)
 		if s.datagrams != nil {
-			err := s.datagrams.SendDatagram(datagram.Bytes())
+			var err error
+			if ipStream, ok := s.datagrams.(transportHTTP.IPDatagramStream); ok {
+				err = ipStream.SendIPDatagram(datagram.Bytes())
+			} else {
+				err = s.datagrams.SendDatagram(datagram.Bytes())
+			}
 			var tooLarge *transportHTTP.DatagramTooLargeError
 			switch {
 			case err == nil:
@@ -205,7 +210,7 @@ func (s *session) writePackets(buffers []*buf.Buffer) error {
 					s.handler.handlePacketTooBig(datagram, mtu)
 					continue
 				}
-				err = E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets")
+				err = E.Cause1(transportHTTP.ErrHTTP3Unavailable, E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets"))
 			case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
 				capsules = append(capsules, datagram)
 				continue

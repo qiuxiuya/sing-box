@@ -101,7 +101,13 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return outbound, nil
 }
 
-func (s *URLTest) Start() error {
+func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
+		if stage == adapter.StartStateStarted {
+			s.group.PostStart()
+		}
+		return nil
+	}
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
 	if s.useAllProviders {
@@ -142,21 +148,13 @@ func (s *URLTest) Start() error {
 		return err
 	}
 	s.group = group
+	scope.Add(group.Close)
 	for _, providerTag := range s.providerTags {
-		s.providers[providerTag].RegisterCallback(s.onProviderUpdated)
+		p := s.providers[providerTag]
+		element := p.RegisterCallback(s.onProviderUpdated)
+		scope.Add(func() error { p.UnregisterCallback(element); return nil })
 	}
 	return nil
-}
-
-func (s *URLTest) PostStart() error {
-	s.group.PostStart()
-	return nil
-}
-
-func (s *URLTest) Close() error {
-	return common.Close(
-		common.PtrOrNil(s.group),
-	)
 }
 
 func (s *URLTest) All() []string {

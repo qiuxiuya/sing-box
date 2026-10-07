@@ -15,7 +15,6 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
-	qtls "github.com/sagernet/sing-quic"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -47,7 +46,7 @@ func newHTTP3RoundTripper(
 	if baseTLSConfig != nil {
 		handshakeTimeout = baseTLSConfig.HandshakeTimeout()
 	}
-	quicConfig := qtls.ConfigWithGSO(NewQUICConfig(options), rawDialer)
+	quicConfig := NewQUICConfig(options)
 	if handshakeTimeout > 0 {
 		quicConfig.HandshakeIdleTimeout = handshakeTimeout
 	}
@@ -73,7 +72,7 @@ func newHTTP3RoundTripper(
 			if err != nil {
 				return nil, err
 			}
-			quicConn, err := quic.DialEarlyConn(ctx, conn, tlsConfig, qtls.ConfigWithGSO(quicConfig, conn))
+			quicConn, err := quic.DialEarlyConn(ctx, conn, tlsConfig, quicConfig)
 			if err != nil {
 				conn.Close()
 				return nil, err

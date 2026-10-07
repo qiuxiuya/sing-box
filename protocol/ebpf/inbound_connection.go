@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -18,7 +19,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,7 +111,7 @@ func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		if errors.Is(err, unix.ENOENT) {
 			original, err = backend.RecoverUDPOriginal(redirectDestination)
 		}
-		if errors.Is(err, unix.ENOENT) {
+		if errors.Is(err, unix.ENOENT) && backend.UDPCleanupMode() != "socket_release" {
 			original, err = backend.RecoverConnectedUDPOriginal(redirectDestination)
 		}
 		if err != nil {

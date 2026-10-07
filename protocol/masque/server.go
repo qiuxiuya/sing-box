@@ -2,7 +2,6 @@ package masque
 
 import (
 	"context"
-	"io"
 	"math"
 	"net"
 	"net/netip"
@@ -46,21 +45,27 @@ type ServerEndpoint struct {
 	endpointBase
 	ctx                  context.Context
 	dnsRouter            adapter.DNSRouter
-	innerDNSQueryOptions adapter.DNSQueryOptions
 	listener             *listener.Listener
 	httpServer           *http.Server
 	tlsConfig            tls.ServerConfig
 	http3                bool
 	quicOptions          option.QUICOptions
-	http3Server          io.Closer
+	h3CongestionControl  option.H3CongestionControl
 	server               *masque.Server
 	deviceOptions        *device.Options
 	device               device.Device
 	localAddresses       []netip.Prefix
 	started              atomic.Bool
+	innerDNSQueryOptions adapter.DNSQueryOptions
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEServerEndpointOptions) (adapter.Endpoint, error) {
+	if err := options.H3CongestionControl.Validate(options.Versions(), true); err != nil {
+		return nil, err
+	}
+	if options.H3CongestionControl != "" && http.ConfigureHTTP3ListenerFunc == nil {
+		return nil, E.New("h3_congestion_control requires QUIC support in this build")
+	}
 	innerDNSQueryOptions, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
 	if err != nil {
 		return nil, E.Cause(err, "inner domain resolver")
@@ -93,6 +98,7 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		innerDNSQueryOptions: innerDNSQueryOptions,
 		http3:                serveHTTP3,
 		quicOptions:          options.HTTP3Options,
+		h3CongestionControl:  options.H3CongestionControl,
 		localAddresses:       options.Address,
 	}
 	server, err := masque.NewServer(masque.ServerOptions{
@@ -151,7 +157,7 @@ func (s *ServerEndpoint) resolve(ctx context.Context, domain string) ([]netip.Ad
 	return s.dnsRouter.Lookup(ctx, domain, s.innerDNSQueryOptions)
 }
 
-func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
+func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		s.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(s.ctx)
@@ -159,15 +165,18 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(tunnelDevice.Close)
 		tunnelDevice.SetPacketWriter(s.writePacketBuffers)
 		s.device = tunnelDevice
 		s.deviceOptions = nil
+		scope.Add(s.server.Close)
 	case adapter.StartStateStart:
 		if s.tlsConfig != nil {
 			err := s.tlsConfig.Start()
 			if err != nil {
 				return E.Cause(err, "create TLS config")
 			}
+			scope.Add(s.tlsConfig.Close)
 		}
 		err := s.device.Start()
 		if err != nil {
@@ -177,26 +186,21 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(s.listener.Close)
 		if s.http3 {
-			s.http3Server, err = s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions)
-			if err != nil {
-				return err
+			http3Server, listenErr := s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions, s.h3CongestionControl)
+			if listenErr != nil {
+				return listenErr
 			}
+			scope.Add(http3Server.Close)
 		}
 		s.started.Store(true)
+		scope.Add(func() error {
+			s.started.Store(false)
+			return nil
+		})
 	}
 	return nil
-}
-
-func (s *ServerEndpoint) Close() error {
-	s.started.Store(false)
-	return common.Close(
-		s.listener,
-		s.http3Server,
-		s.server,
-		s.device,
-		s.tlsConfig,
-	)
 }
 
 type serverConnectionHandler ServerEndpoint

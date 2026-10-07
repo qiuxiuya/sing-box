@@ -2,7 +2,6 @@ package http
 
 import (
 	"context"
-	"io"
 	"net"
 	"slices"
 
@@ -29,18 +28,24 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx         context.Context
-	router      adapter.ConnectionRouterEx
-	logger      log.ContextLogger
-	listener    *listener.Listener
-	server      *http.Server
-	tlsConfig   tls.ServerConfig
-	http3       bool
-	quicOptions option.QUICOptions
-	http3Server io.Closer
+	ctx                 context.Context
+	router              adapter.ConnectionRouterEx
+	logger              log.ContextLogger
+	listener            *listener.Listener
+	server              *http.Server
+	tlsConfig           tls.ServerConfig
+	http3               bool
+	quicOptions         option.QUICOptions
+	h3CongestionControl option.H3CongestionControl
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPInboundOptions) (adapter.Inbound, error) {
+	if err := options.H3CongestionControl.Validate(options.Versions(), false); err != nil {
+		return nil, err
+	}
+	if options.H3CongestionControl != "" && http.ConfigureHTTP3ListenerFunc == nil {
+		return nil, E.New("h3_congestion_control requires QUIC support in this build")
+	}
 	versions := options.Versions()
 	serveHTTP1 := slices.Contains(versions, 1)
 	serveHTTP2 := slices.Contains(versions, 2)
@@ -64,8 +69,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			HTTP2Options:  options.HTTP2Options,
 			UDP:           true,
 		}),
-		http3:       serveHTTP3,
-		quicOptions: options.HTTP3Options,
+		http3:               serveHTTP3,
+		quicOptions:         options.HTTP3Options,
+		h3CongestionControl: options.H3CongestionControl,
 	}
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
@@ -98,7 +104,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -107,35 +113,29 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "create TLS config")
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
 	err := h.listener.Start()
 	if err != nil {
 		return err
 	}
+	scope.Add(h.listener.Close)
 	if h.http3 {
-		return h.startHTTP3()
+		return h.startHTTP3(scope)
 	}
 	return nil
 }
 
-func (h *Inbound) startHTTP3() error {
+func (h *Inbound) startHTTP3(scope *adapter.Scope) error {
 	var metadata adapter.InboundContext
 	//nolint:staticcheck
 	metadata.InboundDetour = h.listener.ListenOptions().Detour
-	http3Server, err := h.server.ListenHTTP3(h.ctx, h.logger, h.listener, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.tlsConfig, h.quicOptions)
+	http3Server, err := h.server.ListenHTTP3(h.ctx, h.logger, h.listener, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.tlsConfig, h.quicOptions, h.h3CongestionControl)
 	if err != nil {
 		return err
 	}
-	h.http3Server = http3Server
+	scope.Add(http3Server.Close)
 	return nil
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		h.http3Server,
-		h.tlsConfig,
-	)
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

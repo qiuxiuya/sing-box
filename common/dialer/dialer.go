@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/udpgso"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
@@ -62,9 +61,6 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 		if err != nil {
 			return nil, err
 		}
-	}
-	if detour, loaded := dialer.(*DetourDialer); loaded {
-		detour.disableGSO = udpgso.Disabled(dialOptions.UDPGSO)
 	}
 	if options.RemoteIsDomain && (!hasDetour || options.ResolverOnDetour || dialOptions.DomainResolver != nil && dialOptions.DomainResolver.Server != "") {
 		var (

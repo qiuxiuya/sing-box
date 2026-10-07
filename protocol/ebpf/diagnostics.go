@@ -65,6 +65,17 @@ type scopedBypassRuleSetDiagnostics struct {
 	BackendState          map[string]BypassRuleSetBackendState
 }
 
+// EBPFPolicyEpochDiagnostics makes the two independently updated policy
+// scopes explicit. A single scalar generation would be misleading because a
+// local update can succeed while a shared update is still pending.
+type EBPFPolicyEpochDiagnostics struct {
+	LocalConfirmed  uint64 `json:"local_confirmed"`
+	LocalExpected   uint64 `json:"local_expected"`
+	SharedConfirmed uint64 `json:"shared_confirmed"`
+	SharedExpected  uint64 `json:"shared_expected"`
+	Converged       bool   `json:"converged"`
+}
+
 // UDPNATDiagnostics reports event-driven userspace UDP NAT state. Cache
 // insertion and capacity-eviction totals come from sing/freelru's existing
 // metrics and therefore restart when the cache is purged (for example after a
@@ -104,32 +115,41 @@ type EBPFDiagnostics struct {
 	Tag           string    `json:"tag"`
 	State         string    `json:"state"`
 
-	LocalEnabled                 bool       `json:"local_enabled"`
-	LocalDataPlane               string     `json:"local_data_plane,omitempty"`
-	LocalCgroupAttachMode        string     `json:"local_cgroup_attach_mode,omitempty"`
-	LocalUDPCleanupMode          string     `json:"local_udp_cleanup_mode,omitempty"`
-	LocalUDPUserspaceCleanupMode string     `json:"local_udp_userspace_cleanup_mode,omitempty"`
-	LocalUDPStorageMode          string     `json:"local_udp_storage_mode,omitempty"`
-	LocalUDPTimeMode             string     `json:"local_udp_time_mode,omitempty"`
-	SharedEnabled                bool       `json:"shared_enabled"`
-	SharedDataPlane              string     `json:"shared_data_plane,omitempty"`
-	FakeIPICMPReply              bool       `json:"fakeip_icmp_reply"`
-	TCBackendMode                string     `json:"tc_backend_mode,omitempty"`
-	TCListenerLookupMode         string     `json:"tc_listener_lookup_mode,omitempty"`
-	TCAttachmentMode             string     `json:"tc_attachment_mode,omitempty"`
-	TCDeliveryInterface          string     `json:"tc_delivery_interface,omitempty"`
-	TCDeliveryInterfaceIndex     int        `json:"tc_delivery_interface_index,omitempty"`
-	TCRoutingMark                uint32     `json:"tc_routing_mark,omitempty"`
-	TCRoutingTable               int        `json:"tc_routing_table,omitempty"`
-	TCRoutingPriority            int        `json:"tc_routing_priority,omitempty"`
-	TCAttachmentCount            int        `json:"tc_attachment_count,omitempty"`
-	TCRetiredAttachmentCount     int        `json:"tc_retired_attachment_count,omitempty"`
-	TCRetiredDeliveryCount       int        `json:"tc_retired_delivery_count,omitempty"`
-	TCRequiresRebuild            bool       `json:"tc_requires_rebuild"`
-	TCHealthStatus               string     `json:"tc_health_status,omitempty"`
-	TCLastHealthCheckAt          *time.Time `json:"tc_last_health_check_at,omitempty"`
-	TCLastReconcileAt            *time.Time `json:"tc_last_reconcile_at,omitempty"`
-	TCNetworkGeneration          uint64     `json:"tc_network_generation,omitempty"`
+	LocalEnabled                  bool       `json:"local_enabled"`
+	LocalDataPlane                string     `json:"local_data_plane,omitempty"`
+	LocalCgroupAttachMode         string     `json:"local_cgroup_attach_mode,omitempty"`
+	LocalSelfBypassMode           string     `json:"local_self_bypass_mode,omitempty"`
+	LocalSelfBypassCleanupMode    string     `json:"local_self_bypass_cleanup_mode,omitempty"`
+	LocalUDPCleanupMode           string     `json:"local_udp_cleanup_mode,omitempty"`
+	LocalUDPUserspaceCleanupMode  string     `json:"local_udp_userspace_cleanup_mode,omitempty"`
+	LocalUDPStorageMode           string     `json:"local_udp_storage_mode,omitempty"`
+	LocalUDPTimeMode              string     `json:"local_udp_time_mode,omitempty"`
+	LocalUDPState                 string     `json:"local_udp_state,omitempty"`
+	LocalUDPRecoveryMode          string     `json:"local_udp_recovery_mode,omitempty"`
+	LocalUDPMapPressure           string     `json:"local_udp_map_pressure,omitempty"`
+	LocalUDPNetworkGeneration     uint32     `json:"local_udp_network_generation,omitempty"`
+	LocalUDPReleaseObserver       bool       `json:"local_udp_release_observer"`
+	LocalUDPReleaseFallbackReason string     `json:"local_udp_release_fallback_reason,omitempty"`
+	LocalUDPReleaseProgram        string     `json:"local_udp_release_program,omitempty"`
+	SharedEnabled                 bool       `json:"shared_enabled"`
+	SharedDataPlane               string     `json:"shared_data_plane,omitempty"`
+	FakeIPICMPReply               bool       `json:"fakeip_icmp_reply"`
+	TCBackendMode                 string     `json:"tc_backend_mode,omitempty"`
+	TCListenerLookupMode          string     `json:"tc_listener_lookup_mode,omitempty"`
+	TCAttachmentMode              string     `json:"tc_attachment_mode,omitempty"`
+	TCDeliveryInterface           string     `json:"tc_delivery_interface,omitempty"`
+	TCDeliveryInterfaceIndex      int        `json:"tc_delivery_interface_index,omitempty"`
+	TCRoutingMark                 uint32     `json:"tc_routing_mark,omitempty"`
+	TCRoutingTable                int        `json:"tc_routing_table,omitempty"`
+	TCRoutingPriority             int        `json:"tc_routing_priority,omitempty"`
+	TCAttachmentCount             int        `json:"tc_attachment_count,omitempty"`
+	TCRetiredAttachmentCount      int        `json:"tc_retired_attachment_count,omitempty"`
+	TCRetiredDeliveryCount        int        `json:"tc_retired_delivery_count,omitempty"`
+	TCRequiresRebuild             bool       `json:"tc_requires_rebuild"`
+	TCHealthStatus                string     `json:"tc_health_status,omitempty"`
+	TCLastHealthCheckAt           *time.Time `json:"tc_last_health_check_at,omitempty"`
+	TCLastReconcileAt             *time.Time `json:"tc_last_reconcile_at,omitempty"`
+	TCNetworkGeneration           uint64     `json:"tc_network_generation,omitempty"`
 
 	Attachments []EBPFAttachmentDiagnostics `json:"attachments,omitempty"`
 
@@ -166,6 +186,7 @@ type EBPFDiagnostics struct {
 
 	LocalBypassRuleSet  scopedBypassRuleSetDiagnostics `json:"local_bypass_rule_set"`
 	SharedBypassRuleSet scopedBypassRuleSetDiagnostics `json:"shared_bypass_rule_set"`
+	PolicyEpoch         EBPFPolicyEpochDiagnostics     `json:"policy_epoch"`
 
 	// UDPSessionCount is the number of distinct UDP clients (by source
 	// address:port) this inbound is currently tracking state for, summed
@@ -182,6 +203,10 @@ type EBPFDiagnostics struct {
 	UDPReplySockets udpReplySocketPoolSnapshot `json:"udp_reply_sockets"`
 
 	Counters EBPFCounters `json:"counters"`
+}
+
+type udpReleasePathDiagnostics interface {
+	UDPReleasePathDiagnostics() (bool, string, string)
 }
 
 // tcOutcomeHistory is the small amount of extra bookkeeping Diagnostics
@@ -320,43 +345,52 @@ func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnosti
 		})
 	}
 	return adapter.EBPFRuntimeDiagnostics{
-		SchemaVersion:                diagnostics.SchemaVersion,
-		ObservedAt:                   diagnostics.ObservedAt,
-		Tag:                          diagnostics.Tag,
-		State:                        diagnostics.State,
-		LocalEnabled:                 diagnostics.LocalEnabled,
-		LocalDataPlane:               diagnostics.LocalDataPlane,
-		LocalCgroupAttachMode:        diagnostics.LocalCgroupAttachMode,
-		LocalUDPCleanupMode:          diagnostics.LocalUDPCleanupMode,
-		LocalUDPUserspaceCleanupMode: diagnostics.LocalUDPUserspaceCleanupMode,
-		LocalUDPStorageMode:          diagnostics.LocalUDPStorageMode,
-		LocalUDPTimeMode:             diagnostics.LocalUDPTimeMode,
-		SharedEnabled:                diagnostics.SharedEnabled,
-		SharedDataPlane:              diagnostics.SharedDataPlane,
-		FakeIPICMPReply:              diagnostics.FakeIPICMPReply,
-		TCBackendMode:                diagnostics.TCBackendMode,
-		TCListenerLookupMode:         diagnostics.TCListenerLookupMode,
-		TCAttachmentMode:             diagnostics.TCAttachmentMode,
-		TCDeliveryInterface:          diagnostics.TCDeliveryInterface,
-		TCDeliveryInterfaceIndex:     diagnostics.TCDeliveryInterfaceIndex,
-		TCRoutingMark:                diagnostics.TCRoutingMark,
-		TCRoutingTable:               diagnostics.TCRoutingTable,
-		TCRoutingPriority:            diagnostics.TCRoutingPriority,
-		TCAttachmentCount:            diagnostics.TCAttachmentCount,
-		TCRetiredAttachmentCount:     diagnostics.TCRetiredAttachmentCount,
-		TCRetiredDeliveryCount:       diagnostics.TCRetiredDeliveryCount,
-		TCRequiresRebuild:            diagnostics.TCRequiresRebuild,
-		TCHealthStatus:               diagnostics.TCHealthStatus,
-		TCLastHealthCheckAt:          diagnostics.TCLastHealthCheckAt,
-		TCLastReconcileAt:            diagnostics.TCLastReconcileAt,
-		TCNetworkGeneration:          diagnostics.TCNetworkGeneration,
-		Attachments:                  attachments,
-		LastError:                    diagnostics.LastError,
-		LastErrorAt:                  diagnostics.LastErrorAt,
-		LastRecoveryAt:               diagnostics.LastRecoveryAt,
-		RecoveryPending:              diagnostics.RecoveryPending,
-		RecoveryUnrecoverable:        diagnostics.RecoveryUnrecoverable,
-		NextRetryAt:                  diagnostics.NextRetryAt,
+		SchemaVersion:                 diagnostics.SchemaVersion,
+		ObservedAt:                    diagnostics.ObservedAt,
+		Tag:                           diagnostics.Tag,
+		State:                         diagnostics.State,
+		LocalEnabled:                  diagnostics.LocalEnabled,
+		LocalDataPlane:                diagnostics.LocalDataPlane,
+		LocalCgroupAttachMode:         diagnostics.LocalCgroupAttachMode,
+		LocalSelfBypassMode:           diagnostics.LocalSelfBypassMode,
+		LocalSelfBypassCleanupMode:    diagnostics.LocalSelfBypassCleanupMode,
+		LocalUDPCleanupMode:           diagnostics.LocalUDPCleanupMode,
+		LocalUDPUserspaceCleanupMode:  diagnostics.LocalUDPUserspaceCleanupMode,
+		LocalUDPStorageMode:           diagnostics.LocalUDPStorageMode,
+		LocalUDPTimeMode:              diagnostics.LocalUDPTimeMode,
+		LocalUDPState:                 diagnostics.LocalUDPState,
+		LocalUDPRecoveryMode:          diagnostics.LocalUDPRecoveryMode,
+		LocalUDPMapPressure:           diagnostics.LocalUDPMapPressure,
+		LocalUDPNetworkGeneration:     diagnostics.LocalUDPNetworkGeneration,
+		LocalUDPReleaseObserver:       diagnostics.LocalUDPReleaseObserver,
+		LocalUDPReleaseFallbackReason: diagnostics.LocalUDPReleaseFallbackReason,
+		LocalUDPReleaseProgram:        diagnostics.LocalUDPReleaseProgram,
+		SharedEnabled:                 diagnostics.SharedEnabled,
+		SharedDataPlane:               diagnostics.SharedDataPlane,
+		FakeIPICMPReply:               diagnostics.FakeIPICMPReply,
+		TCBackendMode:                 diagnostics.TCBackendMode,
+		TCListenerLookupMode:          diagnostics.TCListenerLookupMode,
+		TCAttachmentMode:              diagnostics.TCAttachmentMode,
+		TCDeliveryInterface:           diagnostics.TCDeliveryInterface,
+		TCDeliveryInterfaceIndex:      diagnostics.TCDeliveryInterfaceIndex,
+		TCRoutingMark:                 diagnostics.TCRoutingMark,
+		TCRoutingTable:                diagnostics.TCRoutingTable,
+		TCRoutingPriority:             diagnostics.TCRoutingPriority,
+		TCAttachmentCount:             diagnostics.TCAttachmentCount,
+		TCRetiredAttachmentCount:      diagnostics.TCRetiredAttachmentCount,
+		TCRetiredDeliveryCount:        diagnostics.TCRetiredDeliveryCount,
+		TCRequiresRebuild:             diagnostics.TCRequiresRebuild,
+		TCHealthStatus:                diagnostics.TCHealthStatus,
+		TCLastHealthCheckAt:           diagnostics.TCLastHealthCheckAt,
+		TCLastReconcileAt:             diagnostics.TCLastReconcileAt,
+		TCNetworkGeneration:           diagnostics.TCNetworkGeneration,
+		Attachments:                   attachments,
+		LastError:                     diagnostics.LastError,
+		LastErrorAt:                   diagnostics.LastErrorAt,
+		LastRecoveryAt:                diagnostics.LastRecoveryAt,
+		RecoveryPending:               diagnostics.RecoveryPending,
+		RecoveryUnrecoverable:         diagnostics.RecoveryUnrecoverable,
+		NextRetryAt:                   diagnostics.NextRetryAt,
 		LocalBypassRuleSet: adapter.EBPFBypassRuleSetDiagnostics{
 			Consistent:            diagnostics.LocalBypassRuleSet.Consistent,
 			Pending:               diagnostics.LocalBypassRuleSet.Pending,
@@ -372,6 +406,13 @@ func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnosti
 			ExpectedPolicyVersion: diagnostics.SharedBypassRuleSet.ExpectedPolicyVersion,
 			RetryCount:            diagnostics.SharedBypassRuleSet.RetryCount,
 			BackendState:          convertBypassRuleSetBackendState(diagnostics.SharedBypassRuleSet.BackendState),
+		},
+		PolicyEpoch: adapter.EBPFPolicyEpochDiagnostics{
+			LocalConfirmed:  diagnostics.PolicyEpoch.LocalConfirmed,
+			LocalExpected:   diagnostics.PolicyEpoch.LocalExpected,
+			SharedConfirmed: diagnostics.PolicyEpoch.SharedConfirmed,
+			SharedExpected:  diagnostics.PolicyEpoch.SharedExpected,
+			Converged:       diagnostics.PolicyEpoch.Converged,
 		},
 		UDPSessionCount: diagnostics.UDPSessionCount,
 		UDPNAT: adapter.EBPFUDPNATDiagnostics{
@@ -461,6 +502,7 @@ func kernelRuntimeForAPI(observedAt time.Time, runtimeState commonEBPF.RuntimeSt
 			Entries:    item.Entries,
 			Supported:  item.Supported,
 			Error:      item.Error,
+			Pressure:   item.Pressure,
 		})
 	}
 	diagnostics := adapter.EBPFKernelRuntimeDiagnostics{
@@ -493,6 +535,10 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	}
 	if i.localEnabled {
 		diagnostics.LocalDataPlane = i.localDataPlane
+		if i.selfBypass != nil {
+			diagnostics.LocalSelfBypassMode = i.selfBypass.Mode().String()
+			diagnostics.LocalSelfBypassCleanupMode = i.selfBypass.CleanupMode()
+		}
 	}
 	if backend := i.cgroupBackendInstance(); backend != nil && !backend.IsClosed() {
 		diagnostics.LocalCgroupAttachMode = backend.AttachMode()
@@ -500,6 +546,16 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 		diagnostics.LocalUDPUserspaceCleanupMode = backend.UDPUserspaceCleanupMode()
 		diagnostics.LocalUDPStorageMode = backend.UDPStorageMode()
 		diagnostics.LocalUDPTimeMode = backend.UDPTimeMode()
+		udpState := backend.UDPStateDiagnostics()
+		diagnostics.LocalUDPState = udpState.State
+		diagnostics.LocalUDPRecoveryMode = udpState.RecoveryMode
+		diagnostics.LocalUDPMapPressure = udpState.MapPressure
+		diagnostics.LocalUDPNetworkGeneration = udpState.NetworkGeneration
+		if releasePath, ok := any(backend).(udpReleasePathDiagnostics); ok {
+			diagnostics.LocalUDPReleaseObserver,
+				diagnostics.LocalUDPReleaseFallbackReason,
+				diagnostics.LocalUDPReleaseProgram = releasePath.UDPReleasePathDiagnostics()
+		}
 	}
 	if i.sharedEnabled {
 		diagnostics.SharedDataPlane = i.sharedDataPlane
@@ -655,6 +711,16 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	}
 	diagnostics.LocalBypassRuleSet = localState
 	diagnostics.SharedBypassRuleSet = sharedState
+	diagnostics.PolicyEpoch = EBPFPolicyEpochDiagnostics{
+		LocalConfirmed:  localState.PolicyVersion,
+		LocalExpected:   localState.ExpectedPolicyVersion,
+		SharedConfirmed: sharedState.PolicyVersion,
+		SharedExpected:  sharedState.ExpectedPolicyVersion,
+		Converged: localState.Consistent && sharedState.Consistent &&
+			!localState.Pending && !sharedState.Pending &&
+			localState.PolicyVersion == localState.ExpectedPolicyVersion &&
+			sharedState.PolicyVersion == sharedState.ExpectedPolicyVersion,
+	}
 	i.bypassRuleSetAccess.Unlock()
 
 	diagnostics.UDPSessionCount = i.udpClientTable.count()
@@ -832,6 +898,7 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 	}
 	lines = append(lines, fmt.Sprintf("local.bypass_rule_set: consistent=%t pending=%t version=%d", d.LocalBypassRuleSet.Consistent, d.LocalBypassRuleSet.Pending, d.LocalBypassRuleSet.PolicyVersion))
 	lines = append(lines, fmt.Sprintf("shared.bypass_rule_set: consistent=%t pending=%t version=%d", d.SharedBypassRuleSet.Consistent, d.SharedBypassRuleSet.Pending, d.SharedBypassRuleSet.PolicyVersion))
+	lines = append(lines, fmt.Sprintf("policy_epoch: local=%d/%d shared=%d/%d converged=%t", d.PolicyEpoch.LocalConfirmed, d.PolicyEpoch.LocalExpected, d.PolicyEpoch.SharedConfirmed, d.PolicyEpoch.SharedExpected, d.PolicyEpoch.Converged))
 	lines = append(lines, fmt.Sprintf("UDP sessions: %d", d.UDPSessionCount))
 	lines = append(lines, fmt.Sprintf(
 		"UDP NAT: active=%d created=%d capacity_evictions=%d queue_drops=%d socket_release_events=%d socket_release_matched=%d pending_release_capacity_rejected=%d release_notification_drops=%d",

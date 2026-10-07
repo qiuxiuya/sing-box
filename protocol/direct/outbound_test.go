@@ -32,7 +32,9 @@ func TestFlowDomainResolveOptionsDuringFirstDial(t *testing.T) {
 	})
 	require.NoError(t, err)
 	outbound := rawOutbound.(*Outbound)
-	t.Cleanup(func() { require.NoError(t, outbound.Close()) })
+	scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, outbound.Start(adapter.StartStateInitialize, scope))
 	expected := adapter.DNSQueryOptions{
 		Transport:    transport,
 		Strategy:     C.DomainStrategyIPv4Only,

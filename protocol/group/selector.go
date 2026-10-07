@@ -90,7 +90,10 @@ func (s *Selector) Network() []string {
 	return selected.Network()
 }
 
-func (s *Selector) Start() error {
+func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
+		return nil
+	}
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
 	if s.useAllProviders {
@@ -138,7 +141,9 @@ func (s *Selector) Start() error {
 	s.selected.Store(selected)
 	s.stateAccess.Unlock()
 	for _, providerTag := range s.providerTags {
-		s.providers[providerTag].RegisterCallback(s.onProviderUpdated)
+		p := s.providers[providerTag]
+		element := p.RegisterCallback(s.onProviderUpdated)
+		scope.Add(func() error { p.UnregisterCallback(element); return nil })
 	}
 	return nil
 }
@@ -289,6 +294,11 @@ func (s *Selector) outboundSelect(outbounds map[string]adapter.Outbound, tags []
 		}
 	}
 
+	if previous := s.selected.Load(); previous != nil {
+		if current, loaded := outbounds[previous.Tag()]; loaded {
+			return current, nil
+		}
+	}
 	if s.defaultTag != "" {
 		detour, loaded := outbounds[s.defaultTag]
 		if !loaded {

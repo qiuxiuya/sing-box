@@ -52,7 +52,6 @@ type OutboundManager interface {
 	Outbounds() []Outbound
 	Outbound(tag string) (Outbound, bool)
 	Default() Outbound
-	Remove(tag string) error
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) error
 }
 
@@ -63,4 +62,12 @@ type IdleConnectionKeeper interface {
 
 type Referrer interface {
 	References() []string
+}
+
+// DynamicOutboundManager supports provider-owned components without allowing
+// duplicate tags in the static configuration.
+type DynamicOutboundManager interface {
+	OutboundManager
+	Replace(ctx context.Context, router Router, logger log.ContextLogger, tag string, componentType string, options any) error
+	Remove(tag string) error
 }

@@ -5,9 +5,8 @@ package route
 import (
 	"sync/atomic"
 
-	E "github.com/sagernet/sing/common/exceptions"
-
 	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type ebpfSelfBypassState struct {

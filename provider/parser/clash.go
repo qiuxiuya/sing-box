@@ -9,6 +9,7 @@ import (
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -242,6 +243,16 @@ func (v *VmessOption) Build() any {
 	if v.TLSOptions != nil {
 		v.SNI = v.ServerName
 	}
+	security := v.Cipher
+	if security == "auto" {
+		// Clash selects an AEAD cipher even with TLS, while sing-box's auto
+		// uses zero with TLS. Resolve it here to preserve Clash semantics.
+		if vmess.AutoSecurityType() == vmess.SecurityTypeAes128Gcm {
+			security = "aes-128-gcm"
+		} else {
+			security = "chacha20-poly1305"
+		}
+	}
 	switch v.PacketEncoding {
 	case "":
 		if v.XUDP {
@@ -256,7 +267,7 @@ func (v *VmessOption) Build() any {
 		DialerOptions:               v.DialerOptions.Build(),
 		ServerOptions:               v.ServerOptions.Build(),
 		UUID:                        v.UUID,
-		Security:                    v.Cipher,
+		Security:                    security,
 		AlterId:                     v.AlterID,
 		GlobalPadding:               v.GlobalPadding,
 		AuthenticatedLength:         v.AuthenticatedLength,
@@ -657,7 +668,7 @@ func (w *ClashWireGuardOption) Build() any {
 }
 
 func clashWireGuardPeer(peer ClashWireGuardPeerOption, persistentKeepalive int) option.WireGuardPeer {
-	var allowedIPs badoption.Listable[netip.Prefix]
+	var allowedIPs option.LegacyListable[netip.Prefix]
 	for _, ip := range peer.AllowedIPs {
 		if prefix, err := netip.ParsePrefix(ip); err == nil {
 			allowedIPs = append(allowedIPs, prefix)
@@ -933,11 +944,11 @@ func clashPluginOptions(plugin string, opts map[string]any) string {
 	return options.Build()
 }
 
-func clashPorts(ports string) badoption.Listable[string] {
+func clashPorts(ports string) option.LegacyListable[string] {
 	if ports == "" {
 		return nil
 	}
-	serverPorts := badoption.Listable[string]{}
+	serverPorts := option.LegacyListable[string]{}
 	ports = strings.ReplaceAll(ports, "/", ",")
 	for port := range strings.SplitSeq(ports, ",") {
 		if port == "" {

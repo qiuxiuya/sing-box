@@ -9,7 +9,6 @@ import (
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/common/udpgso"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -69,7 +68,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Logger:    logger,
 		TLSConfig: tlsConfig,
 		QUICOptions: qtls.QUICOptions{
-			DisableGSO:              udpgso.Disabled(options.UDPGSO),
 			IdleTimeout:             options.IdleTimeout.Build(),
 			KeepAlivePeriod:         options.KeepAlivePeriod.Build(),
 			StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
@@ -155,7 +153,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -164,18 +162,17 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
 	packetConn, err := h.listener.ListenUDP()
 	if err != nil {
 		return err
 	}
-	return h.server.Start(packetConn)
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		h.tlsConfig,
-		common.PtrOrNil(h.server),
-	)
+	scope.Add(h.listener.Close)
+	err = h.server.Start(packetConn)
+	if err != nil {
+		return err
+	}
+	scope.Add(h.server.Close)
+	return nil
 }

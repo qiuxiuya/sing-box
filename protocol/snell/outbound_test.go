@@ -50,7 +50,8 @@ func TestOutboundMultiplexEnabled(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Equal(t, reuse, created.(*Outbound).MultiplexEnabled())
-			require.NoError(t, created.(*Outbound).Close())
+			scope := startTestSnellOutbound(t, created.(*Outbound))
+			require.NoError(t, scope.Close())
 		}
 	}
 }
@@ -132,13 +133,15 @@ func TestV6QUICProxyModeConfiguration(t *testing.T) {
 			)
 			require.NoError(t, err)
 			outbound := created.(*Outbound)
+			require.Nil(t, outbound.quicDestCache)
+			scope := startTestSnellOutbound(t, outbound)
 			require.Equal(t, enabled, outbound.quicProxyMode)
 			if enabled {
 				require.NotNil(t, outbound.quicDestCache)
 			} else {
 				require.Nil(t, outbound.quicDestCache)
 			}
-			require.NoError(t, outbound.Close())
+			require.NoError(t, scope.Close())
 		})
 	}
 }
@@ -395,12 +398,13 @@ func (c *lazyPacketTestClient) Close() error { return nil }
 func TestOutboundIdleConnections(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) {
 		outbound := &Outbound{}
+		scope := startTestSnellOutbound(t, outbound)
 		require.NotPanics(t, func() {
 			outbound.SetKeepIdleConnections(true)
 			outbound.SetKeepIdleConnections(false)
 			outbound.CloseIdleConnections()
 		})
-		require.NoError(t, outbound.Close())
+		require.NoError(t, scope.Close())
 	})
 	t.Run("client", func(t *testing.T) {
 		client := &lazyPacketTestClient{}
@@ -481,4 +485,12 @@ func TestQUICProxyLazyPacketConnCloseDuringInit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not interrupt Snell packet initialization")
 	}
+}
+
+func startTestSnellOutbound(t *testing.T, outbound *Outbound) *adapter.Scope {
+	t.Helper()
+	scope := adapter.NewScope(t.Context(), log.NewNOPFactory().Logger())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, outbound.Start(adapter.StartStateInitialize, scope))
+	return scope
 }

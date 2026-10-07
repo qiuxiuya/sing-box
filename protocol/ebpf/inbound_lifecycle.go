@@ -10,15 +10,23 @@ import (
 	"strconv"
 	"strings"
 
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
-func (i *Inbound) Start(stage adapter.StartStage) error {
+func (i *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
+		if scope == nil {
+			return E.New("missing eBPF inbound lifecycle scope")
+		}
+		// The adapter lifecycle owns cleanup through the child scope. Keep the
+		// explicit startup rollback below as well: it gives direct callers and
+		// failed starts an immediate retryable cleanup, while the scope remains
+		// the final owner when Box.Start aborts or the box is closed.
+		i.ctx = scope.Context()
+		scope.Add(i.Close)
 		if i.localCgroupEnabled() || i.sharedRewriteEnabled() {
 			if err := i.selectRedirectPrefixes(); err != nil {
 				return err
@@ -175,6 +183,7 @@ func (i *Inbound) startInbound() error {
 		if err = cgroupBackend.Attach(); err != nil {
 			return err
 		}
+		i.startCgroupRecoveryScheduler(cgroupBackend)
 		i.startCgroupUDPReleaseReader(cgroupBackend)
 	}
 	if backend != nil {
@@ -369,18 +378,21 @@ func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend)
 	if backend == nil || backend.UDPUserspaceCleanupMode() != "ringbuf" {
 		return
 	}
-	i.cgroupReleaseWait.Go(func() {
+	i.cgroupReleaseWait.Add(1)
+	go func() {
+		defer i.cgroupReleaseWait.Done()
 		for {
-			socketCookie, err := backend.ReadUDPRelease()
+			event, err := backend.ReadUDPRelease()
 			if err != nil {
 				if !errors.Is(err, os.ErrClosed) {
 					i.logger.Warn("read cgroup eBPF UDP socket-release event: ", err)
 				}
 				return
 			}
-			i.udpNat.ReleaseSocket(socketCookie)
+			i.udpNat.ReleaseSocket(event.SocketCookie)
+			i.enqueueCgroupRecoveryEvent(backend, event)
 		}
-	})
+	}()
 }
 
 func (i *Inbound) selfBypassMode() string {
@@ -513,6 +525,7 @@ func (i *Inbound) closeResources() error {
 	cgroupBackend := i.takeCgroupBackend()
 	cgroupErr := error(nil)
 	if cgroupBackend != nil {
+		i.stopCgroupRecoveryScheduler()
 		cgroupErr = cgroupBackend.Close()
 		i.cgroupReleaseWait.Wait()
 		// Close keeps the runtime when a program could not be detached, because a

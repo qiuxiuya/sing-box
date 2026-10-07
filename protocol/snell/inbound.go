@@ -33,16 +33,17 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx      context.Context
-	router   adapter.ConnectionRouterEx
-	logger   logger.ContextLogger
-	listener *listener.Listener
-	service  snellprotocol.Service
-	users    []option.SnellUser
-	version  int
-	obfsMode string
-	udpNat   *quicProxyNATService
-	quicAuth *quicProxyAuthenticationService
+	ctx        context.Context
+	router     adapter.ConnectionRouterEx
+	logger     logger.ContextLogger
+	listener   *listener.Listener
+	service    snellprotocol.Service
+	users      []option.SnellUser
+	version    int
+	obfsMode   string
+	udpNat     *quicProxyNATService
+	quicAuth   *quicProxyAuthenticationService
+	quicParser quicProxyInitParser
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
@@ -146,8 +147,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 		PacketHandler:     (*inboundPacketHandler)(inbound),
 	}
-	inbound.udpNat = newQUICProxyNATService((*inboundUDPHandler)(inbound), inbound.preparePacketConnection, snellprotocol.QUICProxySessionIdleTimeout)
-	inbound.quicAuth = newQUICProxyAuthenticationService(quicParser, inbound.udpNat, logger)
+	inbound.quicParser = quicParser
 	inbound.listener = listener.New(listenerOptions)
 	return inbound, nil
 }
@@ -166,22 +166,20 @@ func newSnellV5Service(options snellv5.ServiceOptions, userList []int, keyList [
 	return service, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		return nil
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateInitialize:
+		h.udpNat = newQUICProxyNATService((*inboundUDPHandler)(h), h.preparePacketConnection, snellprotocol.QUICProxySessionIdleTimeout)
+		scope.Add(func() error { h.udpNat.Close(); return nil })
+		h.quicAuth = newQUICProxyAuthenticationService(h.quicParser, h.udpNat, h.logger)
+		scope.Add(func() error { h.quicAuth.Close(); return nil })
+	case adapter.StartStateStart:
+		if err := h.listener.Start(); err != nil {
+			return err
+		}
+		scope.Add(h.listener.Close)
 	}
-	return h.listener.Start()
-}
-
-func (h *Inbound) Close() error {
-	listenerErr := h.listener.Close()
-	if h.quicAuth != nil {
-		h.quicAuth.Close()
-	}
-	if h.udpNat != nil {
-		h.udpNat.Close()
-	}
-	return listenerErr
+	return nil
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

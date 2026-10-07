@@ -110,10 +110,11 @@ func (m *Manager) Name() string {
 	return "observability"
 }
 
-func (m *Manager) Start(stage adapter.StartStage) error {
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateInitialize || m.started.Swap(true) {
 		return nil
 	}
+	scope.Add(m.Close)
 	m.startedAt = time.Now()
 	m.traffic.SetClosedConnectionsTTL(m.recentTTL)
 	m.traffic.SetClosedConnectionsLimit(m.recentConnections)
