@@ -69,6 +69,7 @@ func TestPlatformVPNRouteBypassWithoutAddressSets(t *testing.T) {
 				tunOptions:              options,
 				networkManager:          &routeBypassTestNetwork{},
 				platformInterface:       platform,
+				usePlatformInterface:    true,
 				enableAutoRedirect:      autoRedirect,
 				usePlatformAutoRedirect: autoRedirect,
 			}

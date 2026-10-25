@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -34,10 +35,11 @@ func TestL3UDPDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), tun.UDPNatOptions{}, 0)
 	defer dispatcher.Close()
-	stage := dispatcher.NewStage(nil)
+	stage, resumed := newTestL3ForwardStage(dispatcher)
 
 	request := buildTestIPv4UDPPacket(client, fakeDestination, []byte("request"))
 	require.True(t, stage.Dispatch(request))
+	resumeTestL3ForwardStage(t, stage, resumed)
 	stage.Flush()
 	require.Len(t, port.writtenPackets, 1)
 
@@ -96,10 +98,11 @@ func TestL3UDPSniffOverrideDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), tun.UDPNatOptions{}, 0)
 	defer dispatcher.Close()
-	stage := dispatcher.NewStage(nil)
+	stage, resumed := newTestL3ForwardStage(dispatcher)
 
 	request := buildTestIPv4UDPPacket(client, originalDestination, []byte("request"))
 	require.True(t, stage.Dispatch(request))
+	resumeTestL3ForwardStage(t, stage, resumed)
 	stage.Flush()
 	require.Equal(t, 1, dnsRouter.lookupCount)
 	require.Len(t, port.writtenPackets, 1)
@@ -123,6 +126,30 @@ func TestL3UDPSniffOverrideDestinationNAT(t *testing.T) {
 	require.Equal(t, originalDestination.Port(), reverseUDP.SourcePort())
 	require.Equal(t, client.Port(), reverseUDP.DestinationPort())
 	require.Equal(t, []byte("reply"), reverseUDP.Payload())
+}
+
+func newTestL3ForwardStage(dispatcher *tun.ForwardDispatcher) (*tun.ForwardStage, <-chan struct{}) {
+	resumed := make(chan struct{}, 1)
+	stage := dispatcher.NewStage(nil, func() {
+		select {
+		case resumed <- struct{}{}:
+		default:
+		}
+	})
+	return stage, resumed
+}
+
+// Flow judgement runs asynchronously; install the verdict once it is ready.
+func resumeTestL3ForwardStage(t *testing.T, stage *tun.ForwardStage, resumed <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-resumed:
+	case <-time.After(time.Second):
+		t.Fatal("flow judgement did not finish")
+	}
+	stage.ResumeJudged(func([]byte, tun.ForwardFrameMeta) {
+		t.Error("judged packet was not forwarded")
+	})
 }
 
 type testL3SniffHostRouter struct {

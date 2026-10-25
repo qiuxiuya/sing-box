@@ -60,6 +60,9 @@ type ServerEndpoint struct {
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEServerEndpointOptions) (adapter.Endpoint, error) {
+	if err := options.TCPCongestionControl.Validate(); err != nil {
+		return nil, err
+	}
 	if err := options.H3CongestionControl.Validate(options.Versions(), true); err != nil {
 		return nil, err
 	}
@@ -220,6 +223,12 @@ func (h *serverConnectionHandler) NewConnection(ctx context.Context, conn net.Co
 
 func (s *ServerEndpoint) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {
 	err := s.device.WriteInboundBuffers(packetBuffers)
+	buf.ReleaseMulti(packetBuffers)
+	return err
+}
+
+func (s *ServerEndpoint) WaitWriteInboundBuffers(packetBuffers []*buf.Buffer) error {
+	err := s.device.WaitWriteInboundBuffers(packetBuffers)
 	buf.ReleaseMulti(packetBuffers)
 	return err
 }

@@ -44,7 +44,7 @@ func TestConnectionCopySnellErrorLevel(t *testing.T) {
 			t.Run(testCase.name+"/"+direction, func(t *testing.T) {
 				t.Parallel()
 				log := &snellErrorTestLogger{}
-				manager := NewConnectionManager(log)
+				manager := NewConnectionManager(context.Background(), log)
 				source := &snellErrorTestConn{readErr: testCase.err}
 				destination := &snellErrorTestConn{}
 				var done atomic.Bool

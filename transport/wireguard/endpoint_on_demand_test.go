@@ -58,8 +58,8 @@ func TestEndpointOnDemandReferenceTransitions(t *testing.T) {
 				endpoint.tunDevice = &onDemandTestDevice{}
 				endpoint.SetIdle(true)
 				pauseManager.DevicePause()
-				pauseManager.NetworkPause()
-				pauseManager.NetworkWake()
+				waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkPause)
+				waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkWake)
 				pauseManager.DeviceWake()
 				require.NoError(t, endpoint.BindUpdate())
 				require.True(t, endpoint.suspended.Load())
@@ -102,7 +102,7 @@ func TestEndpointCanceledDemandPreservesIdleDuringNetworkPause(t *testing.T) {
 	endpoint, pauseManager, bind := newTestEndpoint(t)
 	endpoint.tunDevice = &onDemandTestDevice{}
 	endpoint.SetIdle(true)
-	pauseManager.NetworkPause()
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkPause)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	destination := M.ParseSocksaddr("192.0.2.1:443")
@@ -112,7 +112,7 @@ func TestEndpointCanceledDemandPreservesIdleDuringNetworkPause(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorIs(t, demandEndpoint(t, endpoint, "l3"), errNetworkPaused)
 	require.True(t, endpoint.suspended.Load())
-	pauseManager.NetworkWake()
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkWake)
 	require.True(t, endpoint.suspended.Load())
 	require.EqualValues(t, 1, bind.opens.Load())
 	require.NoError(t, demandEndpoint(t, endpoint, "tcp"))

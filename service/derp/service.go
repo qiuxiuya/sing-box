@@ -269,7 +269,7 @@ func (d *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				return err
 			}
 			scope.Add(d.stunListener.Close)
-			go d.loopSTUNPacket(stunConn.(*net.UDPConn))
+			go d.loopSTUNPacket(common.MustCast[*net.UDPConn](stunConn))
 		}
 	case adapter.StartStatePostStart:
 		if len(d.verifyClientEndpoint) > 0 {
@@ -348,11 +348,14 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 	logf := func(format string, args ...any) {
 		d.logger.Debug(F.ToString("mesh(", hostname, "): ", fmt.Sprintf(format, args...)))
 	}
+	meshAddress := M.ParseSocksaddrHostPort(hostname, server.ServerPort)
 	var meshHost string
-	if server.ServerPort == 0 || server.ServerPort == 443 {
-		meshHost = hostname
+	if server.ServerPort != 0 && server.ServerPort != 443 {
+		meshHost = meshAddress.String()
+	} else if meshAddress.IsIPv6() {
+		meshHost = "[" + meshAddress.AddrString() + "]"
 	} else {
-		meshHost = M.ParseSocksaddrHostPort(hostname, server.ServerPort).String()
+		meshHost = meshAddress.AddrString()
 	}
 	var serverURL string
 	if stdConfig != nil {
@@ -368,7 +371,7 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 	meshClient.MeshKey = derpServer.MeshKey()
 	meshClient.WatchConnectionChanges = true
 	meshClient.SetURLDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return meshDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+		return meshDialer.DialContext(ctx, network, M.ParseSocksaddrHostPort(server.Server, M.ParseSocksaddr(addr).Port))
 	})
 	add := func(m derp.PeerPresentMessage) { derpServer.AddPacketForwarder(m.Key, meshClient) }
 	remove := func(m derp.PeerGoneMessage) { derpServer.RemovePacketForwarder(m.Peer, meshClient) }
